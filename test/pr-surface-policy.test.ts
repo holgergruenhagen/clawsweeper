@@ -1193,6 +1193,25 @@ test("memory prompt contracts need patch evidence for vector persistence", () =>
   });
 });
 
+test("explicit vector and embedding owners override memory contract basename exemptions", () => {
+  for (const filename of [
+    "src/vector/memory-tool-contract.ts",
+    "src/embedding/memory-prompt-contract.ts",
+  ]) {
+    for (const patch of [undefined, "", "@@\n+  refresh();\n\n[truncated 99 chars]"]) {
+      const pullFiles = [patch === undefined ? { filename } : { filename, patch }];
+      assert.deepEqual(
+        dataModelChangeFromPullFilesForTest({ pullFiles }),
+        {
+          change: true,
+          surfaces: [`unknown-data-model-change: ${filename}`],
+        },
+        `${filename}: ${patch === undefined ? "missing" : patch === "" ? "empty" : "truncated"} patch`,
+      );
+    }
+  }
+});
+
 test("memory persistence owners remain blocked when patch content is unavailable", () => {
   for (const filename of [
     "src/memory/vector-store.ts",

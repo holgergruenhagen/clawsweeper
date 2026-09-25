@@ -686,12 +686,14 @@ function dataModelPathOwner(path: string): { surface: string; strong: boolean } 
   if (/(^|\/)persistence(?:\/|[-_.])|(?:serialized|persisted?)[-_.]?(?:state|json)/i.test(path)) {
     return { surface: "serialized state", strong: true };
   }
+  // Explicit vector/embedding paths own their persisted metadata even when a
+  // contract basename also carries the broad memory-package signal.
+  if (/vector|embedding/i.test(path)) {
+    return { surface: "vector/embedding metadata", strong: true };
+  }
   // Prompt and tool contracts can live inside memory packages without owning
   // persistence. Other incomplete memory-package changes stay conservative.
-  if (
-    /vector|embedding|(?:^|\/)memory(?:\/|[-_.])/i.test(path) &&
-    !isNonPersistentMemoryContractPath(path)
-  ) {
+  if (/(?:^|\/)memory(?:\/|[-_.])/i.test(path) && !isNonPersistentMemoryContractPath(path)) {
     return { surface: "vector/embedding metadata", strong: true };
   }
   if (
