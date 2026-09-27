@@ -1197,6 +1197,8 @@ test("explicit vector and embedding owners override memory contract basename exe
   for (const filename of [
     "src/vector/memory-tool-contract.ts",
     "src/embedding/memory-prompt-contract.ts",
+    "extensions/memory-core/src/vector/tool-contract.ts",
+    "extensions/memory-core/src/embedding/prompt-contract.ts",
   ]) {
     for (const patch of [undefined, "", "@@\n+  refresh();\n\n[truncated 99 chars]"]) {
       const pullFiles = [patch === undefined ? { filename } : { filename, patch }];
