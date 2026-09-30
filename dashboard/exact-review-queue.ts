@@ -15622,7 +15622,9 @@ function exactReviewInputIdentityChanged(
       ? stableJson({
           commandStatusMarker: decision.commandStatusMarker ?? null,
           statusCommentId: decision.statusCommentId ?? null,
-          sourceDeliveryId: isEndorContinuationReview(decision) ? decision.sourceDeliveryId : null,
+          sourceDeliveryId: hasEndorContinuationIdentity(decision)
+            ? decision.sourceDeliveryId
+            : null,
           additionalPrompt: decision.additionalPrompt ?? null,
           sourceCommentId: decision.sourceCommentId ?? null,
           sourceCommentUpdatedAt: decision.sourceCommentUpdatedAt ?? null,
@@ -15640,12 +15642,10 @@ function exactReviewInputIdentityChanged(
   );
 }
 
-function isEndorContinuationReview(decision: ExactReviewDecision) {
+function hasEndorContinuationIdentity(decision: ExactReviewDecision) {
   return (
     decision.targetRepo === "openclaw/endor-clawsweeper-e2e" &&
     decision.itemKind === "pull_request" &&
-    decision.sourceEvent === "issues" &&
-    decision.sourceAction === "legacy_dispatch" &&
     !decision.publication &&
     /^endor-review-revision:[0-9a-f]{64}$/.test(String(decision.sourceDeliveryId ?? "")) &&
     new RegExp(
@@ -15663,12 +15663,17 @@ function isSameEndorContinuationReview(
   if (
     current.terminalFinalization ||
     exactReviewQueueIsPublication(current) ||
-    !isEndorContinuationReview(current.decision) ||
-    !isEndorContinuationReview(incoming)
+    !hasEndorContinuationIdentity(current.decision) ||
+    incoming.sourceEvent !== "issues" ||
+    incoming.sourceAction !== "legacy_dispatch" ||
+    !hasEndorContinuationIdentity(incoming)
   ) {
     return false;
   }
   const merged = mergePendingExactReviewDecision(current.decision, incoming);
+  // PR-event coalescing retains the semantic revision but changes the action.
+  // A continuation's transport action is not a new source for that owner.
+  merged.sourceAction = current.decision.sourceAction;
   // The first dispatch may precede status-comment creation. Resolving its
   // unchanged marker's address later must not replace the admitted owner.
   if (current.decision.statusCommentId === undefined) delete merged.statusCommentId;
