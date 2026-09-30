@@ -2190,6 +2190,23 @@ export class ExactReviewQueue {
             ),
           };
         }
+        if (
+          current &&
+          (current.reviewRetryPolicyEpoch || DEFAULT_EXACT_REVIEW_RETRY_POLICY_EPOCH) ===
+            exactReviewRetryPolicyEpoch(this.env) &&
+          isSameEndorContinuationReview(current, decision)
+        ) {
+          // Persist lease reclamation even when this delivery adds no new work.
+          this.writeStateSync(state);
+          this.incrementQueueMetricsSync({ reviewSemanticDeduped: 1 });
+          return {
+            deduped: true as const,
+            semantic: true as const,
+            key,
+            state,
+            semanticDuplicatesRemoved: 0,
+          };
+        }
         let supersededRunId: string | null = null;
         let supersessionAudit: ExactReviewSupersessionAudit | null = null;
         let ingressAdmitted = false;
@@ -15605,6 +15622,7 @@ function exactReviewInputIdentityChanged(
       ? stableJson({
           commandStatusMarker: decision.commandStatusMarker ?? null,
           statusCommentId: decision.statusCommentId ?? null,
+          sourceDeliveryId: isEndorContinuationReview(decision) ? decision.sourceDeliveryId : null,
           additionalPrompt: decision.additionalPrompt ?? null,
           sourceCommentId: decision.sourceCommentId ?? null,
           sourceCommentUpdatedAt: decision.sourceCommentUpdatedAt ?? null,
@@ -15620,6 +15638,41 @@ function exactReviewInputIdentityChanged(
       stableJson(exactReviewProofAllowedScenarios(nextDecision)) ||
     commandIdentity(priorDecision) !== commandIdentity(nextDecision)
   );
+}
+
+function isEndorContinuationReview(decision: ExactReviewDecision) {
+  return (
+    decision.targetRepo === "openclaw/endor-clawsweeper-e2e" &&
+    decision.itemKind === "pull_request" &&
+    decision.sourceEvent === "issues" &&
+    decision.sourceAction === "legacy_dispatch" &&
+    !decision.publication &&
+    /^endor-review-revision:[0-9a-f]{64}$/.test(String(decision.sourceDeliveryId ?? "")) &&
+    new RegExp(
+      `^<!-- clawsweeper-command-status:${decision.itemNumber}:(?:autofix|automerge):[0-9a-f]{40} -->$`,
+    ).test(String(decision.commandStatusMarker ?? "")) &&
+    (decision.statusCommentId === undefined ||
+      (Number.isSafeInteger(decision.statusCommentId) && Number(decision.statusCommentId) > 0))
+  );
+}
+
+function isSameEndorContinuationReview(
+  current: ExactReviewQueueItem,
+  incoming: ExactReviewDecision,
+) {
+  if (
+    current.terminalFinalization ||
+    exactReviewQueueIsPublication(current) ||
+    !isEndorContinuationReview(current.decision) ||
+    !isEndorContinuationReview(incoming)
+  ) {
+    return false;
+  }
+  const merged = mergePendingExactReviewDecision(current.decision, incoming);
+  // The first dispatch may precede status-comment creation. Resolving its
+  // unchanged marker's address later must not replace the admitted owner.
+  if (current.decision.statusCommentId === undefined) delete merged.statusCommentId;
+  return !exactReviewInputIdentityChanged(current.decision, merged);
 }
 
 function exactReviewRetryIdentityChanged(
