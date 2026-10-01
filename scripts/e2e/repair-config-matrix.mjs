@@ -14,7 +14,7 @@ export const PINS = Object.freeze({
   candidate: "2e75822d6d09b54e217b19fcc09581daad75b96253f2ccafdda20eb448506d74",
   files: 1882,
   codex: "0.159.3", scanner: "3.97.4", pnpm: "12.4.1",
-  crabbox: "67559434737170faa1d387e7c9b23e2885b257bbbe733ca3fb1febb3c001c6a1",
+  crabbox: "9f4a10d5d8e640e1e24be0414f8c0838b337103ded1a98e7ed02ccbd9d459bdf",
   label: "crabbox-proof-20261001-b-7c91e5a2",
   branch: "proof/repair-codex-config-20261001",
 });
