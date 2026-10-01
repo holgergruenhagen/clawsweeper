@@ -1,167 +1,100 @@
-name: CI
+name: Repair config proof
 
 on:
-  push:
-    branches:
-      - main
-    paths-ignore:
-      - "apply-report.json"
-      - "repair-apply-report.json"
-      - "jobs/**"
-      - "records/**"
-      - "results/**"
-  pull_request:
   workflow_dispatch:
     inputs:
-      codex_auth_mode:
-        description: "Inference route for the hosted canary; configured uses the repository setting"
-        type: choice
-        default: configured
-        options:
-          - configured
-          - clawrouter
+      lease_id:
+        description: "Exact task-owned AWS lease recorded by the controller"
+        required: true
+        type: string
+      source_head:
+        description: "Exact signed proof head checked immediately before dispatch"
+        required: true
+        type: string
+      runner_name:
+        description: "Exact task runner name checked immediately before dispatch"
+        required: true
+        type: string
+      source_tree:
+        description: "Reviewed proof-branch tree qualified natively on this guest"
+        required: true
+        type: string
+      source_digest:
+        description: "Controller's full tracked-source manifest SHA-256"
+        required: true
+        type: string
+      qualification_digest:
+        description: "SHA-256 of the successful pre-registration qualification receipt"
+        required: true
+        type: string
+      matrix_input_digest:
+        description: "SHA-256 of the sealed baseline/candidate source and tool inputs"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: repair-config-proof-20261001
+  cancel-in-progress: false
 
 jobs:
-  review-network-smoke:
-    name: review-network-smoke
-    runs-on: ubuntu-24.04
-    timeout-minutes: 3
+  repair-config-matrix:
+    if: >-
+      github.repository == 'openclaw/clawsweeper' &&
+      github.ref == 'refs/heads/proof/repair-codex-config-20261001' &&
+      github.sha == inputs.source_head &&
+      github.event_name == 'workflow_dispatch'
+    runs-on: crabbox-proof-20261001-b-7c91e5a2
+    timeout-minutes: 55
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
+          # The verifier fails closed if the frozen base is outside this bound.
+          fetch-depth: 8
+          fetch-tags: false
           persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: "24"
-      - name: Install pinned Codex and prove Linux review sandbox
-        shell: bash
-        run: |
-          set -euo pipefail
-          codex_version="$(node --input-type=module -e '
-            import { readFileSync } from "node:fs";
-            const action = readFileSync(".github/actions/setup-codex/action.yml", "utf8");
-            const version = action.match(
-              /^  codex-version:\n(?:    [^\n]*\n)*?    default: "(\d+\.\d+\.\d+(?:-[\w.-]+)?)"$/m,
-            )?.[1];
-            if (!version) throw new Error("Missing exact setup-codex version pin");
-            process.stdout.write(version);
-          ')"
-          codex_prefix="$(mktemp -d "$RUNNER_TEMP/review-codex.XXXXXX")"
-          npm install --global --prefix "$codex_prefix" "@openai/codex@$codex_version" \
-            --no-audit --no-fund --ignore-scripts
-          export PATH="$codex_prefix/bin:$PATH"
-
-          # Match setup-codex's hosted Linux bubblewrap prerequisites.
-          current_userns="$(sysctl -n kernel.unprivileged_userns_clone 2>/dev/null || true)"
-          if [[ -n "$current_userns" && "$current_userns" != "1" ]]; then
-            sudo sysctl -w kernel.unprivileged_userns_clone=1
-          fi
-          current_apparmor="$(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || true)"
-          if [[ -n "$current_apparmor" && "$current_apparmor" != "0" ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-
-          CODEX_HOME="$(mktemp -d "$RUNNER_TEMP/review-codex-home.XXXXXX")"
-          export CODEX_HOME
-          printf 'model = "gpt-5.4"\n' > "$CODEX_HOME/config.toml"
-          export GITHUB_WORKSPACE="$PWD"
-          node .github/actions/setup-codex/configure-review-network.mjs
-          bash .github/actions/setup-codex/smoke-review-network.sh
-
-  hosted-review-scan:
-    name: Hosted native review scan smoke
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: ./.github/actions/setup-pnpm
-        with:
-          build-script: build
-      - uses: ./.github/actions/setup-codex
+      # The native Crabbox phase must finish before this runner is registered.
+      # This step does not install tools, create a UID, set sysctls, or rerun probes.
+      - name: Verify pre-registration guest qualification
         env:
-          OPENAI_API_KEY: ${{ inputs.codex_auth_mode != 'clawrouter' && vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.OPENAI_API_KEY || '' }}
-          CLAWSWEEPER_INTERNAL_MODEL: ${{ inputs.codex_auth_mode != 'clawrouter' && vars.CLAWSWEEPER_CODEX_AUTH_MODE != 'clawrouter' && secrets.CLAWSWEEPER_MODEL || '' }}
-          CLAWSWEEPER_CLAWROUTER_CONFIG: ${{ secrets.CLAWSWEEPER_CLAWROUTER_CONFIG }}
+          REPAIR_PROOF_RUNNER_NAME: ${{ inputs.runner_name }}
+          REPAIR_PROOF_LEASE_ID: ${{ inputs.lease_id }}
+          REPAIR_PROOF_SOURCE_TREE: ${{ inputs.source_tree }}
+          REPAIR_PROOF_SOURCE_DIGEST: ${{ inputs.source_digest }}
+          REPAIR_PROOF_QUALIFICATION_DIGEST: ${{ inputs.qualification_digest }}
+        run: |
+          test "$RUNNER_NAME" = "$REPAIR_PROOF_RUNNER_NAME"
+          node scripts/e2e/repair-config-guest-qualification.mjs verify \
+            --lease-id "$REPAIR_PROOF_LEASE_ID" \
+            --source-head "$GITHUB_SHA" \
+            --source-tree "$REPAIR_PROOF_SOURCE_TREE" \
+            --source-digest "$REPAIR_PROOF_SOURCE_DIGEST" \
+            --receipt-sha256 "$REPAIR_PROOF_QUALIFICATION_DIGEST"
+      - name: Verify sealed matrix inputs and remaining lease lifetime
+        env:
+          REPAIR_PROOF_MATRIX_INPUT_DIGEST: ${{ inputs.matrix_input_digest }}
+        run: node scripts/e2e/repair-config-matrix.mjs verify-stage "$REPAIR_PROOF_MATRIX_INPUT_DIGEST"
+      - name: Native API login for the isolated proof UID
+        env:
+          REPAIR_PROOF_MATRIX_INPUT_DIGEST: ${{ inputs.matrix_input_digest }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CLAWSWEEPER_INTERNAL_MODEL: ${{ secrets.CLAWSWEEPER_MODEL }}
+        run: node scripts/e2e/repair-config-matrix.mjs login "$REPAIR_PROOF_MATRIX_INPUT_DIGEST"
+      # Credentials are absent from this step's environment. Native exec uses only
+      # the proof UID's fresh login, never the runner's Actions/GitHub environment.
+      - name: Run four-cell compiled repair matrix
+        env:
+          REPAIR_PROOF_MATRIX_INPUT_DIGEST: ${{ inputs.matrix_input_digest }}
+        run: node scripts/e2e/repair-config-matrix.mjs run-matrix "$REPAIR_PROOF_MATRIX_INPUT_DIGEST"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
         with:
-          auth-mode: ${{ inputs.codex_auth_mode == 'clawrouter' && 'clawrouter' || vars.CLAWSWEEPER_CODEX_AUTH_MODE || 'proxy' }}
-      - name: Prove refusal then clean structured review
-        run: node scripts/hosted-review-scan-smoke.mjs "$RUNNER_TEMP/hosted-review-scan-proof.json"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: hosted-review-scan-proof
-          path: ${{ runner.temp }}/hosted-review-scan-proof.json
+          name: repair-config-proof
+          path: |
+            /opt/repair-config-proof-20261001/qualification.json
+            /opt/repair-config-proof-20261001/matrix-result.json
           if-no-files-found: error
-
-  check:
-    name: pnpm check
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Validate workflow semantics
-        env:
-          ACTIONLINT_VERSION: "1.7.12"
-          ACTIONLINT_LINUX_AMD64_SHA256: "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8"
-        run: |
-          actionlint_archive="${RUNNER_TEMP}/actionlint.tar.gz"
-          curl --fail --show-error --silent --location \
-            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
-            --output "$actionlint_archive"
-          printf '%s  %s\n' "$ACTIONLINT_LINUX_AMD64_SHA256" "$actionlint_archive" | sha256sum --check -
-          tar -xzf "$actionlint_archive" -C "$RUNNER_TEMP" actionlint
-          "$RUNNER_TEMP/actionlint" \
-            -shellcheck= \
-            -ignore 'unexpected key "queue" for "concurrency" section' \
-            .github/workflows/*.yml
-
-      - uses: ./.github/actions/setup-pnpm
-
-      - name: Run check
-        run: pnpm run check
-
-  sparse-repair-builds:
-    name: sparse repair build smoke
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup-pnpm
-
-      - name: Build each sparse repair checkout
-        run: pnpm run test:workflow-sparse-checkout
-
-  windows-codex-launch:
-    name: Windows Codex launcher
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup-pnpm
-
-      - name: Build process workers
-        run: |
-          pnpm run build
-          pnpm run build:repair
-
-      - name: Verify native Windows launcher
-        run: >
-          node --test --test-name-pattern
-          "escaped Windows launchers|extensionless Windows node shebang shims|CODEX_BIN and preserves argv|timeout errors|app-server mode"
-          test/codex-process.test.ts
-
-      - name: Verify native Windows target clone deadlines
-        run: node --test test/repair/target-checkout.test.ts
+          retention-days: 7
