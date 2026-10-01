@@ -14,14 +14,14 @@ export const PINS = Object.freeze({
   candidate: "2e75822d6d09b54e217b19fcc09581daad75b96253f2ccafdda20eb448506d74",
   files: 1882,
   codex: "0.159.3", scanner: "3.97.4", pnpm: "12.4.1",
-  crabbox: "9f4a10d5d8e640e1e24be0414f8c0838b337103ded1a98e7ed02ccbd9d459bdf",
+  crabbox: "a91ef119bf63dcea924c112099ede8a0175076d0285b26c5ce4d81d2c4582893",
   label: "crabbox-proof-20261001-b-7c91e5a2",
   branch: "proof/repair-codex-config-20261001",
 });
 export const LIMITS = Object.freeze({
   nativeExecStarts: 12, nativeExecMs: 180_000, matrixMs: 2_700_000,
   cleanupMs: 300_000, fixtureBytes: 128 * 1024 * 1024, fixtureFiles: 1024,
-  retainedBytes: 64 * 1024 * 1024, retainedFiles: 48,
+  retainedBytes: 64 * 1024 * 1024, retainedFiles: 50,
 });
 const ROOT = "/opt/repair-config-proof-20261001";
 const INPUTS = `${ROOT}/matrix-inputs.json`;
