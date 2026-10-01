@@ -11,7 +11,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
-  LIMITS, PINS, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerPlan, digest,
+  LIMITS, PINS, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
   dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService, registrationAdapterSource,
   main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries,
 } from "../scripts/e2e/repair-config-matrix.mjs";
@@ -540,66 +540,417 @@ test("controller plan binds sole-label registration after qualification and exac
   assert.equal(plan.registration.argv[plan.registration.argv.indexOf("--name") + 1], plan.preDispatch.runnerName);
 });
 
-test("dispatch consumes fresh exact head and unique runner identity/labels; drift never dispatches", () => {
+function controllerFixture() {
+  let elapsed = 0, wallOffset = 0;
+  const wall = Date.parse("2026-10-01T15:00:00Z");
   const options = {
     crabbox: "/fixture/crabbox", ghAdapter: "/fixture/gh", leaseId: LEASE,
     qualificationDigest: "a".repeat(64), inputDigest: "b".repeat(64),
     proofHead: HEAD, proofTree: PROOF_TREE, proofDigest: "c".repeat(64),
+    lease: { leaseId: LEASE, provider: "aws", expiresAt: new Date(wall + 5_400_000).toISOString() },
   };
   const plan = controllerPlan(options);
   options.registration = {
     binarySHA256: PINS.crabbox, argv: plan.registration.argv, code: 0, signal: null,
     stdout: `actions runner registered repo=openclaw/clawsweeper name=${plan.preDispatch.runnerName} labels=${PINS.label} ephemeral=true\n`,
   };
-  const fixture = () => ({
+  const value = {
     ref: { ref: `refs/heads/${PINS.branch}`, object: { type: "commit", sha: HEAD } },
     list: { total_count: 1, runners: [{
       id: 123, name: plan.preDispatch.runnerName, os: "linux", status: "online", busy: false,
       labels: [{ name: PINS.label, type: "custom" }],
     }] },
+  };
+  const calls = [], sleeps = [];
+  const clock = {
+    now: () => elapsed, wallNow: () => wall + elapsed + wallOffset,
+    sleep: (ms) => { sleeps.push(ms); elapsed += ms; },
+  };
+  const response = (phase) => nativeControllerResult(phase === "runner" ? value.list : phase === "head" ? value.ref : "");
+  const run = (respond = response) => dispatchAfterReadback(options, (args, limits) => {
+    const phase = JSON.stringify(args) === JSON.stringify(plan.preDispatch.runnerArgv) ? "runner"
+      : JSON.stringify(args) === JSON.stringify(plan.preDispatch.headArgv) ? "head" : "dispatch";
+    if (phase === "dispatch") assert.deepEqual(args, plan.dispatch);
+    calls.push({ phase, args, ...limits, at: elapsed });
+    return respond(phase, limits);
+  }, clock);
+  return { options, plan, value, calls, sleeps, clock, run, response, wall,
+    advance: (ms) => { elapsed += ms; }, wallOffset: (ms) => { wallOffset = ms; } };
+}
+
+function nativeControllerResult(value, extra = {}) {
+  return { status: 0, signal: null, stdout: typeof value === "string" ? value : JSON.stringify(value), stderr: "", ...extra };
+}
+
+function controllerRejection(run) {
+  let record;
+  assert.throws(run, (error) => {
+    const text = controllerFailureRecord(error);
+    assert(Buffer.byteLength(text) <= 1024);
+    assert(!text.includes("FIXTURE_SECRET") && !text.includes("/private/path"));
+    record = JSON.parse(text);
+    return error.message === "controller failed closed";
   });
-  const run = (value, calls) => dispatchAfterReadback(options, (args) => {
-    calls.push(args);
-    if (JSON.stringify(args) === JSON.stringify(plan.preDispatch.runnerArgv)) return JSON.stringify(value.list);
-    if (JSON.stringify(args) === JSON.stringify(plan.preDispatch.headArgv)) return JSON.stringify(value.ref);
-    assert.deepEqual(args, plan.dispatch); return "";
-  });
-  const calls = [], result = run(fixture(), calls);
+  return record;
+}
+
+test("dispatch consumes exact native registration, runner, fresh head and lease lifetime in order", () => {
+  const f = controllerFixture(), result = f.run();
   assert.equal(result.runnerId, 123);
-  assert.equal(result.registrationDigest, digest(JSON.stringify(options.registration)));
-  assert.deepEqual(calls, [plan.preDispatch.runnerArgv, plan.preDispatch.headArgv, plan.dispatch]);
-  for (const change of [
-    (f) => { f.ref.object.sha = "d".repeat(40); },
-    (f) => { f.ref.ref = "refs/heads/main"; },
-    (f) => { f.list.total_count = 2; },
-    (f) => { f.list.runners = []; },
-    (f) => { f.list.runners[0].id = 0; },
-    (f) => { f.list.runners[0].name = "foreign"; },
-    (f) => { f.list.runners[0].os = "windows"; },
-    (f) => { f.list.runners[0].status = "offline"; },
-    (f) => { f.list.runners[0].busy = true; },
-    (f) => { f.list.runners[0].ephemeral = false; },
-    (f) => { f.list.runners[0].labels.push({ name: "self-hosted", type: "read-only" }); },
-    (f) => { f.list.runners[0].labels[0].name = "other"; },
-  ]) {
-    const value = fixture(), rejectedCalls = []; change(value);
-    assert.throws(() => run(value, rejectedCalls));
-    assert(!rejectedCalls.some((args) => args[0] === "workflow"));
+  assert.equal(result.registrationDigest, digest(JSON.stringify(f.options.registration)));
+  assert.equal(result.reads, 1);
+  assert.deepEqual(f.calls.map(({ args }) => args), [f.plan.preDispatch.runnerArgv, f.plan.preDispatch.headArgv, f.plan.dispatch]);
+  assert(f.calls.every(({ timeout, maxBuffer, killSignal }) => timeout === 30_000 && maxBuffer === 64 * 1024 && killSignal === "SIGKILL"));
+  for (const ephemeral of [true, undefined]) {
+    const next = controllerFixture();
+    if (ephemeral !== undefined) next.value.list.runners[0].ephemeral = ephemeral;
+    assert.equal(next.run().dispatched, true);
   }
-  for (const change of [
-    (r) => { r.binarySHA256 = "d".repeat(64); },
-    (r) => { r.argv = ["wrong-registration-command"]; },
-    (r) => { r.code = 1; },
-    (r) => { r.signal = "SIGTERM"; },
-    (r) => { r.stdout = r.stdout.replace("ephemeral=true", "ephemeral=false"); },
-    (r) => { r.stdout = r.stdout.replace(plan.preDispatch.runnerName, "foreign-runner"); },
+});
+
+for (const [field, change] of [
+  ["binary", (r) => { r.binarySHA256 = "d".repeat(64); }],
+  ["argv", (r) => { r.argv = ["FIXTURE_SECRET"]; }],
+  ["exit", (r) => { r.code = 1; }],
+  ["exit", (r) => { r.error = { code: "EIO", message: "FIXTURE_SECRET" }; }],
+  ["exit", (r) => { r.truncated = true; }],
+  ["signal", (r) => { r.signal = "SIGTERM"; }],
+  ["output", (r) => { r.stdout = "x".repeat(65537); }],
+  ["receipt", (r) => { r.stdout = r.stdout.replace("ephemeral=true", "ephemeral=false"); }],
+  ["receipt", (r) => { r.stdout = "FIXTURE_SECRET /private/path\n"; }],
+]) test(`registration ${field} rejection has bounded diagnostics and makes no API call`, () => {
+  const f = controllerFixture(); change(f.options.registration);
+  const record = controllerRejection(f.run);
+  assert.equal(record.phase, "registration"); assert.equal(record.field, field);
+  assert.equal(f.calls.length, 0);
+});
+
+for (const [field, change] of [
+  ["binary", (f) => { f.options.registration = undefined; }],
+  ["cardinality", (f) => { f.value.list.total_count = 2; }],
+  ["cardinality", (f) => { f.value.list.runners = []; }],
+  ["id", (f) => { f.value.list.runners[0].id = 0; }],
+  ["id", (f) => { f.value.list.runners[0].id = "123"; }],
+  ["id", (f) => { f.value.list.runners[0] = null; }],
+  ["name", (f) => { f.value.list.runners[0].name = "FIXTURE_SECRET"; }],
+  ["os", (f) => { f.value.list.runners[0].os = "windows"; }],
+  ["status", (f) => { f.value.list.runners[0].status = "unknown"; }],
+  ["busy", (f) => { f.value.list.runners[0].busy = true; }],
+  ["busy", (f) => { delete f.value.list.runners[0].busy; }],
+  ["ephemeral", (f) => { f.value.list.runners[0].ephemeral = false; }],
+  ["ephemeral", (f) => { f.value.list.runners[0].ephemeral = null; }],
+  ["ephemeral", (f) => { f.value.list.runners[0].ephemeral = "true"; }],
+  ["labels", (f) => { f.value.list.runners[0].labels.push({ name: "self-hosted", type: "read-only" }); }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].name = "FIXTURE_SECRET"; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].type = "read-only"; }],
+  ["labels", (f) => { delete f.value.list.runners[0].labels; }],
+  ["ref", (f) => { f.value.ref.ref = "refs/heads/main"; }],
+  ["type", (f) => { f.value.ref.object.type = "tag"; }],
+  ["head", (f) => { f.value.ref.object.sha = "d".repeat(40); }],
+  ["lease", (f) => { f.options.lease.leaseId = "cbx_ffffffffffff"; }],
+  ["lease", (f) => { f.options.lease.provider = "other"; }],
+  ["expiry", (f) => { delete f.options.lease.expiresAt; }],
+]) test(`controller preserves the first failing ${field} field and never dispatches drift`, () => {
+  const f = controllerFixture(); change(f);
+  const record = controllerRejection(f.run);
+  assert.equal(record.field, field);
+  assert(!f.calls.some(({ phase }) => phase === "dispatch"));
+  assert.equal(f.sleeps.length, 0);
+});
+
+test("only pre-binding empty responses and exact nonbusy offline runners may wait", () => {
+  const f = controllerFixture();
+  let reads = 0;
+  const result = f.run((phase) => {
+    if (phase !== "runner") return f.response(phase);
+    reads++;
+    if (reads === 1) return nativeControllerResult({ total_count: 0, runners: [] });
+    f.value.list.runners[0].status = reads === 2 ? "offline" : "online";
+    return f.response(phase);
+  });
+  assert.equal(result.reads, 3); assert.equal(result.runnerId, 123);
+  assert.deepEqual(f.sleeps, [5000, 5000]);
+  assert.deepEqual(f.calls.map(({ at }) => at), [0, 5000, 10000, 10000, 10000]);
+});
+
+for (const [field, change] of [
+  ["disappearance", (f) => { f.value.list = { total_count: 0, runners: [] }; }],
+  ["id", (f) => { f.value.list.runners[0].id = 124; }],
+  ["cardinality", (f) => { f.value.list.total_count = 2; f.value.list.runners.push({ ...f.value.list.runners[0] }); }],
+  ["name", (f) => { f.value.list.runners[0].name = "FIXTURE_SECRET"; }],
+  ["busy", (f) => { f.value.list.runners[0].busy = true; }],
+]) test(`bound offline runner ${field} drift is fatal, not another wait`, () => {
+  const f = controllerFixture(); f.value.list.runners[0].status = "offline";
+  const record = controllerRejection(() => f.run((phase) => {
+    if (f.calls.length === 2) change(f);
+    return f.response(phase);
+  }));
+  assert.equal(record.field, field); assert.equal(record.runnerId, 123);
+  assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [5000]);
+});
+
+for (const response of ["FIXTURE_SECRET", null, [], {}, { total_count: -1, runners: [] },
+  { total_count: 0, runners: null }, { total_count: "0", runners: [] }]) {
+  test("malformed runner response is fatal with no raw response disclosure", () => {
+    const f = controllerFixture();
+    const record = controllerRejection(() => f.run(() => nativeControllerResult(response)));
+    assert.equal(record.field, "response"); assert.equal(record.phase, "runner");
+    assert.equal(f.calls.length, 1); assert.equal(f.sleeps.length, 0);
+  });
+}
+
+test("controller records bounded native transport facts without retry or sensitive streams", () => {
+  for (const extra of [
+    { status: 7 }, { signal: "SIGTERM" }, { error: { code: "EACCES", message: "FIXTURE_SECRET" } },
+    { error: { code: "FIXTURE_SECRET", message: "/private/path" } },
+    { error: { code: "ETIMEDOUT" }, status: null, signal: "SIGKILL" }, { truncated: true },
+    { stdout: "FIXTURE_SECRET".repeat(6000) },
   ]) {
-    const registration = structuredClone(options.registration); change(registration);
-    let calls = 0;
-    assert.throws(() => dispatchAfterReadback({ ...options, registration }, () => { calls++; }));
-    assert.equal(calls, 0);
+    const f = controllerFixture();
+    const response = nativeControllerResult("FIXTURE_SECRET /private/path", { stderr: "FIXTURE_SECRET", ...extra });
+    const record = controllerRejection(() => f.run(() => { f.advance(30000); return response; }));
+    assert.equal(record.phase, "runner");
+    assert.equal(record.elapsedMs, 30000);
+    assert.equal(record.native.stdout.sha256, digest(response.stdout));
+    assert.equal(record.native.stderr.bytes, Buffer.byteLength(response.stderr));
+    assert.equal(record.native.timedOut, extra.error?.code === "ETIMEDOUT");
+    assert.equal(f.calls.length, 1); assert.equal(f.sleeps.length, 0);
   }
-  assert.throws(() => dispatchAfterReadback({ ...options, registration: undefined }, () => assert.fail("must reject before API")));
+  const f = controllerFixture();
+  const record = controllerRejection(() => f.run(() => { throw Object.assign(new Error("FIXTURE_SECRET"), { code: "ENOENT" }); }));
+  assert.equal(record.field, "transport"); assert.equal(record.native.errorCode, "ENOENT");
+  assert.equal(record.native.stdout, null);
+});
+
+test("controller retains normalized error/timeout facts without deriving timeout from signals", () => {
+  for (const [extra, errorCode, timedOut] of [
+    [{ errorCode: "ENOBUFS" }, "ENOBUFS", false],
+    [{ errorCode: "ETIMEDOUT" }, "ETIMEDOUT", true],
+    [{ timedOut: true }, null, true],
+    [{ signal: "SIGKILL" }, null, false],
+    [{ errorCode: "FIXTURE_SECRET" }, "unclassified", false],
+    [{ errorCode: "" }, "unclassified", false],
+    [{ error: new Error("FIXTURE_SECRET"), errorCode: "EACCES" }, "EACCES", false],
+  ]) {
+    const f = controllerFixture();
+    const api = controllerRejection(() => f.run(() => nativeControllerResult("", extra)));
+    assert.equal(api.field, "transport");
+    assert.equal(api.native.errorCode, errorCode); assert.equal(api.native.timedOut, timedOut);
+    const registration = controllerFixture(); Object.assign(registration.options.registration, extra);
+    const admission = controllerRejection(registration.run);
+    assert.equal(admission.phase, "registration");
+    assert.equal(admission.native.errorCode, errorCode); assert.equal(admission.native.timedOut, timedOut);
+    assert.equal(registration.calls.length, 0);
+    const closure = controllerClosure(LEASE, {
+      code: 0, signal: null, truncated: false, stdout: `released lease=${LEASE} server=0\n`, stderr: "", ...extra,
+    });
+    assert.equal(closure.released, null);
+    assert.equal(closure.native.errorCode, errorCode); assert.equal(closure.native.timedOut, timedOut);
+    assert(!JSON.stringify(closure).includes("FIXTURE_SECRET"));
+  }
+});
+
+test("readiness has one monotonic deadline with a twelve-read cap and five-second spacing", () => {
+  const f = controllerFixture();
+  const record = controllerRejection(() => f.run(() => nativeControllerResult({ total_count: 0, runners: [] })));
+  assert.equal(record.field, "read-limit"); assert.equal(record.reads, 12);
+  assert.equal(record.elapsedMs, 55000);
+  assert.equal(f.calls.length, 12); assert.equal(f.sleeps.length, 11);
+  assert(f.sleeps.every((ms) => ms === 5000));
+  assert.deepEqual(f.calls.map(({ timeout }) => timeout), Array.from({ length: 12 }, (_, index) => Math.min(30000, 60000 - index * 5000)));
+});
+
+test("API latency reduces sleep and subprocess budgets without admitting a late read", () => {
+  const f = controllerFixture();
+  const record = controllerRejection(() => f.run(() => {
+    f.advance(f.calls.length === 1 ? 29000 : 23000);
+    return nativeControllerResult({ total_count: 0, runners: [] });
+  }));
+  assert.equal(record.field, "deadline"); assert.equal(record.elapsedMs, 60000);
+  assert.deepEqual(f.calls.map(({ timeout }) => timeout), [30000, 26000]);
+  assert.deepEqual(f.sleeps, [5000, 3000]);
+  assert.equal(f.calls.length, 2);
+});
+
+test("a response at the monotonic deadline cannot advance to head read or dispatch", () => {
+  for (const latePhase of ["runner", "head"]) {
+    const f = controllerFixture();
+    const record = controllerRejection(() => f.run((phase) => {
+      if (phase === "runner") f.advance(latePhase === "runner" ? 60000 : 59999);
+      if (phase === "head") f.advance(1);
+      return f.response(phase);
+    }));
+    assert.equal(record.field, "deadline"); assert.equal(record.phase, latePhase);
+    assert(!f.calls.some(({ phase }) => phase === "dispatch"));
+    if (latePhase === "head") assert.equal(f.calls.at(-1).timeout, 1);
+  }
+});
+
+test("native timeout at the remaining API budget is fatal and does not restart readiness", () => {
+  const f = controllerFixture();
+  const record = controllerRejection(() => f.run((phase, { timeout }) => {
+    if (f.calls.length < 6) {
+      f.advance(6000);
+      return nativeControllerResult({ total_count: 0, runners: [] });
+    }
+    assert.equal(timeout, 5000); f.advance(timeout);
+    return nativeControllerResult("", { status: null, signal: "SIGKILL", error: { code: "ETIMEDOUT" } });
+  }));
+  assert.equal(record.reads, 6); assert.equal(record.elapsedMs, 60000);
+  assert.equal(record.native.timedOut, true); assert.equal(record.field, "transport");
+});
+
+test("fresh head precedes lifetime admission; wall-clock rollback cannot extend native expiry", () => {
+  const exact = controllerFixture();
+  exact.options.lease.expiresAt = new Date(exact.wall + 3000000).toISOString();
+  assert.equal(exact.run().dispatched, true);
+  for (const rollback of [false, true]) {
+    const f = controllerFixture();
+    f.options.lease.expiresAt = new Date(f.wall + 3000000).toISOString();
+    const record = controllerRejection(() => f.run((phase) => {
+      if (phase === "head") { f.advance(1); if (rollback) f.wallOffset(-60000); }
+      return f.response(phase);
+    }));
+    assert.equal(record.phase, "lifetime"); assert.equal(record.field, "expiry");
+    assert.deepEqual(f.calls.map(({ phase }) => phase), ["runner", "head"]);
+  }
+});
+
+test("a failed or timed-out dispatch is attempted once, never retried", () => {
+  for (const extra of [{ status: 1 }, { error: { code: "ETIMEDOUT" }, status: null, signal: "SIGKILL" }]) {
+    const f = controllerFixture();
+    const record = controllerRejection(() => f.run((phase) => phase === "dispatch"
+      ? nativeControllerResult("FIXTURE_SECRET", extra) : f.response(phase)));
+    assert.equal(record.phase, "dispatch"); assert.equal(record.dispatchStarted, true);
+    assert.equal(record.runnerId, 123);
+    assert.equal(f.calls.filter(({ phase }) => phase === "dispatch").length, 1);
+  }
+});
+
+test("closure accepts the exact native release marker from either complete stream, runner separately", () => {
+  for (const stream of ["stdout", "stderr"]) {
+    const result = { code: 0, signal: null, truncated: false, stdout: "", stderr: "",
+      [stream]: `released lease=${LEASE} server=i-0123456789abcdef0\n` };
+    const record = controllerClosure(LEASE, result);
+    assert.equal(record.released, true); assert.equal(record.leaseDisposition, "released");
+    assert.equal(record.runnerDisposition, "unconfirmed");
+    assert(!JSON.stringify(record).includes("i-0123456789abcdef0"));
+  }
+});
+
+test("unterminated release-looking lines in either stream defeat otherwise valid closure evidence", () => {
+  const complete = `released lease=${LEASE} server=0\n`;
+  for (const stream of ["stdout", "stderr"]) {
+    const other = stream === "stdout" ? "stderr" : "stdout";
+    for (const trailing of [
+      "released lease=cbx_ffffffffffff server=0",
+      "released lease=cbx_", "released lease=", "released lease", "released",
+      complete.trimEnd(),
+    ]) {
+      for (const sameStream of [false, true]) {
+        const result = { code: 0, signal: null, truncated: false, stdout: "", stderr: "",
+          [stream]: complete + (sameStream ? trailing : ""), [other]: sameStream ? "" : trailing };
+        const record = controllerClosure(LEASE, result);
+        assert.equal(record.released, null);
+        assert.equal(record.leaseDisposition, "unconfirmed");
+        assert.equal(record.runnerDisposition, "unconfirmed");
+      }
+    }
+  }
+});
+
+test("closure keeps missing, mismatched, failed, incomplete and truncated native evidence unconfirmed", () => {
+  for (const change of [
+    (r) => { r.stdout = ""; }, (r) => { r.stdout = r.stdout.replace(LEASE, "cbx_ffffffffffff"); },
+    (r) => { r.stdout = r.stdout.trimEnd(); }, (r) => { r.stdout = r.stdout.slice(0, 20); },
+    (r) => { r.stderr = "x".repeat(65537); }, (r) => { r.stdout += `released lease=cbx_ffffffffffff server=0\n`; },
+    (r) => { r.code = 1; }, (r) => { r.signal = "SIGTERM"; },
+    (r) => { r.error = { code: "EIO", message: "FIXTURE_SECRET" }; },
+    (r) => { r.errorCode = "ENOBUFS"; }, (r) => { r.failure = "deadline"; },
+    (r) => { r.timedOut = true; }, (r) => { r.truncated = true; }, (r) => { delete r.truncated; },
+    (r) => { r.stdout = Buffer.from(r.stdout); }, (r) => { delete r.stderr; },
+  ]) {
+    const result = { code: 0, signal: null, truncated: false, stdout: `released lease=${LEASE} server=0\n`, stderr: "" };
+    change(result);
+    const record = controllerClosure(LEASE, result);
+    assert.equal(record.released, null); assert.equal(record.leaseDisposition, "unconfirmed");
+    assert.equal(record.runnerDisposition, "unconfirmed");
+    assert(!JSON.stringify(record).includes("FIXTURE_SECRET"));
+  }
+  assert.equal(controllerClosure(LEASE, undefined).released, null);
+});
+
+async function controllerCliFixture(t, { mode = "controller-dispatch", edit = () => {}, input, response } = {}) {
+  const f = controllerFixture(), tool = Buffer.from("fixture ghx");
+  f.options.ghx = "/fixture/ghx"; f.options.ghxSHA256 = digest(tool);
+  f.options.lease.expiresAt = new Date(Date.now() + 5_400_000).toISOString();
+  edit(f.options);
+  const original = { read: fs.readFileSync, exitCode: process.exitCode };
+  const calls = [];
+  let stdout = "", stderr = "", exitCode;
+  try {
+    t.mock.method(fs, "readFileSync", (file, ...args) => {
+      if (file === 0) return Buffer.from(input ?? JSON.stringify(f.options));
+      if (file === "/fixture/ghx") return tool;
+      return original.read(file, ...args);
+    });
+    t.mock.method(fs, "realpathSync", (file) => file);
+    t.mock.method(childProcess, "spawnSync", (command, args, limits) => {
+      assert.equal(command, "/fixture/ghx"); assert.equal(args[0], "--no-cache");
+      assert(limits.timeout > 0 && limits.timeout <= 30000);
+      assert.equal(limits.killSignal, "SIGKILL"); assert.equal(limits.maxBuffer, 64 * 1024);
+      const phase = args[1] === "workflow" ? "dispatch" : args[2].includes("/actions/runners?") ? "runner" : "head";
+      calls.push(phase);
+      return response ? response(phase) : f.response(phase);
+    });
+    syncBuiltinESMExports();
+    t.mock.method(process.stdout, "write", (bytes) => { stdout += bytes; return true; });
+    t.mock.method(process.stderr, "write", (bytes) => { stderr += bytes; return true; });
+    await matrixMain([mode]);
+    exitCode = process.exitCode ?? 0;
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports(); process.exitCode = original.exitCode;
+  }
+  assert(!`${stdout}${stderr}`.includes("FIXTURE_SECRET") && !`${stdout}${stderr}`.includes("/private/path"));
+  return { stdout, stderr, exitCode, calls };
+}
+
+test("actual controller CLI uses the single instrumented path and bounded native adapter", async (t) => {
+  const result = await controllerCliFixture(t);
+  assert.equal(result.exitCode, 0); assert.equal(result.stderr, "");
+  assert.equal(JSON.parse(result.stdout).dispatched, true);
+  assert.deepEqual(result.calls, ["runner", "head", "dispatch"]);
+});
+
+for (const [phase, field, fixture] of [
+  ["input", "input", { input: "FIXTURE_SECRET /private/path" }],
+  ["tool", "path", { edit: (o) => { o.ghx = "FIXTURE_SECRET"; } }],
+  ["tool", "identity", { edit: (o) => { o.ghxSHA256 = "f".repeat(64); } }],
+  ["registration", "receipt", { edit: (o) => { o.registration.stdout = "FIXTURE_SECRET"; } }],
+  ["runner", "response", { response: () => nativeControllerResult("FIXTURE_SECRET") }],
+  ["runner", "transport", { response: () => { throw Object.assign(new Error("FIXTURE_SECRET /private/path"), { code: "EACCES" }); } }],
+]) test(`actual CLI preserves ${phase}/${field} admission diagnostics before generic catch`, async (t) => {
+  const result = await controllerCliFixture(t, fixture);
+  assert.equal(result.exitCode, 1); assert.equal(result.stdout, "");
+  const lines = result.stderr.trimEnd().split("\n");
+  assert.equal(lines.length, 2); assert.equal(lines[1], "repair-config controller-dispatch failed closed");
+  assert(Buffer.byteLength(lines[0]) <= 1024);
+  const record = JSON.parse(lines[0]);
+  assert.equal(record.phase, phase); assert.equal(record.field, field);
+  assert(!result.calls.includes("dispatch"));
+});
+
+test("actual closure CLI exits nonzero on unconfirmed evidence and keeps runner disposition separate", async (t) => {
+  for (const truncated of [false, true]) {
+    const input = JSON.stringify({ leaseId: LEASE, result: {
+      code: 0, signal: null, truncated, stdout: "", stderr: `released lease=${LEASE} server=0\n`,
+    } });
+    const result = await controllerCliFixture(t, { mode: "controller-closure", input });
+    assert.equal(result.exitCode, truncated ? 1 : 0);
+    assert.equal(result.stderr, ""); assert.equal(result.calls.length, 0);
+    const record = JSON.parse(result.stdout);
+    assert.equal(record.released, truncated ? null : true); assert.equal(record.runnerDisposition, "unconfirmed");
+  }
 });
 
 test("scanner version and actual scans use the same isolated network namespace without altered arguments", () => {

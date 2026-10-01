@@ -3,6 +3,7 @@ import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import { supervisorArguments, unitStopped } from "./repair-config-guest-qualification.mjs";
 
@@ -284,38 +285,174 @@ export function controllerPlan({ crabbox, ghAdapter, leaseId, qualificationDiges
   };
 }
 
-export function dispatchAfterReadback(options, ghxCall) {
-  const plan = controllerPlan(options), expected = plan.preDispatch;
-  const registration = options.registration;
-  assert.equal(registration?.binarySHA256, PINS.crabbox);
-  assert.deepEqual(registration.argv, plan.registration.argv);
-  assert.equal(registration.code, 0);
-  assert.equal(registration.signal, null);
-  assert(typeof registration.stdout === "string" && Buffer.byteLength(registration.stdout) <= 64 * 1024);
-  const registrationLines = registration.stdout.trim().split("\n");
-  assert.equal(registrationLines.at(-1),
-    `actions runner registered repo=openclaw/clawsweeper name=${expected.runnerName} labels=${expected.runnerLabel} ephemeral=true`);
-  const runnerList = JSON.parse(ghxCall(expected.runnerArgv));
-  assert.equal(runnerList.total_count, 1);
-  assert.equal(runnerList.runners.length, 1);
-  const runner = runnerList.runners[0];
-  assert(Number.isSafeInteger(runner.id) && runner.id > 0);
-  assert.equal(runner.name, expected.runnerName);
-  assert.equal(runner.os, "linux");
-  assert.equal(runner.status, "online");
-  assert.equal(runner.busy, false);
-  // The native registration receipt is authoritative; not all API versions
-  // return ephemeral. Reject a contradictory value when the API does supply it.
-  if (runner.ephemeral !== undefined) assert.equal(runner.ephemeral, true);
-  assert.deepEqual(runner.labels.map(({ name, type }) => ({ name, type })), [{ name: expected.runnerLabel, type: "custom" }]);
-  // Read the branch last; the workflow also checks the exact head and runner name.
-  const ref = JSON.parse(ghxCall(expected.headArgv));
-  assert.equal(ref.ref, `refs/heads/${PINS.branch}`);
-  assert.equal(ref.object.type, "commit");
-  assert.equal(ref.object.sha, expected.proofHead);
-  ghxCall(plan.dispatch);
-  return { dispatched: true, proofHead: expected.proofHead, runnerId: runner.id, runnerName: runner.name,
-    runnerLabel: expected.runnerLabel, registrationDigest: digest(JSON.stringify(registration)) };
+const controllerFailures = new WeakMap();
+
+function controllerNativeFacts(result = {}) {
+  const error = result.error || result.errorCode != null
+    ? { code: result.error?.code ?? result.errorCode } : null;
+  const facts = stageNativeFacts({ ...result, error });
+  facts.timedOut ||= result.timedOut === true;
+  return facts;
+}
+
+export function controllerFailureRecord(error) {
+  return controllerFailures.get(error) ?? json({
+    kind: "repair-config-controller-failure", phase: "input", field: "input",
+    errorCode: stageErrorCode(error), reads: 0, elapsedMs: 0,
+  });
+}
+
+export function dispatchAfterReadback(options, ghxCall, clock = {}) {
+  const now = clock.now ?? (() => performance.now()), wallNow = clock.wallNow ?? Date.now;
+  const sleep = clock.sleep ?? ((ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
+  const started = now(), wallStarted = wallNow();
+  const context = { phase: "input", field: "input", reads: 0, elapsedMs: 0 };
+  let sampled = started;
+  const check = (field, matches) => {
+    context.field = field;
+    assert(matches, "controller admission failed closed");
+  };
+  const elapsed = () => {
+    const value = now();
+    check("deadline", Number.isFinite(value) && value >= sampled);
+    sampled = value;
+    context.elapsedMs = Math.floor(value - started);
+    return value - started;
+  };
+  const remaining = () => {
+    const ms = Math.floor(60_000 - elapsed());
+    check("deadline", ms > 0);
+    return ms;
+  };
+  const invoke = (phase, args) => {
+    context.phase = phase;
+    delete context.native;
+    const timeout = Math.min(30_000, remaining());
+    context.field = "transport";
+    let response;
+    try {
+      if (phase === "dispatch") context.dispatchStarted = true;
+      response = ghxCall(args, { timeout, killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
+    } catch (error) {
+      context.native = controllerNativeFacts({ error });
+      throw error;
+    }
+    context.native = controllerNativeFacts(response ?? {});
+    check("transport", response?.status === 0 && response.signal === null && !response.error
+      && context.native.errorCode === null && !context.native.timedOut && !response.truncated);
+    check("response", typeof response.stdout === "string" && typeof response.stderr === "string"
+      && Buffer.byteLength(response.stdout) <= 64 * 1024 && Buffer.byteLength(response.stderr) <= 64 * 1024);
+    remaining();
+    context.field = "response";
+    return response.stdout;
+  };
+  try {
+    const plan = controllerPlan(options), expected = plan.preDispatch;
+    if (!ghxCall) {
+      context.phase = "tool";
+      check("path", typeof options.ghx === "string" && path.isAbsolute(options.ghx) && isHash(options.ghxSHA256));
+      check("path", fs.realpathSync(options.ghx) === options.ghx);
+      context.field = "identity";
+      check("identity", digest(fs.readFileSync(options.ghx)) === options.ghxSHA256);
+      ghxCall = (args, limits) => spawnSync(options.ghx, ["--no-cache", ...args], {
+        env: process.env, encoding: "utf8", ...limits,
+      });
+    }
+    context.phase = "registration";
+    const registration = options.registration;
+    context.native = controllerNativeFacts({ ...registration, status: registration?.code });
+    check("binary", registration?.binarySHA256 === PINS.crabbox);
+    context.field = "argv";
+    assert.deepEqual(registration.argv, plan.registration.argv);
+    check("exit", registration.code === 0 && !registration.error && !registration.errorCode
+      && !registration.failure && !registration.truncated && !registration.timedOut
+      && context.native.errorCode === null && !context.native.timedOut);
+    check("signal", registration.signal === null);
+    check("output", typeof registration.stdout === "string" && Buffer.byteLength(registration.stdout) <= 64 * 1024);
+    check("receipt", registration.stdout.trim().split("\n").at(-1)
+      === `actions runner registered repo=openclaw/clawsweeper name=${expected.runnerName} labels=${expected.runnerLabel} ephemeral=true`);
+    let runner;
+    for (;;) {
+      context.phase = "runner";
+      remaining();
+      check("read-limit", context.reads < 12);
+      context.reads++;
+      const list = JSON.parse(invoke("runner", expected.runnerArgv));
+      check("response", list !== null && typeof list === "object" && !Array.isArray(list)
+        && Number.isSafeInteger(list.total_count) && list.total_count >= 0 && Array.isArray(list.runners));
+      context.totalCount = list.total_count;
+      context.rowCount = list.runners.length;
+      check("cardinality", list.total_count === list.runners.length && list.total_count <= 1);
+      delete context.matches;
+      delete context.status;
+      if (list.total_count === 0) {
+        check("disappearance", context.runnerId === undefined);
+      } else {
+        runner = list.runners[0];
+        check("id", runner !== null && typeof runner === "object" && Number.isSafeInteger(runner.id) && runner.id > 0);
+        check("id", context.runnerId === undefined || context.runnerId === runner.id);
+        context.runnerId = runner.id;
+        context.status = ["online", "offline"].includes(runner.status) ? runner.status : "unknown";
+        context.matches = {
+          name: runner.name === expected.runnerName, os: runner.os === "linux", busy: runner.busy === false,
+          labels: Array.isArray(runner.labels) && runner.labels.length === 1
+            && runner.labels[0]?.name === expected.runnerLabel && runner.labels[0]?.type === "custom",
+          ephemeralPresent: Object.hasOwn(runner, "ephemeral"),
+          ephemeral: !Object.hasOwn(runner, "ephemeral") || runner.ephemeral === true,
+        };
+        for (const field of ["name", "os", "labels", "busy", "ephemeral"]) check(field, context.matches[field]);
+        // Native registration proves ephemeral when the API omits that field.
+        check("status", context.status !== "unknown");
+        if (runner.status === "online") break;
+      }
+      check("read-limit", context.reads < 12);
+      sleep(Math.min(5_000, remaining()));
+      remaining();
+    }
+    // No API calls intervene between the exact head read, lifetime admission and
+    // the one dispatch. The lease fields come from native authoritative metadata.
+    const ref = JSON.parse(invoke("head", expected.headArgv));
+    check("ref", ref?.ref === `refs/heads/${PINS.branch}`);
+    check("type", ref?.object?.type === "commit");
+    check("head", ref.object.sha === expected.proofHead);
+    context.phase = "lifetime";
+    check("lease", options.lease?.leaseId === options.leaseId && options.lease.provider === "aws");
+    const spent = elapsed();
+    context.field = "expiry";
+    admitDeadline(options.lease.expiresAt, Math.max(wallNow(), wallStarted + spent));
+    invoke("dispatch", plan.dispatch);
+    return { dispatched: true, proofHead: expected.proofHead, runnerId: runner.id, runnerName: runner.name,
+      runnerLabel: expected.runnerLabel, registrationDigest: digest(JSON.stringify(registration)),
+      reads: context.reads, elapsedMs: context.elapsedMs };
+  } catch (error) {
+    // Context contains only fixed field names, enums, booleans, counts and
+    // native stream hashes. Preserve the first failing field, never raw errors.
+    const finished = now();
+    if (Number.isFinite(finished) && finished >= sampled)
+      context.elapsedMs = Math.min(Number.MAX_SAFE_INTEGER, Math.floor(finished - started));
+    const failure = new Error("controller failed closed");
+    const record = json({ kind: "repair-config-controller-failure", ...context, errorCode: stageErrorCode(error) });
+    assert(Buffer.byteLength(record) <= 1024);
+    controllerFailures.set(failure, record);
+    throw failure;
+  }
+}
+
+export function controllerClosure(leaseId, result) {
+  assert(/^cbx_[a-f0-9]{12}$/.test(leaseId));
+  const native = controllerNativeFacts({ ...result, status: result?.code });
+  const bounded = result && ["stdout", "stderr"].every((key) => typeof result[key] === "string"
+    && Buffer.byteLength(result[key]) <= 64 * 1024);
+  const complete = bounded && result.truncated === false && !result.error && !result.errorCode
+    && !result.failure && !result.timedOut && result.code === 0 && result.signal === null
+    && native.errorCode === null && !native.timedOut;
+  const lines = bounded ? [result.stdout, result.stderr].map((stream) => stream.split("\n")) : [];
+  const unterminated = lines.some((stream) => /^released(?:\s|$)/.test(stream.at(-1)));
+  const markers = lines.flatMap((stream) => stream.slice(0, -1)).filter((line) => line.startsWith("released lease="));
+  const pattern = new RegExp(`^released lease=${leaseId} server=[A-Za-z0-9._:-]{1,128}$`);
+  const released = complete && !unterminated && markers.length > 0 && markers.every((line) => pattern.test(line));
+  return { leaseId, released: released ? true : null, leaseDisposition: released ? "released" : "unconfirmed",
+    runnerDisposition: "unconfirmed", native };
 }
 
 export function scannerInvocation(scanner, args) {
@@ -974,18 +1111,11 @@ export async function main(argv = process.argv.slice(2)) {
       assert.equal(args.length, 1);
       result = makePayload(fs.realpathSync(args[0]), readInput());
     } else if (mode === "controller-plan") result = controllerPlan(readInput());
-    else if (mode === "controller-dispatch") {
-      const options = readInput();
-      assert(path.isAbsolute(options.ghx) && isHash(options.ghxSHA256));
-      assert.equal(fs.realpathSync(options.ghx), options.ghx);
-      assert.equal(digest(fs.readFileSync(options.ghx)), options.ghxSHA256);
-      result = dispatchAfterReadback(options, (args) => {
-        const response = spawnSync(options.ghx, ["--no-cache", ...args], {
-          env: process.env, encoding: "utf8", timeout: 30_000, maxBuffer: 64 * 1024,
-        });
-        assert(!response.error && !response.signal && response.status === 0, "controller GitHub operation failed closed");
-        return response.stdout;
-      });
+    else if (mode === "controller-dispatch") result = dispatchAfterReadback(readInput());
+    else if (mode === "controller-closure") {
+      const input = readInput();
+      result = controllerClosure(input.leaseId, input.result);
+      if (!result.released) process.exitCode = 1;
     }
     else if (mode === "registration-adapter") {
       const options = readInput();
@@ -1038,7 +1168,8 @@ export async function main(argv = process.argv.slice(2)) {
     process.stdout.write(output);
   } catch (error) {
     if (mode === "stage") process.stderr.write(stageFailureRecord(stageDiagnostic, error));
-    process.stderr.write(`repair-config ${["stage", "payload", "controller-plan", "controller-dispatch", "registration-adapter", "verify-stage", "login", "login-root", "run-matrix", "matrix", "record-codex", "fixture-gh", "fixture-git", "scanner"].includes(mode) ? mode : "admission"} failed closed\n`);
+    if (mode === "controller-dispatch") process.stderr.write(controllerFailureRecord(error));
+    process.stderr.write(`repair-config ${["stage", "payload", "controller-plan", "controller-dispatch", "controller-closure", "registration-adapter", "verify-stage", "login", "login-root", "run-matrix", "matrix", "record-codex", "fixture-gh", "fixture-git", "scanner"].includes(mode) ? mode : "admission"} failed closed\n`);
     process.exitCode = 1;
   } finally {
     if (mode === "stage") stageDiagnostic = null;
