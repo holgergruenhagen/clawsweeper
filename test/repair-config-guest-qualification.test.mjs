@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 8\b/);
+  assert.match(body, /fetch-depth: 9\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -488,17 +488,17 @@ test("fixture measurement tolerates descendant cleanup races but rejects missing
 
 test("retention accounts for all explicit captures plus file/byte reserve", (t) => {
   const dir = temporaryFixture(t), files = [];
-  for (let i = 0; i < 50; i++) {
+  for (let i = 0; i < 53; i++) {
     const file = path.join(dir, `${i}.log`); fs.writeFileSync(file, "x"); files.push(file);
   }
-  assert.equal(LIMITS.retainedFiles, 50);
+  assert.equal(LIMITS.retainedFiles, 53);
   assert.equal(LIMITS.retainedBytes, 64 * 1024 * 1024);
-  assert.deepEqual(assertRetention(files), { files: 50, bytes: 50 });
-  assert.deepEqual(assertRetention(files, 0, LIMITS.retainedBytes - 50), { files: 50, bytes: 50 });
+  assert.deepEqual(assertRetention(files), { files: 53, bytes: 53 });
+  assert.deepEqual(assertRetention(files, 0, LIMITS.retainedBytes - 53), { files: 53, bytes: 53 });
   assert.throws(() => assertRetention(files, 1));
-  const extra = path.join(dir, "50.log"); fs.writeFileSync(extra, "x");
+  const extra = path.join(dir, "53.log"); fs.writeFileSync(extra, "x");
   assert.throws(() => assertRetention([...files, extra]));
-  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes - 49));
+  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes - 52));
   assert.throws(() => assertRetention([files[0], files[0]]));
   const link = path.join(dir, "symlink"); fs.symlinkSync(files[0], link);
   assert.throws(() => assertRetention([link]));
