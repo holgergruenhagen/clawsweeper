@@ -488,12 +488,14 @@ test("fixture measurement tolerates descendant cleanup races but rejects missing
 
 test("retention accounts for all explicit captures plus file/byte reserve", (t) => {
   const dir = temporaryFixture(t), files = [];
-  for (let i = 0; i < 32; i++) {
+  for (let i = 0; i < 48; i++) {
     const file = path.join(dir, `${i}.log`); fs.writeFileSync(file, "x"); files.push(file);
   }
-  assert.deepEqual(assertRetention(files), { files: 32, bytes: 32 });
+  assert.equal(LIMITS.retainedBytes, 64 * 1024 * 1024);
+  assert.deepEqual(assertRetention(files), { files: 48, bytes: 48 });
+  assert.deepEqual(assertRetention(files, 0, LIMITS.retainedBytes - 48), { files: 48, bytes: 48 });
   assert.throws(() => assertRetention(files, 1));
-  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes));
+  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes - 47));
   assert.throws(() => assertRetention([files[0], files[0]]));
   const link = path.join(dir, "symlink"); fs.symlinkSync(files[0], link);
   assert.throws(() => assertRetention([link]));
