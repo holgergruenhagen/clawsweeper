@@ -20,7 +20,7 @@ export const PINS = Object.freeze({
 export const LIMITS = Object.freeze({
   nativeExecStarts: 12, nativeExecMs: 180_000, matrixMs: 2_700_000,
   cleanupMs: 300_000, fixtureBytes: 128 * 1024 * 1024, fixtureFiles: 1024,
-  retainedBytes: 8 * 1024 * 1024, retainedFiles: 22,
+  retainedBytes: 8 * 1024 * 1024, retainedFiles: 32,
 });
 const ROOT = "/opt/repair-config-proof-20261001";
 const INPUTS = `${ROOT}/matrix-inputs.json`;
@@ -41,6 +41,24 @@ const CELLS = ["baseline-ordinary", "baseline-maintainer", "candidate-ordinary",
 const REGISTRATION = ["api", "-X", "POST", "repos/openclaw/clawsweeper/actions/runners/registration-token", "--jq", ".token"];
 let executionDeadline = Infinity;
 let terminationDeadline = Infinity;
+const STAGE_PHASES = Object.freeze([
+  "input", "root", "payload", "receipt", "fresh-paths", "head",
+  "scanner-identity", "scanner-environment", "scanner-version", "boot", "prepare", "archive",
+  "baseline-extract", "baseline-inventory", "baseline-ownership", "baseline-corepack",
+  "baseline-install", "baseline-build", "baseline-seal",
+  "candidate-extract", "candidate-apply-check", "candidate-apply", "candidate-inventory",
+  "candidate-ownership", "candidate-corepack", "candidate-install", "candidate-build", "candidate-seal",
+  "tools", "private-outputs", "seal", "output",
+]);
+const STAGE_ERROR_CODES = Object.freeze([
+  "EACCES", "EPERM", "ENOENT", "ENOTDIR", "EEXIST", "EINVAL", "EIO", "ENOSPC",
+  "ENOMEM", "EAGAIN", "ELOOP", "ETIMEDOUT", "ENOBUFS", "ERR_ASSERTION",
+  "ERR_INVALID_ARG_TYPE", "ERR_INVALID_ARG_VALUE", "ERR_OUT_OF_RANGE",
+]);
+const STAGE_SIGNALS = Object.freeze([
+  "SIGTERM", "SIGKILL", "SIGINT", "SIGHUP", "SIGABRT", "SIGSEGV", "SIGBUS", "SIGILL", "SIGFPE", "SIGPIPE",
+]);
+let stageDiagnostic = null;
 export const digest = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 const json = (value) => `${JSON.stringify(value)}\n`;
 const readJSON = (file) => JSON.parse(fs.readFileSync(file, "utf8"));
@@ -310,6 +328,63 @@ function cleanEnv(home, tmp = `${home}/tmp`) {
     LANG: "C.UTF-8", TMPDIR: tmp, TMP: tmp, TEMP: tmp, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null" };
 }
 
+function stagePhase(phase) {
+  assert(STAGE_PHASES.includes(phase));
+  stageDiagnostic = { phase };
+}
+
+const stageErrorCode = (error) => error == null ? null
+  : STAGE_ERROR_CODES.includes(error.code) ? error.code : "unclassified";
+
+function stageNativeFacts(result) {
+  const output = (value) => typeof value === "string" || Buffer.isBuffer(value)
+    ? { bytes: Buffer.byteLength(value), sha256: digest(value) } : null;
+  return {
+    exit: Number.isInteger(result.status) && result.status >= 0 && result.status <= 255 ? result.status : null,
+    signal: result.signal == null ? null : STAGE_SIGNALS.includes(result.signal) ? result.signal : "unclassified",
+    errorCode: stageErrorCode(result.error), timedOut: result.error?.code === "ETIMEDOUT",
+    stdout: output(result.stdout), stderr: output(result.stderr),
+  };
+}
+
+export function stageFailureRecord(context, error) {
+  const facts = {};
+  for (const key of ["uidMatch", "modeMatch", "versionMatch"])
+    if (typeof context?.facts?.[key] === "boolean") facts[key] = context.facts[key];
+  const record = {
+    kind: "repair-config-stage-failure",
+    phase: STAGE_PHASES.includes(context?.phase) ? context.phase : "input",
+    errorCode: stageErrorCode(error), facts,
+  };
+  // Only this credential-free phase may retain command metadata. Never serialize
+  // error objects, messages, command inputs, or native output bytes.
+  if (context?.native) {
+    const native = context.native;
+    const output = (value) => value && Number.isSafeInteger(value.bytes) && value.bytes >= 0
+      && typeof value.sha256 === "string" && value.sha256.length === 64 && isHash(value.sha256)
+      ? { bytes: value.bytes, sha256: value.sha256 } : null;
+    record.native = {
+      exit: Number.isInteger(native.exit) && native.exit >= 0 && native.exit <= 255 ? native.exit : null,
+      signal: native.signal == null ? null : STAGE_SIGNALS.includes(native.signal) ? native.signal : "unclassified",
+      errorCode: native.errorCode == null ? null : STAGE_ERROR_CODES.includes(native.errorCode) ? native.errorCode : "unclassified",
+      timedOut: native.timedOut === true, stdout: output(native.stdout), stderr: output(native.stderr),
+    };
+  }
+  const bytes = json(record);
+  assert(Buffer.byteLength(bytes) <= 1024);
+  return bytes;
+}
+
+export function scannerStageOptions(q) {
+  const home = `${ROOT}/private`, tmp = `${home}/tmp`;
+  const stats = [home, tmp].map((file) => fs.lstatSync(file));
+  const uidMatch = stats.every((stat) => stat.uid === q.proofUid && stat.gid === q.proofGid);
+  const modeMatch = stats.every((stat) => stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o7777) === 0o700);
+  if (stageDiagnostic) stageDiagnostic.facts = { uidMatch, modeMatch };
+  assert(uidMatch && modeMatch);
+  return { cwd: ROOT, uid: q.proofUid, gid: q.proofGid, env: cleanEnv(home, tmp) };
+}
+
 export function commandTimeout(options = {}, now = Date.now(), workUntil = executionDeadline, cleanupUntil = terminationDeadline) {
   const timeout = Math.min(options.timeout ?? 180_000, (options.cleanup ? cleanupUntil : workUntil) - now);
   assert(timeout > 0, options.cleanup ? "termination deadline" : "matrix deadline");
@@ -324,6 +399,7 @@ function command(command, args, options = {}) {
     ...(options.uid === undefined ? {} : { uid: options.uid, gid: options.gid }),
     ...(options.input === undefined ? {} : { input: options.input }),
   });
+  if (stageDiagnostic) stageDiagnostic.native = stageNativeFacts(result);
   if (!options.allowFailure) assert(!result.error && !result.signal && result.status === 0, `${path.basename(command)} failed closed`);
   return result;
 }
@@ -450,20 +526,31 @@ function ownTree(root, uid, gid, readonly = false) {
 }
 
 function stage(payload) {
+  stagePhase("root");
+  stageDiagnostic.facts = { uidMatch: process.getuid() === 0 };
   assertRoot();
+  stagePhase("payload");
   assert.equal(payload.base, PINS.base); assert.equal(payload.tree, PINS.tree);
   assert.equal(digest(payload.patch), PINS.patch);
   validateEntries(payload.candidate);
   assert.equal(digest(JSON.stringify(payload.candidate)), PINS.candidate);
+  stagePhase("receipt");
   const q = sealed(QUALIFICATION, payload.qualificationDigest);
   assert(q.qualified && q.probes.containment.markerMatch && q.probes.sandbox.markerMatch && q.supervisor.terminated);
   assert.equal(payload.leaseId, q.leaseId);
+  stagePhase("fresh-paths");
   assert(!fs.existsSync(INPUTS) && !fs.existsSync(`${ROOT}/sources`) && !fs.existsSync(`${ROOT}/tools`));
+  stagePhase("head");
   const repository = fs.realpathSync(process.cwd());
   assert.equal(command("/usr/bin/git", ["-c", `safe.directory=${repository}`, "rev-parse", "HEAD"], { cwd: repository }).stdout.trim(), q.source.head);
+  stagePhase("scanner-identity");
   const scanner = toolIdentity(payload.scanner.path, payload.scanner.sha256);
+  stagePhase("scanner-environment");
+  const scannerOptions = scannerStageOptions(q);
+  stagePhase("scanner-version");
   const [scannerCommand, scannerArgs] = scannerInvocation(scanner.path, ["--version"]);
-  const scannerVersion = command(scannerCommand, scannerArgs, { cwd: ROOT, uid: q.proofUid, gid: q.proofGid });
+  const scannerVersion = command(scannerCommand, scannerArgs, scannerOptions);
+  stageDiagnostic.facts = { versionMatch: `${scannerVersion.stdout}${scannerVersion.stderr}`.trim() === `trufflehog ${PINS.scanner}` };
   assert.equal(`${scannerVersion.stdout}${scannerVersion.stderr}`.trim(), `trufflehog ${PINS.scanner}`);
   const inputs = {
     format: 1, leaseId: payload.leaseId, expiresAt: payload.expiresAt,
@@ -473,29 +560,43 @@ function stage(payload) {
     qualifierDigest: digest(fs.readFileSync(path.join(path.dirname(SELF), "repair-config-guest-qualification.mjs"))),
     nativeExecStartsLimit: 12, underlyingModelRequestCount: null,
   };
+  stagePhase("boot");
   assert.equal(digest(fs.readFileSync("/proc/sys/kernel/random/boot_id")), q.guestBootDigest);
+  stagePhase("prepare");
   const prepare = `${ROOT}/prepare`;
   fs.mkdirSync(prepare, { mode: 0o700 });
   fs.chownSync(prepare, q.runnerUid, fs.statSync(repository).gid);
   fs.mkdirSync(`${prepare}/tmp`, { mode: 0o700 });
   fs.chownSync(`${prepare}/tmp`, q.runnerUid, fs.statSync(repository).gid);
+  stagePhase("archive");
   const archive = command("/usr/bin/git", ["-c", `safe.directory=${repository}`, "archive", PINS.base], { cwd: repository, binary: true, maxBuffer: 128 * 1024 * 1024 }).stdout;
   for (const revision of ["baseline", "candidate"]) {
+    stagePhase(`${revision}-extract`);
     const source = `${ROOT}/sources/${revision}`;
     fs.mkdirSync(source, { recursive: true, mode: 0o755 });
     command("/usr/bin/tar", ["-x", "--no-same-owner", "--no-same-permissions", "-C", source], { input: archive });
     if (revision === "candidate") {
+      stagePhase("candidate-apply-check");
       command("/usr/bin/git", ["apply", "--check", "-"], { cwd: source, input: payload.patch });
+      stagePhase("candidate-apply");
       command("/usr/bin/git", ["apply", "-"], { cwd: source, input: payload.patch });
     }
+    stagePhase(`${revision}-inventory`);
     const entries = sourceInventory(source, payload.candidate);
     if (revision === "candidate") assert.deepEqual(entries, payload.candidate);
     inputs[revision] = { entries, sourceDigest: digest(JSON.stringify(entries)) };
+    stagePhase(`${revision}-ownership`);
     ownTree(source, q.runnerUid, fs.statSync(repository).gid);
     const buildOptions = { cwd: source, env: cleanEnv(prepare), uid: q.runnerUid, gid: fs.statSync(repository).gid };
-    assert.equal(command("corepack", ["pnpm", "--version"], buildOptions).stdout.trim(), PINS.pnpm);
+    stagePhase(`${revision}-corepack`);
+    const pnpmVersion = command("corepack", ["pnpm", "--version"], buildOptions).stdout.trim();
+    stageDiagnostic.facts = { versionMatch: pnpmVersion === PINS.pnpm };
+    assert.equal(pnpmVersion, PINS.pnpm);
+    stagePhase(`${revision}-install`);
     command("corepack", ["pnpm", "install", "--frozen-lockfile"], buildOptions);
+    stagePhase(`${revision}-build`);
     command("corepack", ["pnpm", "run", "build:node"], buildOptions);
+    stagePhase(`${revision}-seal`);
     assert.deepEqual(sourceInventory(source, entries), entries);
     ownTree(source, 0, 0, true);
     inputs[revision].compiled = treeInventory(`${source}/dist`);
@@ -505,6 +606,7 @@ function stage(payload) {
     fs.symlinkSync(`${ROOT}/private/runs/${revision}`, `${source}/.clawsweeper-repair/runs`);
     fs.chmodSync(source, 0o555);
   }
+  stagePhase("tools");
   fs.mkdirSync(`${ROOT}/tools`, { mode: 0o755 });
   fs.copyFileSync(SELF, GUEST_SELF, fs.constants.COPYFILE_EXCL);
   fs.copyFileSync(path.join(path.dirname(SELF), "repair-config-guest-qualification.mjs"), `${ROOT}/tools/repair-config-guest-qualification.mjs`, fs.constants.COPYFILE_EXCL);
@@ -514,9 +616,11 @@ function stage(payload) {
   fs.writeFileSync(`${ROOT}/tools/package.json`, '{"type":"module"}\n', { flag: "wx", mode: 0o444 });
   ownTree(`${ROOT}/tools`, 0, 0, true);
   inputs.tools = treeInventory(`${ROOT}/tools`);
+  stagePhase("private-outputs");
   for (const dir of ["cells", "runs", "runs/baseline", "runs/candidate", "admission"])
     fs.mkdirSync(`${ROOT}/private/${dir}`, { recursive: true, mode: 0o700 });
   ownTree(`${ROOT}/private`, q.proofUid, q.proofGid);
+  stagePhase("seal");
   writeSealed(INPUTS, inputs);
   return { staged: true, inputDigest: digest(fs.readFileSync(INPUTS)), leaseId: inputs.leaseId,
     baseline: inputs.baseline.sourceDigest, candidate: inputs.candidate.sourceDigest, patch: PINS.patch };
@@ -861,7 +965,11 @@ export async function main(argv = process.argv.slice(2)) {
     if (mode === "record-codex") return await recordCodex(args);
     if (["fixture-gh", "fixture-git", "scanner"].includes(mode)) return runFixture(mode, args);
     let result;
-    if (mode === "stage") result = stage(readInput(2 * 1024 * 1024));
+    if (mode === "stage") {
+      stagePhase("input");
+      result = stage(readInput(2 * 1024 * 1024));
+      stagePhase("output");
+    }
     else if (mode === "payload") {
       assert.equal(args.length, 1);
       result = makePayload(fs.realpathSync(args[0]), readInput());
@@ -928,9 +1036,12 @@ export async function main(argv = process.argv.slice(2)) {
     const output = json(result);
     assert(Buffer.byteLength(output) <= (mode === "payload" ? 2 * 1024 * 1024 : 256 * 1024));
     process.stdout.write(output);
-  } catch {
+  } catch (error) {
+    if (mode === "stage") process.stderr.write(stageFailureRecord(stageDiagnostic, error));
     process.stderr.write(`repair-config ${["stage", "payload", "controller-plan", "controller-dispatch", "registration-adapter", "verify-stage", "login", "login-root", "run-matrix", "matrix", "record-codex", "fixture-gh", "fixture-git", "scanner"].includes(mode) ? mode : "admission"} failed closed\n`);
     process.exitCode = 1;
+  } finally {
+    if (mode === "stage") stageDiagnostic = null;
   }
 }
 

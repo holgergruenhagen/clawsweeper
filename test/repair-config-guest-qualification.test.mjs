@@ -13,7 +13,7 @@ import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
   LIMITS, PINS, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerPlan, digest,
   dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService, registrationAdapterSource,
-  reserveStart, scannerInvocation, sourceInventory, validateEntries,
+  main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries,
 } from "../scripts/e2e/repair-config-matrix.mjs";
 
 const BASE = "2f777941de926c6f11cb0c6363ecfe4bbee94371";
@@ -488,10 +488,10 @@ test("fixture measurement tolerates descendant cleanup races but rejects missing
 
 test("retention accounts for all explicit captures plus file/byte reserve", (t) => {
   const dir = temporaryFixture(t), files = [];
-  for (let i = 0; i < 22; i++) {
+  for (let i = 0; i < 32; i++) {
     const file = path.join(dir, `${i}.log`); fs.writeFileSync(file, "x"); files.push(file);
   }
-  assert.deepEqual(assertRetention(files), { files: 22, bytes: 22 });
+  assert.deepEqual(assertRetention(files), { files: 32, bytes: 32 });
   assert.throws(() => assertRetention(files, 1));
   assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes));
   assert.throws(() => assertRetention([files[0], files[0]]));
@@ -609,6 +609,218 @@ test("scanner version and actual scans use the same isolated network namespace w
   ]) assert.deepEqual(scannerInvocation("/fixture/trufflehog", args),
     ["/usr/bin/unshare", ["--user", "--map-root-user", "--net", "--", "/fixture/trufflehog", ...args]]);
   assert.throws(() => scannerInvocation("/fixture/trufflehog", ["--no-verification"]));
+});
+
+// Exercise the real stage entrypoint with guest I/O replaced. Synthetic source
+// digests admit only this fixture; no root filesystem or native command is used.
+async function stageFixture(t, options = {}) {
+  const stopAt = options.stopAt ?? "archive", proofUid = 999, proofGid = 982;
+  const scanner = "/usr/local/bin/fixture-scanner", source = Buffer.from("fixture source");
+  const candidate = Array.from({ length: PINS.files }, (_, i) => ({
+    path: `file-${String(i).padStart(4, "0")}`, mode: "100644", bytes: source.length, sha256: hash(source),
+  }));
+  const patch = "fixture patch", candidateJSON = JSON.stringify(candidate);
+  const receipt = {
+    qualified: true, leaseId: LEASE, proofUid, proofGid, runnerUid: 1000,
+    probes: { containment: { markerMatch: true }, sandbox: { markerMatch: true } },
+    supervisor: { terminated: true }, source: { head: HEAD },
+    node: { path: NODE }, codex: { path: CODEX }, guestBootDigest: hash(BOOT),
+  };
+  const receiptBytes = JSON.stringify(receipt);
+  const payload = {
+    base: stopAt === "payload" ? "wrong" : PINS.base, tree: PINS.tree, patch, candidate,
+    qualificationDigest: hash(receiptBytes), leaseId: LEASE,
+    scanner: { path: scanner, sha256: hash("fixture scanner") },
+  };
+  const original = { read: fs.readFileSync, hash: crypto.createHash, exitCode: process.exitCode };
+  const calls = [], writes = [];
+  let stdout = "", stderr = "", exitCode;
+  const nativeFailure = options.result ?? {
+    status: 7, signal: null, stdout: "FIXTURE_SECRET /private/path\n", stderr: "FIXTURE_SECRET error\n",
+  };
+  try {
+    process.exitCode = undefined;
+    t.mock.method(process, "getuid", () => stopAt === "root" ? 1000 : 0);
+    t.mock.method(crypto, "createHash", (...args) => {
+      const native = original.hash(...args), chunks = [];
+      return {
+        update(bytes) { chunks.push(Buffer.from(bytes)); native.update(bytes); return this; },
+        digest(encoding) {
+          const text = Buffer.concat(chunks).toString();
+          const pin = text === patch ? PINS.patch : text === candidateJSON ? PINS.candidate : null;
+          return pin && encoding === "hex" ? pin : native.digest(encoding);
+        },
+      };
+    });
+    t.mock.method(fs, "readFileSync", (file, encoding) => {
+      if (file === 0) return Buffer.from(stopAt === "input" ? "FIXTURE_SECRET invalid JSON" : JSON.stringify(payload));
+      if (file === RECEIPT) {
+        if (stopAt === "receipt") throw Object.assign(new Error("FIXTURE_SECRET /private/path"), { code: "EACCES" });
+        return receiptBytes;
+      }
+      if (file === scanner) return Buffer.from("fixture scanner");
+      if (file === "/proc/sys/kernel/random/boot_id") return Buffer.from(stopAt === "boot" ? "different" : BOOT);
+      if (String(file).startsWith(`${ROOT}/sources/`)) return source;
+      return original.read(file, encoding);
+    });
+    t.mock.method(fs, "realpathSync", (file) => file);
+    t.mock.method(fs, "existsSync", (file) => stopAt === "fresh-paths" && file === `${ROOT}/matrix-inputs.json`);
+    t.mock.method(fs, "lstatSync", (file) => {
+      const privateDir = [ `${ROOT}/private`, `${ROOT}/private/tmp` ].includes(file);
+      const regular = file === RECEIPT || file === scanner || /\/file-\d+$/.test(file);
+      return {
+        isFile: () => regular, isDirectory: () => !regular, isSymbolicLink: () => false, nlink: 1,
+        uid: privateDir ? proofUid : file === scanner && stopAt === "scanner-identity" ? 1000 : 0,
+        gid: privateDir ? proofGid : 0,
+        mode: file === RECEIPT ? 0o444 : privateDir ? stopAt === "scanner-environment" ? 0o755 : 0o700
+          : file === scanner || !regular ? 0o755 : 0o644,
+      };
+    });
+    t.mock.method(fs, "statSync", () => ({ gid: 1000 }));
+    t.mock.method(fs, "readdirSync", () => []);
+    for (const name of ["mkdirSync", "chownSync", "chmodSync"]) t.mock.method(fs, name, (file) => {
+      writes.push({ name, file });
+      if (stopAt === "prepare" && name === "mkdirSync") throw Object.assign(new Error("FIXTURE_SECRET"), { code: "EACCES" });
+    });
+    t.mock.method(fs, "symlinkSync", (target, file) => { writes.push({ name: "symlinkSync", file }); });
+    for (const name of ["copyFileSync", "writeFileSync"])
+      t.mock.method(fs, name, () => assert.fail("fixture must stop before final sealed writes"));
+    t.mock.method(childProcess, "spawnSync", (command, args, commandOptions) => {
+      let phase, text = "";
+      const revision = commandOptions.cwd?.endsWith("/candidate") ? "candidate" : "baseline";
+      if (command === "/usr/bin/git" && args.includes("rev-parse")) { phase = "head"; text = HEAD; }
+      else if (command === "/usr/bin/unshare") {
+        phase = "scanner-version"; text = `trufflehog ${PINS.scanner}`;
+        assert.deepEqual(args, ["--user", "--map-root-user", "--net", "--", scanner, "--version"]);
+        assert.equal(commandOptions.uid, proofUid); assert.equal(commandOptions.gid, proofGid);
+        assert.equal(commandOptions.env.HOME, `${ROOT}/private`);
+        for (const key of ["TMPDIR", "TMP", "TEMP"]) assert.equal(commandOptions.env[key], `${ROOT}/private/tmp`);
+        assert(!writes.some(({ file }) => file.startsWith(`${ROOT}/prepare`) || file.startsWith(`${ROOT}/private`)));
+      } else if (command === "/usr/bin/git" && args.includes("archive")) phase = "archive";
+      else if (command === "/usr/bin/tar") phase = `${args.at(-1).endsWith("/candidate") ? "candidate" : "baseline"}-extract`;
+      else if (command === "/usr/bin/git" && args[0] === "apply") phase = args.includes("--check") ? "candidate-apply-check" : "candidate-apply";
+      else if (command === "corepack") {
+        phase = `${revision}-${args.includes("--version") ? "corepack" : args.includes("install") ? "install" : "build"}`;
+        if (args.includes("--version")) text = PINS.pnpm;
+      } else assert.fail("unexpected fixture native command");
+      calls.push({ phase, env: commandOptions.env });
+      assert.deepEqual(Object.keys(commandOptions.env).sort(),
+        ["GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM", "GIT_TERMINAL_PROMPT", "HOME", "LANG", "PATH", "TEMP", "TMP", "TMPDIR"]);
+      if (phase === stopAt) {
+        if (options.thrown) throw options.thrown;
+        return nativeFailure;
+      }
+      return { status: 0, signal: null, stdout: commandOptions.encoding ? text : Buffer.from(text), stderr: "" };
+    });
+    syncBuiltinESMExports();
+    t.mock.method(process.stdout, "write", (bytes) => { stdout += bytes; return true; });
+    t.mock.method(process.stderr, "write", (bytes) => { stderr += bytes; return true; });
+    await matrixMain([options.mode ?? "stage"]);
+    exitCode = process.exitCode ?? 0;
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports(); process.exitCode = original.exitCode;
+  }
+  assert.equal(exitCode, 1); assert.equal(stdout, "");
+  assert(!stderr.includes("FIXTURE_SECRET") && !stderr.includes("/private/path"));
+  const lines = stderr.trimEnd().split("\n");
+  if (options.mode) {
+    assert.deepEqual(lines, [`repair-config ${options.mode} failed closed`]);
+    return;
+  }
+  assert.equal(lines.length, 2); assert.equal(lines[1], "repair-config stage failed closed");
+  assert(Buffer.byteLength(lines[0]) <= 1024);
+  return { report: JSON.parse(lines[0]), calls };
+}
+
+for (const phase of [
+  "input", "root", "payload", "receipt", "fresh-paths", "head", "scanner-identity", "scanner-environment",
+  "scanner-version", "boot", "prepare", "archive", "baseline-extract", "baseline-corepack",
+  "baseline-install", "baseline-build", "candidate-extract", "candidate-apply-check", "candidate-apply",
+  "candidate-corepack", "candidate-install", "candidate-build",
+]) test(`stage failure identifies ${phase} without native output or sensitive error text`, async (t) => {
+  const { report } = await stageFixture(t, { stopAt: phase });
+  assert.equal(report.phase, phase);
+  assert.equal(report.kind, "repair-config-stage-failure");
+  if (report.native) {
+    assert.equal(report.native.exit, 7);
+    assert.equal(report.native.stdout.sha256, hash("FIXTURE_SECRET /private/path\n"));
+    assert.equal(report.native.stderr.bytes, Buffer.byteLength("FIXTURE_SECRET error\n"));
+  }
+});
+
+for (const [name, result, expected] of [
+  ["spawn", { error: Object.assign(new Error("FIXTURE_SECRET"), { code: "ENOENT" }), status: null, signal: null }, { errorCode: "ENOENT", exit: null, signal: null, timedOut: false }],
+  ["timeout", { error: Object.assign(new Error("FIXTURE_SECRET"), { code: "ETIMEDOUT" }), status: null, signal: "SIGKILL" }, { errorCode: "ETIMEDOUT", exit: null, signal: "SIGKILL", timedOut: true }],
+  ["signal", { status: null, signal: "SIGTERM" }, { errorCode: null, exit: null, signal: "SIGTERM", timedOut: false }],
+]) test(`stage records allowlisted ${name} facts without inferring a timeout from a signal`, async (t) => {
+  const { report } = await stageFixture(t, { stopAt: "head", result });
+  for (const [key, value] of Object.entries(expected)) assert.equal(report.native[key], value);
+});
+
+test("thrown native spawn error retains only its allowlisted code and phase", async (t) => {
+  const { report } = await stageFixture(t, {
+    stopAt: "head", thrown: Object.assign(new Error("FIXTURE_SECRET /private/path"), { code: "EACCES" }),
+  });
+  assert.equal(report.phase, "head"); assert.equal(report.errorCode, "EACCES");
+  assert.equal(report.native, undefined);
+});
+
+for (const phase of ["scanner-version", "baseline-corepack", "candidate-corepack"])
+  test(`stage distinguishes ${phase} mismatch from native command failure`, async (t) => {
+    const { report } = await stageFixture(t, {
+      stopAt: phase, result: { status: 0, signal: null, stdout: "FIXTURE_SECRET unexpected version", stderr: "" },
+    });
+    assert.equal(report.phase, phase); assert.equal(report.native.exit, 0);
+    assert.equal(report.facts.versionMatch, false);
+    assert.equal(report.errorCode, "ERR_ASSERTION");
+  });
+
+test("stage diagnostic serialization is bounded and excludes arbitrary keys and unclassified values", () => {
+  const secret = "FIXTURE_SECRET".repeat(10_000);
+  const record = stageFailureRecord({
+    phase: secret, stack: secret, payload: secret, facts: { uidMatch: false, modeMatch: true, versionMatch: false, secret },
+    native: { exit: secret, signal: secret, errorCode: secret, timedOut: secret,
+      stdout: { bytes: 1024 ** 3, sha256: "a".repeat(64), raw: secret }, stderr: { bytes: -1, sha256: secret }, env: secret },
+  }, Object.assign(new Error(secret), { code: secret }));
+  assert(Buffer.byteLength(record) <= 1024);
+  assert(!record.includes("FIXTURE_SECRET"));
+  assert.deepEqual(JSON.parse(record), {
+    kind: "repair-config-stage-failure", phase: "input", errorCode: "unclassified",
+    facts: { uidMatch: false, modeMatch: true, versionMatch: false },
+    native: { exit: null, signal: "unclassified", errorCode: "unclassified", timedOut: false,
+      stdout: { bytes: 1024 ** 3, sha256: "a".repeat(64) }, stderr: null },
+  });
+});
+
+test("scanner environment requires existing proof-owned private HOME/tmp without permission changes", (t) => {
+  const q = { proofUid: 999, proofGid: 982 }, seen = [];
+  let change = () => {};
+  t.mock.method(fs, "lstatSync", (file) => {
+    seen.push(file);
+    const stat = { isDirectory: () => true, isSymbolicLink: () => false, uid: 999, gid: 982, mode: 0o40700 };
+    change(stat, file); return stat;
+  });
+  try {
+    const options = scannerStageOptions(q);
+    assert.deepEqual(seen, [`${ROOT}/private`, `${ROOT}/private/tmp`]);
+    assert.equal(options.env.HOME, `${ROOT}/private`);
+    assert.equal(options.env.TMPDIR, `${ROOT}/private/tmp`);
+    assert.equal(options.uid, 999); assert.equal(options.gid, 982);
+    for (const edit of [
+      (s) => { s.uid = 1000; }, (s) => { s.gid = 1000; }, (s) => { s.mode = 0o40755; },
+      (s) => { s.mode = 0o42700; }, (s) => { s.isDirectory = () => false; },
+      (s) => { s.isSymbolicLink = () => true; },
+      () => { throw Object.assign(new Error("absent"), { code: "ENOENT" }); },
+    ]) {
+      change = (stat, file) => { if (file.endsWith("/tmp")) edit(stat); };
+      assert.throws(() => scannerStageOptions(q));
+    }
+  } finally { t.mock.restoreAll(); }
+});
+
+test("stage diagnostics do not appear in subsequent credential-bearing login failures", async (t) => {
+  await stageFixture(t);
+  await stageFixture(t, { mode: "login" });
 });
 
 test("workflow verifies qualification and staged inputs before API login then runs without secret env", () => {
