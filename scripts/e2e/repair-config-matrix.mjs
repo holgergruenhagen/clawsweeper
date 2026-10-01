@@ -14,14 +14,14 @@ export const PINS = Object.freeze({
   candidate: "2e75822d6d09b54e217b19fcc09581daad75b96253f2ccafdda20eb448506d74",
   files: 1882,
   codex: "0.159.3", scanner: "3.97.4", pnpm: "12.4.1",
-  crabbox: "d05aa44f0ec3f3cddac3e9c8dfdf269298a7e6253218dc28a41116379f23e82a",
+  crabbox: "68c05c47a547789ff8c49c13ee590266cb7ed98825bc5970c030e3679e0cc812",
   label: "crabbox-proof-20261001-b-7c91e5a2",
   branch: "proof/repair-codex-config-20261001",
 });
 export const LIMITS = Object.freeze({
   nativeExecStarts: 12, nativeExecMs: 180_000, matrixMs: 2_700_000,
   cleanupMs: 300_000, fixtureBytes: 128 * 1024 * 1024, fixtureFiles: 1024,
-  retainedBytes: 64 * 1024 * 1024, retainedFiles: 53,
+  retainedBytes: 64 * 1024 * 1024, retainedFiles: 58,
 });
 const ROOT = "/opt/repair-config-proof-20261001";
 const INPUTS = `${ROOT}/matrix-inputs.json`;
@@ -39,7 +39,6 @@ const CHANGED = [
   "test/repair/execute-fix-policy.test.ts", "test/repair/process-env.test.ts",
 ];
 const CELLS = ["baseline-ordinary", "baseline-maintainer", "candidate-ordinary", "candidate-maintainer"];
-const REGISTRATION = ["api", "-X", "POST", "repos/openclaw/clawsweeper/actions/runners/registration-token", "--jq", ".token"];
 let executionDeadline = Infinity;
 let terminationDeadline = Infinity;
 const STAGE_PHASES = Object.freeze([
@@ -230,29 +229,16 @@ export function assertRetention(paths, reserveFiles = 0, reserveBytes = 0) {
   return { files, bytes };
 }
 
-export function registrationAdapterSource(ghx, sha256, node = process.execPath) {
-  assert(path.isAbsolute(ghx) && path.isAbsolute(node) && isHash(sha256));
-  return `#!${node}
-import assert from "node:assert/strict";
-import fs from "node:fs";
-import crypto from "node:crypto";
-import {spawnSync} from "node:child_process";
-try {
-  assert.deepEqual(process.argv.slice(2), ${JSON.stringify(REGISTRATION)});
-  const command=${JSON.stringify(ghx)};
-  assert.equal(fs.realpathSync(command), command);
-  assert.equal(crypto.createHash("sha256").update(fs.readFileSync(command)).digest("hex"), ${JSON.stringify(sha256)});
-  const result=spawnSync(command, ["--no-cache", ...process.argv.slice(2)], {env:process.env, encoding:"utf8", timeout:15000, maxBuffer:8192});
-  assert(!result.error && !result.signal && result.status===0);
-  const token=result.stdout.trim();
-  assert(/^[A-Za-z0-9._-]{8,4096}$/.test(token));
-  process.stdout.write(token+"\\n");
-} catch { process.stderr.write("registration adapter failed closed\\n"); process.exitCode=1; }
-`;
+// Input validation only, not GitHub group authority. The future reviewed
+// acquisition payload must call this before warmup; controllerPlan is too late.
+export function admitAcquisitionInput({ runnerGroupId } = {}) {
+  assert(Number.isSafeInteger(runnerGroupId) && runnerGroupId > 0, "explicit repository JIT group id required");
+  return { runnerGroupId, inputValidated: true, authorityVerified: false };
 }
 
-export function controllerPlan({ crabbox, ghAdapter, leaseId, qualificationDigest, inputDigest, proofHead, proofTree, proofDigest }) {
-  assert(path.isAbsolute(crabbox) && path.isAbsolute(ghAdapter));
+export function controllerPlan({ crabbox, runnerGroupId, leaseId, qualificationDigest, inputDigest, proofHead, proofTree, proofDigest }) {
+  admitAcquisitionInput({ runnerGroupId });
+  assert(path.isAbsolute(crabbox));
   assert(/^cbx_[a-f0-9]{12}$/.test(leaseId));
   assert([qualificationDigest, inputDigest, proofDigest].every(isHash));
   assert([proofHead, proofTree].every((value) => /^[a-f0-9]{40}$/.test(value)));
@@ -265,11 +251,16 @@ export function controllerPlan({ crabbox, ghAdapter, leaseId, qualificationDiges
       { argv: [crabbox, "run", "--id", leaseId, "--no-sync", "--no-hydrate", "--script-stdin"], purpose: "bound source staging; sealed inputs" },
     ],
     registration: {
-      argv: [crabbox, "actions", "register", "--id", leaseId, "--repo", "openclaw/clawsweeper", "--name", runnerName, "--labels", PINS.label, "--ephemeral"],
-      prependPATH: path.dirname(ghAdapter), adapterBasename: "gh",
-      requires: ["qualified guest receipt", "sealed source/build inputs", "current code audits", "native precommit review", "signed advertised proof head"],
-      tokenStdout: "private native capture only",
-      evidenceRequired: ["binarySHA256", "argv", "code", "signal", "stdout"],
+      argv: [crabbox, "actions", "register", "--id", leaseId, "--repo", "openclaw/clawsweeper", "--name", runnerName,
+        "--labels", PINS.label, "--ephemeral", "--jit", "--runner-group-id", String(runnerGroupId)],
+      requires: ["authoritative repository JIT group id", "pre-warmup input admission", "qualified guest receipt",
+        "sealed source/build inputs", "current code audits", "native precommit review", "signed advertised proof head"],
+      // Native owns 16s request + 180s install + 30s guest/16s API cleanup.
+      // This allowance is not a proved wall bound or an outer kill timer.
+      allowanceMs: 300_000, nativePhaseBudgetMs: 242_000, overheadMs: 58_000, provedWallClockBound: false,
+      supervision: "native phase cleanup; caller supervision requires separate review",
+      capture: "bounded complete private CLI receipt; no JIT secret",
+      evidenceRequired: ["binarySHA256", "argv", "code", "signal", "stdout", "stderr", "truncated", "durationMs"],
     },
     preDispatch: {
       proofHead, runnerName, runnerLabel: PINS.label,
@@ -286,6 +277,20 @@ export function controllerPlan({ crabbox, ghAdapter, leaseId, qualificationDiges
 }
 
 const controllerFailures = new WeakMap();
+
+function jitLaunchReceipt(text, runnerName) {
+  assert(Buffer.byteLength(text) <= 1024);
+  const receipt = JSON.parse(text);
+  assert(Number.isSafeInteger(receipt?.runnerId) && receipt.runnerId > 0);
+  // Match the pinned native encoder's complete record, including its newline.
+  // This also rejects duplicate keys, trailing output and unreviewed fields.
+  assert.equal(text, json({
+    kind: "actions-jit-registration", stage: "launch-accepted", ownership: "owned",
+    runnerId: receipt.runnerId, runnerName, httpStatus: 201, apiExit: 0,
+    launchAccepted: true, guestCleanup: "not-started", runnerCleanup: "handoff-on-success",
+  }));
+  return receipt;
+}
 
 function controllerNativeFacts(result = {}) {
   const error = result.error || result.errorCode != null
@@ -365,13 +370,17 @@ export function dispatchAfterReadback(options, ghxCall, clock = {}) {
     context.field = "argv";
     assert.deepEqual(registration.argv, plan.registration.argv);
     check("exit", registration.code === 0 && !registration.error && !registration.errorCode
-      && !registration.failure && !registration.truncated && !registration.timedOut
+      && !registration.failure && registration.truncated === false && !registration.timedOut
       && context.native.errorCode === null && !context.native.timedOut);
     check("signal", registration.signal === null);
-    check("output", typeof registration.stdout === "string" && Buffer.byteLength(registration.stdout) <= 64 * 1024);
-    check("receipt", registration.stdout.trim().split("\n").at(-1)
-      === `actions runner registered repo=openclaw/clawsweeper name=${expected.runnerName} labels=${expected.runnerLabel} ephemeral=true`);
-    let runner;
+    check("allowance", Number.isSafeInteger(registration.durationMs) && registration.durationMs >= 0
+      && registration.durationMs <= plan.registration.allowanceMs);
+    check("output", ["stdout", "stderr"].every((key) => typeof registration[key] === "string"
+      && Buffer.byteLength(registration[key]) <= 64 * 1024));
+    context.field = "receipt";
+    const receipt = jitLaunchReceipt(registration.stdout, expected.runnerName);
+    context.runnerId = receipt.runnerId;
+    let runner, runnerSeen = false;
     for (;;) {
       context.phase = "runner";
       remaining();
@@ -386,15 +395,15 @@ export function dispatchAfterReadback(options, ghxCall, clock = {}) {
       delete context.matches;
       delete context.status;
       if (list.total_count === 0) {
-        check("disappearance", context.runnerId === undefined);
+        check("disappearance", !runnerSeen);
       } else {
         runner = list.runners[0];
         check("id", runner !== null && typeof runner === "object" && Number.isSafeInteger(runner.id) && runner.id > 0);
-        check("id", context.runnerId === undefined || context.runnerId === runner.id);
-        context.runnerId = runner.id;
+        check("id", context.runnerId === runner.id);
         context.status = ["online", "offline"].includes(runner.status) ? runner.status : "unknown";
         context.matches = {
-          name: runner.name === expected.runnerName, os: runner.os === "linux", busy: runner.busy === false,
+          name: runner.name === expected.runnerName,
+          os: runner.os === "linux" || (runner.status === "offline" && runner.os === "unknown"), busy: runner.busy === false,
           labels: Array.isArray(runner.labels) && runner.labels.length === 1
             && runner.labels[0]?.name === expected.runnerLabel && runner.labels[0]?.type === "custom",
           ephemeralPresent: Object.hasOwn(runner, "ephemeral"),
@@ -403,6 +412,7 @@ export function dispatchAfterReadback(options, ghxCall, clock = {}) {
         for (const field of ["name", "os", "labels", "busy", "ephemeral"]) check(field, context.matches[field]);
         // Native registration proves ephemeral when the API omits that field.
         check("status", context.status !== "unknown");
+        runnerSeen = true;
         if (runner.status === "online") break;
       }
       check("read-limit", context.reads < 12);
@@ -1117,13 +1127,7 @@ export async function main(argv = process.argv.slice(2)) {
       result = controllerClosure(input.leaseId, input.result);
       if (!result.released) process.exitCode = 1;
     }
-    else if (mode === "registration-adapter") {
-      const options = readInput();
-      assert.equal(path.basename(options.output), "gh");
-      assertRetention(options.retainedPaths, 1, 32 * 1024);
-      fs.writeFileSync(options.output, registrationAdapterSource(options.ghx, options.sha256), { flag: "wx", mode: 0o700 });
-      result = { adapterDigest: digest(fs.readFileSync(options.output)) };
-    } else if (mode === "verify-stage") {
+    else if (mode === "verify-stage") {
       assert.equal(args.length, 1);
       const { inputs } = verifyInputs(args[0]);
       admitDeadline(inputs.expiresAt);
@@ -1169,7 +1173,7 @@ export async function main(argv = process.argv.slice(2)) {
   } catch (error) {
     if (mode === "stage") process.stderr.write(stageFailureRecord(stageDiagnostic, error));
     if (mode === "controller-dispatch") process.stderr.write(controllerFailureRecord(error));
-    process.stderr.write(`repair-config ${["stage", "payload", "controller-plan", "controller-dispatch", "controller-closure", "registration-adapter", "verify-stage", "login", "login-root", "run-matrix", "matrix", "record-codex", "fixture-gh", "fixture-git", "scanner"].includes(mode) ? mode : "admission"} failed closed\n`);
+    process.stderr.write(`repair-config ${["stage", "payload", "controller-plan", "controller-dispatch", "controller-closure", "verify-stage", "login", "login-root", "run-matrix", "matrix", "record-codex", "fixture-gh", "fixture-git", "scanner"].includes(mode) ? mode : "admission"} failed closed\n`);
     process.exitCode = 1;
   } finally {
     if (mode === "stage") stageDiagnostic = null;

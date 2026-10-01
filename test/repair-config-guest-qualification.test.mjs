@@ -11,8 +11,8 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
-  LIMITS, PINS, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
-  dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService, registrationAdapterSource,
+  LIMITS, PINS, admitAcquisitionInput, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
+  dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService,
   main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries,
 } from "../scripts/e2e/repair-config-matrix.mjs";
 
@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 9\b/);
+  assert.match(body, /fetch-depth: 10\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -488,48 +488,47 @@ test("fixture measurement tolerates descendant cleanup races but rejects missing
 
 test("retention accounts for all explicit captures plus file/byte reserve", (t) => {
   const dir = temporaryFixture(t), files = [];
-  for (let i = 0; i < 53; i++) {
+  for (let i = 0; i < 58; i++) {
     const file = path.join(dir, `${i}.log`); fs.writeFileSync(file, "x"); files.push(file);
   }
-  assert.equal(LIMITS.retainedFiles, 53);
+  assert.equal(LIMITS.retainedFiles, 58);
   assert.equal(LIMITS.retainedBytes, 64 * 1024 * 1024);
-  assert.deepEqual(assertRetention(files), { files: 53, bytes: 53 });
-  assert.deepEqual(assertRetention(files, 0, LIMITS.retainedBytes - 53), { files: 53, bytes: 53 });
+  assert.deepEqual(assertRetention(files), { files: 58, bytes: 58 });
+  assert.deepEqual(assertRetention(files, 0, LIMITS.retainedBytes - 58), { files: 58, bytes: 58 });
   assert.throws(() => assertRetention(files, 1));
-  const extra = path.join(dir, "53.log"); fs.writeFileSync(extra, "x");
+  const extra = path.join(dir, "58.log"); fs.writeFileSync(extra, "x");
   assert.throws(() => assertRetention([...files, extra]));
-  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes - 52));
+  assert.throws(() => assertRetention(files, 0, LIMITS.retainedBytes - 57));
   assert.throws(() => assertRetention([files[0], files[0]]));
   const link = path.join(dir, "symlink"); fs.symlinkSync(files[0], link);
   assert.throws(() => assertRetention([link]));
 });
 
-test("registration adapter delegates exactly one pinned ghx operation and keeps failed output private", (t) => {
-  const dir = temporaryFixture(t), ghx = path.join(dir, "fixture-ghx"), adapter = path.join(dir, "adapter.mjs");
-  const expected = ["--no-cache", "api", "-X", "POST", "repos/openclaw/clawsweeper/actions/runners/registration-token", "--jq", ".token"];
-  const body = `#!${process.execPath}\nimport assert from "node:assert/strict"; assert.deepEqual(process.argv.slice(2), ${JSON.stringify(expected)}); process.stdout.write("FIXTURE_ONLY_TOKEN_123\\n");\n`;
-  fs.writeFileSync(path.join(dir, "package.json"), '{"type":"module"}');
-  fs.writeFileSync(ghx, body, { mode: 0o700 });
-  fs.writeFileSync(adapter, registrationAdapterSource(ghx, digest(body)));
-  const run = (args) => childProcess.spawnSync(process.execPath, [adapter, ...args], {
-    env: { PATH: path.dirname(process.execPath) }, encoding: "utf8", timeout: 3000, maxBuffer: 4096,
-  });
-  const accepted = run(expected.slice(1));
-  assert.equal(accepted.status, 0, accepted.stderr);
-  assert.equal(accepted.stdout, "FIXTURE_ONLY_TOKEN_123\n");
-  for (const args of [[], ["auth", "token"], [...expected.slice(1), "--input", "-"]]) {
-    const rejected = run(args);
-    assert.equal(rejected.status, 1); assert.equal(rejected.stdout, "");
-    assert.equal(rejected.stderr, "registration adapter failed closed\n");
+test("lease-independent admission validates only explicit input, never GitHub authority", () => {
+  for (const runnerGroupId of [23, Number.MAX_SAFE_INTEGER]) {
+    assert.deepEqual(admitAcquisitionInput({ runnerGroupId }), { runnerGroupId, inputValidated: true, authorityVerified: false });
   }
-  fs.appendFileSync(ghx, "// changed binary\n");
-  const changed = run(expected.slice(1));
-  assert.equal(changed.status, 1); assert.equal(changed.stdout, "");
+  for (const runnerGroupId of [undefined, null, "UNBOUND", "", "23", 0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, true]) {
+    assert.throws(() => admitAcquisitionInput({ runnerGroupId }));
+    assert.throws(() => controllerPlan({ runnerGroupId }));
+  }
+  assert.throws(() => admitAcquisitionInput());
+  const source = fs.readFileSync(new URL("../scripts/e2e/repair-config-matrix.mjs", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /registration-token|registrationAdapterSource|registration-adapter/);
+});
+
+test("removed legacy adapter mode cannot mint or create a fallback", (t) => {
+  const result = childProcess.spawnSync(process.execPath, [
+    fileURLToPath(new URL("../scripts/e2e/repair-config-matrix.mjs", import.meta.url)), "registration-adapter",
+  ], { env: { PATH: path.dirname(process.execPath), HOME: temporaryFixture(t) }, encoding: "utf8", timeout: 3000, maxBuffer: 4096 });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(result.stderr, "repair-config admission failed closed\n");
 });
 
 test("controller plan binds sole-label registration after qualification and exact-lease cleanup", () => {
   const plan = controllerPlan({
-    crabbox: "/fixture/crabbox", ghAdapter: "/fixture/gh", leaseId: LEASE,
+    crabbox: "/fixture/crabbox", runnerGroupId: 23, leaseId: LEASE,
     qualificationDigest: "a".repeat(64), inputDigest: "b".repeat(64),
     proofHead: HEAD, proofTree: PROOF_TREE, proofDigest: "c".repeat(64),
   });
@@ -537,7 +536,16 @@ test("controller plan binds sole-label registration after qualification and exac
   assert.deepEqual(plan.leasePolicy, { ttlSeconds: 5400, idleSeconds: 5400, minimumMatrixRemainingSeconds: 3000, renewal: false });
   assert.equal(plan.beforeRegistration.length, 2);
   assert(plan.beforeRegistration.every(({ argv }) => argv.includes("--no-sync") && argv.includes("--script-stdin")));
-  assert.deepEqual(plan.registration.argv.slice(-3), ["--labels", PINS.label, "--ephemeral"]);
+  assert.deepEqual(plan.registration.argv.slice(-6), ["--labels", PINS.label, "--ephemeral", "--jit", "--runner-group-id", "23"]);
+  assert.equal(plan.registration.allowanceMs, 300_000);
+  assert.equal(plan.registration.nativePhaseBudgetMs, 16_000 + 180_000 + 30_000 + 16_000);
+  assert.equal(plan.registration.overheadMs, 58_000);
+  assert.equal(plan.registration.provedWallClockBound, false);
+  assert.equal(plan.registration.nativePhaseBudgetMs + plan.registration.overheadMs, plan.registration.allowanceMs);
+  assert(!Object.hasOwn(plan.registration, "timeout") && !Object.hasOwn(plan.registration, "killSignal"));
+  assert(!Object.hasOwn(plan.registration, "prependPATH"));
+  assert(plan.registration.requires.includes("authoritative repository JIT group id"));
+  assert(plan.registration.requires.includes("pre-warmup input admission"));
   assert.deepEqual(plan.exactCleanup, ["/fixture/crabbox", "stop", LEASE]);
   assert(plan.dispatch.includes(`matrix_input_digest=${"b".repeat(64)}`));
   assert.equal(plan.preDispatch.proofHead, HEAD);
@@ -549,7 +557,7 @@ function controllerFixture() {
   let elapsed = 0, wallOffset = 0;
   const wall = Date.parse("2026-10-01T15:00:00Z");
   const options = {
-    crabbox: "/fixture/crabbox", ghAdapter: "/fixture/gh", leaseId: LEASE,
+    crabbox: "/fixture/crabbox", runnerGroupId: 23, leaseId: LEASE,
     qualificationDigest: "a".repeat(64), inputDigest: "b".repeat(64),
     proofHead: HEAD, proofTree: PROOF_TREE, proofDigest: "c".repeat(64),
     lease: { leaseId: LEASE, provider: "aws", expiresAt: new Date(wall + 5_400_000).toISOString() },
@@ -557,7 +565,12 @@ function controllerFixture() {
   const plan = controllerPlan(options);
   options.registration = {
     binarySHA256: PINS.crabbox, argv: plan.registration.argv, code: 0, signal: null,
-    stdout: `actions runner registered repo=openclaw/clawsweeper name=${plan.preDispatch.runnerName} labels=${PINS.label} ephemeral=true\n`,
+    stdout: `${JSON.stringify({
+      kind: "actions-jit-registration", stage: "launch-accepted", ownership: "owned",
+      runnerId: 123, runnerName: plan.preDispatch.runnerName, httpStatus: 201, apiExit: 0,
+      launchAccepted: true, guestCleanup: "not-started", runnerCleanup: "handoff-on-success",
+    })}\n`,
+    stderr: "", truncated: false, durationMs: 10_000,
   };
   const value = {
     ref: { ref: `refs/heads/${PINS.branch}`, object: { type: "commit", sha: HEAD } },
@@ -613,6 +626,63 @@ test("dispatch consumes exact native registration, runner, fresh head and lease 
   }
 });
 
+test("registration allowance admits complete on-time captures without claiming a wall-clock supervisor", () => {
+  for (const durationMs of [0, 242_000, 300_000]) {
+    const f = controllerFixture();
+    f.options.registration.durationMs = durationMs;
+    assert.equal(f.run().dispatched, true);
+  }
+  for (const durationMs of [0.5, NaN, Number.MAX_SAFE_INTEGER]) {
+    const f = controllerFixture();
+    f.options.registration.durationMs = durationMs;
+    assert.equal(controllerRejection(f.run).field, "allowance");
+    assert.equal(f.calls.length, 0);
+  }
+});
+
+for (const [name, change] of [
+  ["wrong kind", (r) => { r.kind = "legacy"; }],
+  ["not launch-accepted", (r) => { r.stage = "install"; }],
+  ["unknown ownership", (r) => { r.ownership = "unknown"; }],
+  ["missing runner id", (r) => { delete r.runnerId; }],
+  ["string runner id", (r) => { r.runnerId = "123"; }],
+  ["zero runner id", (r) => { r.runnerId = 0; }],
+  ["unsafe runner id", (r) => { r.runnerId = Number.MAX_SAFE_INTEGER + 1; }],
+  ["wrong name", (r) => { r.runnerName = "FIXTURE_SECRET"; }],
+  ["non-201", (r) => { r.httpStatus = 200; }],
+  ["string status", (r) => { r.httpStatus = "201"; }],
+  ["failed API exit", (r) => { r.apiExit = 1; }],
+  ["missing API exit", (r) => { delete r.apiExit; }],
+  ["string launch acceptance", (r) => { r.launchAccepted = "true"; }],
+  ["cleanup already run", (r) => { r.guestCleanup = "confirmed"; }],
+  ["cleanup unknown", (r) => { r.runnerCleanup = "unknown"; }],
+  ["unreviewed field", (r) => { r.secret = "FIXTURE_SECRET"; }],
+]) test(`typed JIT receipt rejects ${name} before readback`, () => {
+  const f = controllerFixture(), receipt = JSON.parse(f.options.registration.stdout);
+  change(receipt);
+  f.options.registration.stdout = `${JSON.stringify(receipt)}\n`;
+  const record = controllerRejection(f.run);
+  assert.equal(record.phase, "registration"); assert.equal(record.field, "receipt");
+  assert.equal(f.calls.length, 0);
+});
+
+for (const [name, change] of [
+  ["incomplete final line", (text) => text.slice(0, -1)],
+  ["truncated JSON", (text) => text.slice(0, -3)],
+  ["duplicate key", (text) => text.replace('"apiExit":0', '"apiExit":1,"apiExit":0')],
+  ["duplicate receipt", (text) => text + text],
+  ["trailing output", (text) => text + "FIXTURE_SECRET\n"],
+  ["oversized receipt", (text) => text.trimEnd() + " ".repeat(1024) + "\n"],
+  ["null", () => "null\n"],
+  ["array", () => "[]\n"],
+  ["legacy success", () => "actions runner registered ephemeral=true\n"],
+]) test(`complete native JIT record rejects ${name}`, () => {
+  const f = controllerFixture();
+  f.options.registration.stdout = change(f.options.registration.stdout);
+  assert.equal(controllerRejection(f.run).field, "receipt");
+  assert.equal(f.calls.length, 0);
+});
+
 for (const [field, change] of [
   ["binary", (r) => { r.binarySHA256 = "d".repeat(64); }],
   ["argv", (r) => { r.argv = ["FIXTURE_SECRET"]; }],
@@ -621,7 +691,15 @@ for (const [field, change] of [
   ["exit", (r) => { r.truncated = true; }],
   ["signal", (r) => { r.signal = "SIGTERM"; }],
   ["output", (r) => { r.stdout = "x".repeat(65537); }],
-  ["receipt", (r) => { r.stdout = r.stdout.replace("ephemeral=true", "ephemeral=false"); }],
+  ["output", (r) => { r.stderr = "x".repeat(65537); }],
+  ["exit", (r) => { delete r.truncated; }],
+  ["output", (r) => { delete r.stderr; }],
+  ["allowance", (r) => { r.durationMs = 300_001; }],
+  ["allowance", (r) => { delete r.durationMs; }],
+  ["allowance", (r) => { r.durationMs = -1; }],
+  ["allowance", (r) => { r.durationMs = "10000"; }],
+  ["allowance", (r) => { r.durationMs = Infinity; }],
+  ["receipt", (r) => { r.stdout = r.stdout.replace('"launchAccepted":true', '"launchAccepted":false'); }],
   ["receipt", (r) => { r.stdout = "FIXTURE_SECRET /private/path\n"; }],
 ]) test(`registration ${field} rejection has bounded diagnostics and makes no API call`, () => {
   const f = controllerFixture(); change(f.options.registration);
@@ -636,6 +714,7 @@ for (const [field, change] of [
   ["cardinality", (f) => { f.value.list.runners = []; }],
   ["id", (f) => { f.value.list.runners[0].id = 0; }],
   ["id", (f) => { f.value.list.runners[0].id = "123"; }],
+  ["id", (f) => { f.value.list.runners[0].id = 124; }],
   ["id", (f) => { f.value.list.runners[0] = null; }],
   ["name", (f) => { f.value.list.runners[0].name = "FIXTURE_SECRET"; }],
   ["os", (f) => { f.value.list.runners[0].os = "windows"; }],
@@ -663,7 +742,7 @@ for (const [field, change] of [
   assert.equal(f.sleeps.length, 0);
 });
 
-test("only pre-binding empty responses and exact nonbusy offline runners may wait", () => {
+test("empty propagation waits preserve the receipt ID until the exact runner is seen", () => {
   const f = controllerFixture();
   let reads = 0;
   const result = f.run((phase) => {
@@ -671,11 +750,40 @@ test("only pre-binding empty responses and exact nonbusy offline runners may wai
     reads++;
     if (reads === 1) return nativeControllerResult({ total_count: 0, runners: [] });
     f.value.list.runners[0].status = reads === 2 ? "offline" : "online";
+    f.value.list.runners[0].os = reads === 2 ? "unknown" : "linux";
     return f.response(phase);
   });
   assert.equal(result.reads, 3); assert.equal(result.runnerId, 123);
   assert.deepEqual(f.sleeps, [5000, 5000]);
   assert.deepEqual(f.calls.map(({ at }) => at), [0, 5000, 10000, 10000, 10000]);
+});
+
+test("initial empty propagation cannot rebind the JIT receipt to a different runner", () => {
+  const f = controllerFixture();
+  const record = controllerRejection(() => f.run((phase) => {
+    if (f.calls.length === 1) return nativeControllerResult({ total_count: 0, runners: [] });
+    f.value.list.runners[0].id = 124;
+    return f.response(phase);
+  }));
+  assert.equal(record.field, "id"); assert.equal(record.runnerId, 123);
+  assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [5000]);
+});
+
+test("unknown OS is only a literal offline wait, never online admission", () => {
+  for (const [status, os] of [["online", "unknown"], ["offline", ""], ["offline", undefined], ["offline", null], ["offline", "windows"]]) {
+    const f = controllerFixture();
+    Object.assign(f.value.list.runners[0], { status, os });
+    assert.equal(controllerRejection(f.run).field, "os");
+    assert.equal(f.calls.length, 1); assert.equal(f.sleeps.length, 0);
+  }
+  const f = controllerFixture();
+  f.value.list.runners[0].os = "unknown";
+  const record = controllerRejection(() => f.run((phase) => {
+    f.value.list.runners[0].status = f.calls.length === 1 ? "offline" : "online";
+    return f.response(phase);
+  }));
+  assert.equal(record.field, "os"); assert.equal(record.runnerId, 123);
+  assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [5000]);
 });
 
 for (const [field, change] of [
