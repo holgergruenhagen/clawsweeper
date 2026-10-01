@@ -20,7 +20,7 @@ export const PINS = Object.freeze({
 export const LIMITS = Object.freeze({
   nativeExecStarts: 12, nativeExecMs: 180_000, matrixMs: 2_700_000,
   cleanupMs: 300_000, fixtureBytes: 128 * 1024 * 1024, fixtureFiles: 1024,
-  retainedBytes: 8 * 1024 * 1024, retainedFiles: 18,
+  retainedBytes: 8 * 1024 * 1024, retainedFiles: 22,
 });
 const ROOT = "/opt/repair-config-proof-20261001";
 const INPUTS = `${ROOT}/matrix-inputs.json`;
