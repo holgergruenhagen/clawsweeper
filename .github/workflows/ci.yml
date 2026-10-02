@@ -53,7 +53,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           # The verifier fails closed if the frozen base is outside this bound.
-          fetch-depth: 12
+          fetch-depth: 13
           fetch-tags: false
           persist-credentials: false
       # The native Crabbox phase must finish before this runner is registered.

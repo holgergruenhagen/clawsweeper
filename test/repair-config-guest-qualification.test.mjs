@@ -13,7 +13,7 @@ import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
   LIMITS, PINS, admitAcquisitionInput, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
   dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService,
-  main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries,
+  main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries, writeSealed,
 } from "../scripts/e2e/repair-config-matrix.mjs";
 
 const BASE = "2f777941de926c6f11cb0c6363ecfe4bbee94371";
@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 12\b/);
+  assert.match(body, /fetch-depth: 13\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -251,6 +251,48 @@ function temporaryFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "repair-config-contract-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
+}
+
+for (const mask of [0o077, 0o022]) {
+  test(`sealed metadata finishes read-only and readable under umask ${mask.toString(8)}`, (t) => {
+    const root = temporaryFixture(t);
+    const file = path.join(root, "sealed.json");
+    const control = path.join(root, "creation-mode-only.json");
+    const value = { fixture: true, nativeExecStarts: 0 };
+    const previous = process.umask(mask);
+    try {
+      fs.writeFileSync(control, "{}\n", { flag: "wx", mode: 0o444 });
+      assert.equal(fs.statSync(control).mode & 0o777, 0o444 & ~mask);
+      writeSealed(file, value);
+      const stat = fs.lstatSync(file);
+      assert(stat.isFile() && !stat.isSymbolicLink());
+      assert.equal(stat.nlink, 1);
+      assert.equal(stat.uid, process.getuid());
+      assert.equal(stat.mode & 0o777, 0o444);
+      assert.equal(stat.mode & 0o222, 0);
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), value);
+      assert.throws(() => writeSealed(file, { replaced: true }), { code: "EEXIST" });
+      assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), value);
+      assert.equal(fs.statSync(file).mode & 0o777, 0o444);
+      const sentinel = path.join(root, "sentinel.json");
+      const sentinelBytes = Buffer.from('{"sentinel":"unchanged"}\n');
+      fs.writeFileSync(sentinel, sentinelBytes, { flag: "wx", mode: 0o600 });
+      const link = path.join(root, "sealed-link.json");
+      fs.symlinkSync(sentinel, link);
+      const originalLink = fs.lstatSync(link);
+      assert.throws(() => writeSealed(link, { replaced: true }), { code: "EEXIST" });
+      const unchangedLink = fs.lstatSync(link);
+      assert(unchangedLink.isSymbolicLink());
+      assert.equal(unchangedLink.dev, originalLink.dev);
+      assert.equal(unchangedLink.ino, originalLink.ino);
+      assert.equal(fs.readlinkSync(link), sentinel);
+      assert.deepEqual(fs.readFileSync(sentinel), sentinelBytes);
+      assert.equal(fs.statSync(sentinel).uid, process.getuid());
+      assert.equal(fs.statSync(sentinel).mode & 0o777, 0o600);
+    } finally {
+      process.umask(previous);
+    }
+  });
 }
 
 test("matrix lifetime admission reserves 2700 seconds plus 300 seconds for cleanup", () => {

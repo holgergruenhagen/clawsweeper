@@ -561,8 +561,9 @@ function sealed(file, expectedDigest) {
   return JSON.parse(bytes);
 }
 
-function writeSealed(file, value) {
+export function writeSealed(file, value) {
   fs.writeFileSync(file, json(value), { flag: "wx", mode: 0o444 });
+  fs.chmodSync(file, 0o444);
 }
 
 function toolIdentity(file, sha256) {
