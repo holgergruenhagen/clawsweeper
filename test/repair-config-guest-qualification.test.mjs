@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 10\b/);
+  assert.match(body, /fetch-depth: 11\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -626,6 +626,25 @@ test("dispatch consumes exact native registration, runner, fresh head and lease 
   }
 });
 
+for (const type of ["custom", "read-only"]) {
+  test(`sole exact ${type} JIT label preserves empty/offline propagation and online Linux admission`, () => {
+    const f = controllerFixture();
+    f.value.list.runners[0].labels[0].type = type;
+    let reads = 0;
+    const result = f.run((phase) => {
+      if (phase !== "runner") return f.response(phase);
+      reads++;
+      if (reads === 1) return nativeControllerResult({ total_count: 0, runners: [] });
+      f.value.list.runners[0].status = reads === 2 ? "offline" : "online";
+      f.value.list.runners[0].os = reads === 2 ? "unknown" : "linux";
+      return f.response(phase);
+    });
+    assert.equal(result.dispatched, true); assert.equal(result.runnerId, 123);
+    assert.equal(result.reads, 3); assert.deepEqual(f.sleeps, [5000, 5000]);
+    assert.equal(f.calls.filter(({ phase }) => phase === "dispatch").length, 1);
+  });
+}
+
 test("registration allowance admits complete on-time captures without claiming a wall-clock supervisor", () => {
   for (const durationMs of [0, 242_000, 300_000]) {
     const f = controllerFixture();
@@ -726,7 +745,12 @@ for (const [field, change] of [
   ["ephemeral", (f) => { f.value.list.runners[0].ephemeral = "true"; }],
   ["labels", (f) => { f.value.list.runners[0].labels.push({ name: "self-hosted", type: "read-only" }); }],
   ["labels", (f) => { f.value.list.runners[0].labels[0].name = "FIXTURE_SECRET"; }],
-  ["labels", (f) => { f.value.list.runners[0].labels[0].type = "read-only"; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].type = "system"; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].type = "Read-Only"; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].type = null; }],
+  ["labels", (f) => { delete f.value.list.runners[0].labels[0].type; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0] = { name: "self-hosted", type: "read-only" }; }],
+  ["labels", (f) => { f.value.list.runners[0].labels[0].type = "read-only"; f.value.list.runners[0].labels.push({ name: "self-hosted", type: "read-only" }); }],
   ["labels", (f) => { delete f.value.list.runners[0].labels; }],
   ["ref", (f) => { f.value.ref.ref = "refs/heads/main"; }],
   ["type", (f) => { f.value.ref.object.type = "tag"; }],

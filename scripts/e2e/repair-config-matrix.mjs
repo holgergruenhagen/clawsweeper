@@ -14,7 +14,7 @@ export const PINS = Object.freeze({
   candidate: "2e75822d6d09b54e217b19fcc09581daad75b96253f2ccafdda20eb448506d74",
   files: 1882,
   codex: "0.159.3", scanner: "3.97.4", pnpm: "12.4.1",
-  crabbox: "68c05c47a547789ff8c49c13ee590266cb7ed98825bc5970c030e3679e0cc812",
+  crabbox: "5cf55179574e7cd82c478b3d44ebcab9d2f33906821f22c2e006e74bc0d2cd5a",
   label: "crabbox-proof-20261001-b-7c91e5a2",
   branch: "proof/repair-codex-config-20261001",
 });
@@ -405,7 +405,7 @@ export function dispatchAfterReadback(options, ghxCall, clock = {}) {
           name: runner.name === expected.runnerName,
           os: runner.os === "linux" || (runner.status === "offline" && runner.os === "unknown"), busy: runner.busy === false,
           labels: Array.isArray(runner.labels) && runner.labels.length === 1
-            && runner.labels[0]?.name === expected.runnerLabel && runner.labels[0]?.type === "custom",
+            && runner.labels[0]?.name === expected.runnerLabel && ["custom", "read-only"].includes(runner.labels[0]?.type),
           ephemeralPresent: Object.hasOwn(runner, "ephemeral"),
           ephemeral: !Object.hasOwn(runner, "ephemeral") || runner.ephemeral === true,
         };
