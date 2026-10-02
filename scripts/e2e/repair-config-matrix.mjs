@@ -795,10 +795,17 @@ export function observeService(unit, control = command, files = fs) {
     if (error.code !== "ENOENT") throw error;
     groupExists = false;
   }
-  return { fields, groupExists, terminated: [0, 1, 4].includes(state.status) && !state.error && !state.signal && unitStopped(fields, groupExists, populated) };
+  return { fields, groupExists, errorCode: stageErrorCode(state.error),
+    terminated: [0, 1, 4].includes(state.status) && !state.error && !state.signal && unitStopped(fields, groupExists, populated) };
 }
 
-async function rootService(inputs, name, commandPath, args, env, options = {}) {
+const rootServiceFailures = new WeakMap();
+
+export function rootServiceFailureRecord(error) {
+  return rootServiceFailures.get(error) ?? null;
+}
+
+export async function rootService(inputs, name, commandPath, args, env, options = {}) {
   assertRoot();
   const unit = `repair-proof-${inputs.leaseId.slice(4)}-${crypto.randomUUID()}.service`;
   const seconds = Math.min(options.seconds ?? 450, Math.floor((options.deadline - Date.now() - 10_000) / 1000));
@@ -810,13 +817,22 @@ async function rootService(inputs, name, commandPath, args, env, options = {}) {
     arg === "--property=RuntimeMaxSec=100s" ? `--property=RuntimeMaxSec=${seconds}s` : arg);
   const prior = observeService(unit);
   assert(prior.terminated && prior.fields.LoadState === "not-found" && !prior.groupExists, "new task unit only");
-  let outputBytes = 0, stdout = "", failure = null, stopped = false;
+  let outputBytes = 0, stdout = "", failure = null, stopped = false, lastSuccessfulUsage = null;
+  let wrapperErrorCode = null, cleanupFailed = false, settled;
+  const cleanup = {
+    stopAttempted: false, stopExit: null, stopSignal: null, stopErrorCode: null,
+    observationErrorCode: null, terminationConfirmed: null,
+  };
+  const fail = (kind, error = null) => { failure ??= { kind, errorCode: stageErrorCode(error) }; };
   const stop = () => {
     if (stopped) return; stopped = true;
+    cleanup.stopAttempted = true;
     try {
       const result = command("/usr/bin/systemctl", ["--no-ask-password", "stop", unit], { timeout: 20_000, allowFailure: true, cleanup: true });
-      if (result.error || result.signal || result.status !== 0) failure ??= "native-stop";
-    } catch { failure ??= "native-stop"; }
+      const facts = stageNativeFacts(result);
+      cleanup.stopExit = facts.exit; cleanup.stopSignal = facts.signal; cleanup.stopErrorCode = facts.errorCode;
+      if (result.error || result.signal || result.status !== 0) cleanupFailed = true;
+    } catch (error) { cleanupFailed = true; cleanup.stopErrorCode = stageErrorCode(error); }
   };
   let status;
   try {
@@ -825,39 +841,77 @@ async function rootService(inputs, name, commandPath, args, env, options = {}) {
         cwd: ROOT, env: cleanEnv(`${ROOT}/prepare`), stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       });
       const monitor = setInterval(() => {
+        let kind = "fixture-measurement";
         try {
-          fixtureUsage();
+          lastSuccessfulUsage = fixtureUsage();
+          kind = "matrix-deadline";
           if (Date.now() >= options.deadline) throw new Error("matrix deadline");
+          kind = "native-start-measurement";
           for (const slot of fs.readdirSync(`${ROOT}/private/admission`).filter((name) => name.endsWith(".start.json"))) {
+            kind = "native-start-measurement";
             const admission = readJSON(`${ROOT}/private/admission/${slot}`);
+            kind = "native-start-deadline";
             if (!fs.existsSync(`${ROOT}/private/admission/${slot.replace(".start.json", ".exit.json")}`)
               && Date.now() - admission.admittedAt >= LIMITS.nativeExecMs - 5_000)
               throw new Error("native start deadline");
           }
         }
-        catch { failure ??= "fixture-or-time-budget"; stop(); }
+        catch (error) {
+          if (kind === "fixture-measurement" && error?.code === "ERR_ASSERTION"
+            && error?.message === "aggregate disposable fixture ceiling") kind = "fixture-limit";
+          fail(kind, error); stop();
+        }
       }, 200);
       const capture = (chunk, isStdout) => {
         outputBytes += chunk.length;
-        if (outputBytes > 2 * 1024 * 1024) { failure ??= "output-budget"; stop(); return; }
+        if (outputBytes > 2 * 1024 * 1024) { fail("output-budget"); stop(); return; }
         if (isStdout && !options.secret) stdout += chunk;
       };
       child.stdout.on("data", (chunk) => capture(chunk, true));
       child.stderr.on("data", (chunk) => capture(chunk, false));
-      child.on("error", () => { failure ??= "spawn"; });
-      if (child.stdin) { child.stdin.on("error", () => { failure ??= "stdin"; }); child.stdin.end(options.input); }
-      child.on("close", (code, signal) => { clearInterval(monitor); resolve({ code, signal }); });
+      child.on("error", (error) => { wrapperErrorCode = stageErrorCode(error); fail("spawn", error); });
+      if (child.stdin) { child.stdin.on("error", (error) => { fail("stdin", error); }); child.stdin.end(options.input); }
+      child.on("close", (code, signal) => {
+        clearInterval(monitor);
+        if (signal) fail("wrapper-signal");
+        else if (code !== 0) fail("wrapper-exit");
+        resolve({ code, signal });
+      });
     });
+  } catch (error) {
+    wrapperErrorCode = stageErrorCode(error);
+    fail("wrapper-error", error);
   } finally {
-    let settled;
-    try { settled = observeService(unit); } catch { failure ??= "termination-observation"; }
+    try { settled = observeService(unit); cleanup.observationErrorCode ??= settled.errorCode; }
+    catch (error) { cleanupFailed = true; cleanup.observationErrorCode ??= stageErrorCode(error); }
     if (!settled?.terminated) {
       stop();
-      try { settled = observeService(unit); } catch { failure ??= "termination-observation"; }
+      try { settled = observeService(unit); cleanup.observationErrorCode ??= settled.errorCode; }
+      catch (error) { cleanupFailed = true; cleanup.observationErrorCode ??= stageErrorCode(error); }
     }
-    assert(settled?.terminated, "native child termination unconfirmed");
+    cleanup.terminationConfirmed = settled?.terminated === true ? true : null;
   }
-  assert(status?.code === 0 && !status.signal && !failure, `${name} failed closed`);
+  try {
+    assert(status?.code === 0 && !status.signal && !failure && !cleanupFailed && settled?.terminated,
+      "root service failed closed");
+  } catch (error) {
+    // These are timeout/systemd-run wrapper facts, never inferred Codex exits.
+    // Secret login retains its existing generic failure output only.
+    if (!options.secret) {
+      const phase = CELLS.some((cell) => ["plan", "deterministic-review", "fix-review"].some((part) => name === `${cell}-${part}`))
+        ? name : "unknown";
+      const native = stageNativeFacts({ status: status?.code, signal: status?.signal });
+      const record = {
+        kind: "repair-config-service-failure", phase, attribution: "timeout-systemd-run-wrapper",
+        firstFailure: failure,
+        wrapper: { exit: native.exit, signal: native.signal, errorCode: wrapperErrorCode },
+        lastSuccessfulUsage, cleanup,
+      };
+      assert(Buffer.byteLength(json(record)) <= 1024);
+      rootServiceFailures.set(error, record);
+    }
+    throw error;
+  }
   return { status: 0, outputBytes, stdout };
 }
 
@@ -1019,7 +1073,7 @@ async function matrix(expectedDigest) {
   assert(!fs.existsSync(`${ROOT}/matrix-started.json`), "one matrix attempt only");
   writeSealed(`${ROOT}/matrix-started.json`, { deadline, inputDigest: expectedDigest });
   const observations = [];
-  let failure = null, peak = { files: 0, bytes: 0 };
+  let failure = null, serviceFailure = null, peak = { files: 0, bytes: 0 };
   try {
     for (const name of CELLS) {
       const cell = makeCell(inputs, name), env = cellEnvironment(inputs, cell);
@@ -1087,14 +1141,15 @@ async function matrix(expectedDigest) {
     }
     assert.equal(fs.readdirSync(`${ROOT}/private/admission`).filter((name) => name.endsWith(".start.json")).length, 12);
     verifyInputs(expectedDigest);
-  } catch {
+  } catch (error) {
     failure = "matrix failed closed; no retry or fallback";
+    serviceFailure = rootServiceFailureRecord(error);
   }
   const actualStarts = CELLS.flatMap((name) => {
     const file = `${ROOT}/private/cells/${name}/trace.jsonl`;
     return fs.existsSync(file) ? fs.readFileSync(file, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse).filter((row) => row.kind === "native-start") : [];
   });
-  const result = { passed: failure === null, failure, leaseId: inputs.leaseId, nativeExecStarts: actualStarts.length,
+  const result = { passed: failure === null, failure, serviceFailure, leaseId: inputs.leaseId, nativeExecStarts: actualStarts.length,
     phaseCounts: Object.fromEntries(["plan", "edit", "review"].map((phase) => [phase, actualStarts.filter((row) => row.phase === phase).length])),
     underlyingModelRequestCount: null, observations, peak, inputDigest: expectedDigest, durationMs: LIMITS.matrixMs - (deadline - Date.now()),
     limits: "Compiled fixture plan/edit/review only; no production publication or deployment proof" };

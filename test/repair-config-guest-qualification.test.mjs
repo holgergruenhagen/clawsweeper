@@ -13,7 +13,7 @@ import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
   LIMITS, PINS, admitAcquisitionInput, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
   dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService,
-  main as matrixMain, reserveStart, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries, writeSealed,
+  main as matrixMain, reserveStart, rootService, rootServiceFailureRecord, scannerInvocation, scannerStageOptions, sourceInventory, stageFailureRecord, validateEntries, writeSealed,
 } from "../scripts/e2e/repair-config-matrix.mjs";
 
 const BASE = "2f777941de926c6f11cb0c6363ecfe4bbee94371";
@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 13\b/);
+  assert.match(body, /fetch-depth: 14\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -324,6 +324,222 @@ test("expired work admission still permits bounded exact-unit termination and ob
   assert.equal(observeService(unit, () => ({ status: 1, error: new Error("timeout"), stdout: "" }), missing).terminated, false);
   const populated = { lstatSync: () => ({ isDirectory: () => true }), readFileSync: () => "populated 1\n" };
   assert.equal(observeService(unit, control, populated).terminated, false);
+});
+
+// Run the actual service wrapper with only builtin guest I/O replaced. Every
+// command is asserted here; no host service, native tool or model is executed.
+async function serviceFixture(t, spec = {}) {
+  const canary = "FIXTURE_SECRET /fixture/private-canary";
+  const fault = (code) => Object.assign(new Error(canary), { code });
+  const calls = [], deadline = 1_500_000;
+  let now = 1_000_000, interval, cleared = 0, observations = 0, observation = "terminated";
+  let measurement = 0, size = 7, result, error;
+  try {
+    t.mock.method(process, "getuid", () => 0);
+    t.mock.method(Date, "now", () => now);
+    t.mock.method(globalThis, "setInterval", (callback, ms) => {
+      assert.equal(ms, 200); interval = callback; return 1;
+    });
+    t.mock.method(globalThis, "clearInterval", (id) => { assert.equal(id, 1); cleared++; });
+    t.mock.method(fs, "readdirSync", (dir) => {
+      if (dir === `${ROOT}/private`) {
+        const value = spec.usage?.[measurement++] ?? 7;
+        if (typeof value === "string") throw fault(value);
+        size = value;
+        return spec.emptyUsage ? [] : [{ name: "fixture-file" }];
+      }
+      assert.equal(dir, `${ROOT}/private/admission`);
+      if (spec.admissionError) throw fault(spec.admissionError);
+      return spec.expiredStart ? ["baseline-ordinary-plan.start.json"] : [];
+    });
+    t.mock.method(fs, "lstatSync", (file) => {
+      if (file === `${ROOT}/private/fixture-file`) return { isDirectory: () => false, size };
+      assert(file.startsWith("/sys/fs/cgroup/system.slice/repair-proof-"));
+      if (observation === "terminated") throw fault("ENOENT");
+      return { isDirectory: () => true };
+    });
+    t.mock.method(fs, "readFileSync", (file) => {
+      if (file === `${ROOT}/private/admission/baseline-ordinary-plan.start.json`)
+        return JSON.stringify({ admittedAt: now - LIMITS.nativeExecMs });
+      assert(file.startsWith("/sys/fs/cgroup/system.slice/repair-proof-") && file.endsWith("/cgroup.events"));
+      return "populated 1\n";
+    });
+    t.mock.method(fs, "existsSync", (file) => {
+      assert.equal(file, `${ROOT}/private/admission/baseline-ordinary-plan.exit.json`); return false;
+    });
+    t.mock.method(childProcess, "spawnSync", (bin, args, options) => {
+      assert.equal(bin, "/usr/bin/systemctl");
+      assert.equal(args[0], "--no-ask-password");
+      assert.match(args[2], /^repair-proof-012345abcdef-[a-f0-9-]{36}\.service$/);
+      calls.push(args[1]);
+      if (args[1] === "stop") {
+        assert.equal(options.timeout, 20_000);
+        if (spec.stopError) throw fault(spec.stopError);
+        return { status: spec.stopCode ?? 0, signal: null, stdout: canary, stderr: canary };
+      }
+      assert.equal(args[1], "show"); assert.equal(options.timeout, 15_000);
+      observation = observations++ === 0 ? "terminated" : (spec.observations?.[observations - 2] ?? "terminated");
+      if (typeof observation === "object") {
+        const returnedError = observation.returnedError;
+        observation = "terminated";
+        return { status: null, signal: "SIGTERM", error: fault(returnedError), stdout: "", stderr: canary };
+      }
+      if (!["terminated", "active"].includes(observation)) throw fault(observation);
+      return { status: 0, signal: null, stdout: observation === "terminated"
+        ? "LoadState=not-found\nActiveState=inactive\nMainPID=0\nControlPID=0\nControlGroup=\n"
+        : `LoadState=loaded\nActiveState=active\nMainPID=123\nControlPID=0\nControlGroup=/system.slice/${args[2]}\n` };
+    });
+    t.mock.method(childProcess, "spawn", (bin, args, options) => {
+      assert.equal(bin, "/usr/bin/timeout");
+      assert.deepEqual(args.slice(0, 4), ["--signal=TERM", "--kill-after=5s", "230s", "/usr/bin/systemd-run"]);
+      assert(args.includes("--property=RuntimeMaxSec=220s"));
+      assert.equal(options.cwd, ROOT);
+      calls.push("spawn");
+      if (spec.spawnThrow) throw fault(spec.spawnThrow);
+      const child = new EventEmitter();
+      child.stdout = new PassThrough(); child.stderr = new PassThrough();
+      child.stdin = options.stdio[0] === "pipe" ? new PassThrough() : null;
+      queueMicrotask(() => {
+        if (spec.spawnError) child.emit("error", fault(spec.spawnError));
+        if (spec.stdinError) child.stdin.emit("error", fault(spec.stdinError));
+        child.stdout.emit("data", spec.outputOverflow ? Buffer.alloc(2 * 1024 * 1024 + 1) : Buffer.from(canary));
+        child.stderr.emit("data", Buffer.from(canary));
+        for (let i = 0; i < (spec.ticks ?? 0); i++) {
+          if (spec.deadline) now = deadline;
+          interval();
+        }
+        child.emit("close", Object.hasOwn(spec, "code") ? spec.code : 0, spec.signal ?? null);
+      });
+      return child;
+    });
+    syncBuiltinESMExports();
+    try {
+      result = await rootService({ leaseId: LEASE, proofUid: 999, proofGid: 982 },
+        spec.name ?? "baseline-ordinary-plan", "/fixture/node", [canary], { FIXTURE_ONLY: canary },
+        { deadline, seconds: 220, ...(spec.secret || spec.stdinError ? { input: canary } : {}), secret: spec.secret === true });
+    } catch (caught) { error = caught; }
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+  const record = rootServiceFailureRecord(error);
+  if (record) {
+    const bytes = JSON.stringify(record) + "\n";
+    assert(Buffer.byteLength(bytes) <= 1024);
+    assert(!bytes.includes("FIXTURE_SECRET") && !bytes.includes("/fixture/"));
+    assert(!bytes.includes("stdout") && !bytes.includes("stderr"));
+    assert.equal(record.attribution, "timeout-systemd-run-wrapper");
+  }
+  assert.equal(cleared, spec.spawnThrow ? 0 : 1);
+  assert(calls.filter((call) => call === "stop").length <= 1);
+  return { result, error, record, calls };
+}
+
+for (const [name, spec, kind, exit, signal, code] of [
+  ["nonzero exit", { code: 7 }, "wrapper-exit", 7, null, null],
+  ["signal", { code: null, signal: "SIGTERM" }, "wrapper-signal", null, "SIGTERM", null],
+  ["unknown signal", { code: null, signal: "FIXTURE_SECRET" }, "wrapper-signal", null, "unclassified", null],
+  ["spawn error", { code: null, spawnError: "ENOENT" }, "spawn", null, null, "ENOENT"],
+  ["synchronous wrapper error", { spawnThrow: "EACCES" }, "wrapper-error", null, null, "EACCES"],
+  ["stdin error", { stdinError: "EPIPE" }, "stdin", 0, null, null],
+]) test(`rootService diagnostics preserve observed wrapper ${name}, not Codex status`, async (t) => {
+  const r = await serviceFixture(t, spec);
+  assert(r.error); assert.equal(r.record.firstFailure.kind, kind);
+  assert.deepEqual(r.record.wrapper, { exit, signal, errorCode: code });
+  assert.equal(r.record.lastSuccessfulUsage, null);
+  assert.equal(r.record.cleanup.terminationConfirmed, true);
+  assert.deepEqual(r.calls, ["show", "spawn", "show"]);
+});
+
+for (const [name, spec, kind, usage] of [
+  ["unmeasured failure", { usage: ["EACCES"], ticks: 1 }, "fixture-measurement", null],
+  ["over-limit first measurement", { usage: [LIMITS.fixtureBytes + 1], ticks: 1 }, "fixture-limit", null],
+  ["last successful measurement", { usage: [7, "EACCES"], ticks: 2 }, "fixture-measurement", { files: 1, bytes: 7 }],
+  ["last measurement before overflow", { usage: [7, LIMITS.fixtureBytes + 1], ticks: 2 }, "fixture-limit", { files: 1, bytes: 7 }],
+  ["matrix deadline", { deadline: true, ticks: 1 }, "matrix-deadline", { files: 1, bytes: 7 }],
+  ["native deadline", { expiredStart: true, ticks: 1 }, "native-start-deadline", { files: 1, bytes: 7 }],
+  ["admission measurement error", { admissionError: "EACCES", ticks: 1 }, "native-start-measurement", { files: 1, bytes: 7 }],
+]) test(`rootService diagnostics distinguish ${name} without invented usage`, async (t) => {
+  const r = await serviceFixture(t, spec);
+  assert(r.error); assert.equal(r.record.firstFailure.kind, kind);
+  assert.deepEqual(r.record.lastSuccessfulUsage, usage);
+  assert.equal(r.record.cleanup.stopAttempted, true);
+  assert.equal(r.record.cleanup.stopExit, 0);
+  assert.equal(r.record.cleanup.terminationConfirmed, true);
+  assert.deepEqual(r.calls, ["show", "spawn", "stop", "show"]);
+});
+
+test("rootService diagnostics retain first failure alongside cleanup errors and unknown termination", async (t) => {
+  const r = await serviceFixture(t, { code: 7, observations: ["EACCES", "EACCES"], stopError: "EPERM" });
+  assert(r.error); assert.equal(r.record.firstFailure.kind, "wrapper-exit");
+  assert.equal(r.record.wrapper.exit, 7);
+  assert.deepEqual(r.record.cleanup, { stopAttempted: true, stopExit: null, stopSignal: null,
+    stopErrorCode: "EPERM", observationErrorCode: "EACCES", terminationConfirmed: null });
+  assert.deepEqual(r.calls, ["show", "spawn", "show", "stop", "show"]);
+});
+
+for (const recovered of [false, true]) test(`rootService retains returned observation errno; termination recovered=${recovered}`, async (t) => {
+  const r = await serviceFixture(t, { code: 7, observations: [
+    { returnedError: "ETIMEDOUT" }, recovered ? "terminated" : { returnedError: "ETIMEDOUT" },
+  ] });
+  assert(r.error); assert.equal(r.record.firstFailure.kind, "wrapper-exit");
+  assert.equal(r.record.wrapper.exit, 7);
+  assert.equal(r.record.cleanup.observationErrorCode, "ETIMEDOUT");
+  assert.equal(r.record.cleanup.terminationConfirmed, recovered ? true : null);
+  assert.deepEqual(r.calls, ["show", "spawn", "show", "stop", "show"]);
+});
+
+test("rootService returned observation error does not change existing confirmed-recovery success gate", async (t) => {
+  const r = await serviceFixture(t, { observations: [{ returnedError: "ETIMEDOUT" }, "terminated"] });
+  assert.equal(r.error, undefined); assert.equal(r.result.status, 0); assert.equal(r.record, null);
+  assert.deepEqual(r.calls, ["show", "spawn", "show", "stop", "show"]);
+});
+
+for (const spec of [
+  { observations: ["active", "active"] },
+  { observations: ["active", "terminated"], stopCode: 7 },
+  { observations: ["EACCES", "terminated"] },
+]) test(`rootService cleanup uncertainty cannot become success: ${JSON.stringify(spec)}`, async (t) => {
+  const r = await serviceFixture(t, spec);
+  assert(r.error); assert.equal(r.record.firstFailure, null);
+  assert.equal(r.record.wrapper.exit, 0);
+  assert.deepEqual(r.calls, ["show", "spawn", "show", "stop", "show"]);
+});
+
+test("rootService diagnostics do not overwrite an earlier output failure or stop twice", async (t) => {
+  const r = await serviceFixture(t, { outputOverflow: true, usage: ["EACCES"], ticks: 1, code: null,
+    signal: "SIGTERM", observations: ["active", "active"] });
+  assert.equal(r.record.firstFailure.kind, "output-budget");
+  assert.equal(r.record.cleanup.terminationConfirmed, null);
+  assert.deepEqual(r.calls, ["show", "spawn", "stop", "show", "show"]);
+});
+
+test("rootService diagnostics stay invocation-local and preserve secret login output privacy", async (t) => {
+  const first = await serviceFixture(t, { code: 7, ticks: 1, usage: [9] });
+  const second = await serviceFixture(t, { code: 8, name: "FIXTURE_SECRET /fixture/private-canary" });
+  assert.equal(second.record.phase, "unknown"); assert.equal(second.record.lastSuccessfulUsage, null);
+  assert.deepEqual(rootServiceFailureRecord(first.error).lastSuccessfulUsage, { files: 1, bytes: 9 });
+  assert.equal(rootServiceFailureRecord(new Error("FIXTURE_SECRET")), null);
+  const login = await serviceFixture(t, { secret: true });
+  assert.equal(login.error, undefined); assert.equal(login.result.status, 0); assert.equal(login.result.stdout, "");
+  const failedLogin = await serviceFixture(t, { secret: true, code: 7 });
+  assert(failedLogin.error); assert.equal(failedLogin.record, null);
+});
+
+test("rootService diagnostics distinguish measured zero from unknown usage", async (t) => {
+  const r = await serviceFixture(t, { ticks: 1, emptyUsage: true, code: 7 });
+  assert.deepEqual(r.record.lastSuccessfulUsage, { files: 0, bytes: 0 });
+});
+
+test("rootService complete diagnostic stays within one KiB without truncating cleanup facts", async (t) => {
+  const r = await serviceFixture(t, { name: "candidate-maintainer-deterministic-review",
+    ticks: 1, usage: [LIMITS.fixtureBytes], code: 255, signal: "SIGKILL",
+    observations: ["ETIMEDOUT", "ETIMEDOUT"], stopError: "EACCES" });
+  assert.equal(r.record.wrapper.exit, 255); assert.equal(r.record.wrapper.signal, "SIGKILL");
+  assert.equal(r.record.wrapper.errorCode, null);
+  assert.equal(r.record.firstFailure.kind, "wrapper-signal");
+  assert.deepEqual(r.record.lastSuccessfulUsage, { files: 1, bytes: LIMITS.fixtureBytes });
+  assert.equal(r.record.cleanup.observationErrorCode, "ETIMEDOUT");
+  assert.equal(r.record.cleanup.stopErrorCode, "EACCES");
+  assert.equal(r.record.cleanup.terminationConfirmed, null);
+  assert(Buffer.byteLength(JSON.stringify(r.record) + "\n") <= 1024);
 });
 
 test("manifest admission requires exact count, safe unique sorted paths, modes and hashes", () => {
