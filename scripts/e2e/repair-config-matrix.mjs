@@ -401,9 +401,11 @@ export function dispatchAfterReadback(options, ghxCall, clock = {}) {
         check("id", runner !== null && typeof runner === "object" && Number.isSafeInteger(runner.id) && runner.id > 0);
         check("id", context.runnerId === runner.id);
         context.status = ["online", "offline"].includes(runner.status) ? runner.status : "unknown";
+        // Same-lease source/boot qualification and the native AWS/Linux installer
+        // bind Linux execution to this runner ID; REST OS metadata is not authority.
         context.matches = {
           name: runner.name === expected.runnerName,
-          os: runner.os === "linux" || (runner.status === "offline" && runner.os === "unknown"), busy: runner.busy === false,
+          os: runner.os === "linux" || runner.os === "unknown", busy: runner.busy === false,
           labels: Array.isArray(runner.labels) && runner.labels.length === 1
             && runner.labels[0]?.name === expected.runnerLabel && ["custom", "read-only"].includes(runner.labels[0]?.type),
           ephemeralPresent: Object.hasOwn(runner, "ephemeral"),

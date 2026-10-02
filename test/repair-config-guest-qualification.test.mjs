@@ -242,7 +242,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 11\b/);
+  assert.match(body, /fetch-depth: 12\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -793,21 +793,45 @@ test("initial empty propagation cannot rebind the JIT receipt to a different run
   assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [5000]);
 });
 
-test("unknown OS is only a literal offline wait, never online admission", () => {
-  for (const [status, os] of [["online", "unknown"], ["offline", ""], ["offline", undefined], ["offline", null], ["offline", "windows"]]) {
-    const f = controllerFixture();
-    Object.assign(f.value.list.runners[0], { status, os });
-    assert.equal(controllerRejection(f.run).field, "os");
-    assert.equal(f.calls.length, 1); assert.equal(f.sleeps.length, 0);
-  }
+test("online exact runner admits literal unknown REST OS without relabeling it", () => {
   const f = controllerFixture();
   f.value.list.runners[0].os = "unknown";
-  const record = controllerRejection(() => f.run((phase) => {
+  const result = f.run();
+  assert.equal(result.dispatched, true); assert.equal(result.runnerId, 123);
+  assert.equal(f.value.list.runners[0].os, "unknown");
+  assert.equal(result.reads, 1); assert.deepEqual(f.sleeps, []);
+  assert.deepEqual(f.calls.map(({ phase }) => phase), ["runner", "head", "dispatch"]);
+});
+
+test("unknown REST OS still waits for the exact runner to become online", () => {
+  const f = controllerFixture();
+  f.value.list.runners[0].os = "unknown";
+  const result = f.run((phase) => {
     f.value.list.runners[0].status = f.calls.length === 1 ? "offline" : "online";
     return f.response(phase);
-  }));
-  assert.equal(record.field, "os"); assert.equal(record.runnerId, 123);
-  assert.equal(f.calls.length, 2); assert.deepEqual(f.sleeps, [5000]);
+  });
+  assert.equal(result.dispatched, true); assert.equal(result.runnerId, 123);
+  assert.equal(f.value.list.runners[0].os, "unknown");
+  assert.equal(result.reads, 2); assert.deepEqual(f.sleeps, [5000]);
+  assert.deepEqual(f.calls.map(({ phase }) => phase), ["runner", "runner", "head", "dispatch"]);
+});
+
+for (const [name, os] of [
+  ["missing", undefined], ["null", null], ["empty", ""], ["number", 1],
+  ["object", {}], ["Windows", "windows"], ["macOS", "osx"],
+  ["macOS alias", "macos"], ["case variant", "Linux"],
+]) test(`${name} REST OS is rejected for both offline and online runners`, () => {
+  for (const status of ["offline", "online"]) {
+    const f = controllerFixture();
+    f.value.list.runners[0].status = status;
+    if (os === undefined) delete f.value.list.runners[0].os;
+    else f.value.list.runners[0].os = os;
+    const record = controllerRejection(f.run);
+    assert.equal(record.phase, "runner"); assert.equal(record.field, "os");
+    assert.equal(record.matches.os, false);
+    assert.equal(f.calls.length, 1); assert.deepEqual(f.sleeps, []);
+    assert(!f.calls.some(({ phase }) => phase === "dispatch"));
+  }
 });
 
 for (const [field, change] of [
