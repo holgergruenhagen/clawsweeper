@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
-import { supervisorArguments, unitStopped } from "./repair-config-guest-qualification.mjs";
+import { proofCodexConfig, supervisorArguments, unitStopped } from "./repair-config-guest-qualification.mjs";
 
 export const PINS = Object.freeze({
   base: "2f777941de926c6f11cb0c6363ecfe4bbee94371",
@@ -1050,7 +1050,7 @@ async function loginRoot(packet) {
   assert(typeof packet.model === "string" && packet.model.trim() === packet.model && packet.model.length > 0 && packet.model.length < 256);
   const home = `${ROOT}/private`, codexHome = `${home}/codex`;
   assert(!fs.existsSync(`${codexHome}/auth.json`), "no existing authentication reuse");
-  fs.writeFileSync(`${codexHome}/config.toml`, `model = ${JSON.stringify(packet.model)}\nmodel_reasoning_effort = "medium"\n`, { flag: "wx", mode: 0o600 });
+  fs.writeFileSync(`${codexHome}/config.toml`, proofCodexConfig(packet.model), { flag: "wx", mode: 0o600 });
   fs.chownSync(`${codexHome}/config.toml`, inputs.proofUid, inputs.proofGid);
   const env = { ...cleanEnv(home), CODEX_HOME: codexHome };
   await rootService(inputs, "native-api-login", inputs.codex.path, ["login", "--with-api-key"], env,

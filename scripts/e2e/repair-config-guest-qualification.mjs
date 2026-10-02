@@ -16,6 +16,48 @@ const USER = "repair-config-proof";
 const CODEX_VERSION = "0.159.3";
 const sha256 = (bytes) => crypto.createHash("sha256").update(bytes).digest("hex");
 
+export function proofCodexConfig(model) {
+  const settings = model === undefined ? "" : `model = ${JSON.stringify(model)}\nmodel_reasoning_effort = "medium"\n`;
+  return `${settings}[features]\nplugins = false\n`;
+}
+
+export function pluginsDisabled(output) {
+  if (!output.endsWith("\n") || /[^\t\n\x20-\x7e]/.test(output)) return false;
+  const rows = output.split("\n").filter((line) => /^[ \t]*plugins\b/.test(line));
+  return rows.length === 1
+    && /^plugins[ \t]+stable[ \t]+false$/.test(rows[0]);
+}
+
+export function removeQualificationConfig(file, expected, uid, gid, terminated) {
+  assert.equal(terminated, true, "qualification children must be terminated");
+  const bytes = Buffer.from(proofCodexConfig());
+  assert.equal(expected?.sha256, sha256(bytes));
+  assert.equal(expected.uid, uid);
+  assert.equal(expected.gid, gid);
+  assert.equal(expected.mode, 0o600);
+  assert.equal(expected.nlink, 1);
+  assert.equal(expected.size, bytes.length);
+  const check = (stat) => {
+    assert(stat.isFile() && !stat.isSymbolicLink());
+    for (const key of ["dev", "ino", "uid", "gid", "nlink", "size"])
+      assert.equal(stat[key], expected[key], `qualification config ${key} mismatch`);
+    assert.equal(stat.mode & 0o7777, 0o600);
+  };
+  check(fs.lstatSync(file));
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    check(fs.fstatSync(fd));
+    const actual = fs.readFileSync(fd);
+    assert(actual.equals(bytes));
+    assert.equal(sha256(actual), expected.sha256);
+    check(fs.fstatSync(fd));
+  } finally {
+    fs.closeSync(fd);
+  }
+  check(fs.lstatSync(file));
+  fs.unlinkSync(file);
+}
+
 export function parseArguments(argv) {
   const [mode, ...rest] = argv;
   assert(["qualify", "verify"].includes(mode), "explicit mode required");
@@ -79,7 +121,11 @@ export function assertReceiptBinding(receipt, expected) {
   assert.equal(receipt.probes?.unexpectedSocketDescriptors, 0);
   assert.equal(receipt.probes?.containment?.markerMatch, true);
   assert.equal(receipt.probes?.sandbox?.markerMatch, true);
+  const plugins = receipt.probes?.plugins;
+  assert(plugins?.status === 0 && !plugins.signal && !plugins.failure && !plugins.signalFailure && plugins.markerMatch);
+  assert.equal(plugins.stderrBytes, 0);
   assert.equal(receipt.supervisor?.terminated, true);
+  assert.equal(receipt.temporaryConfigRemoved, true);
   assert.equal(receipt.codex?.version, CODEX_VERSION);
 }
 
@@ -130,10 +176,11 @@ function protectedExecutable(file) {
 }
 
 // Serialized into the root-supervised child; it receives no controller environment.
-async function guestProbes(options, classifySockets) {
+async function guestProbes(options, classifySockets, renderConfig, checkPlugins) {
   const { default: assert } = await import("node:assert/strict");
   const fs = await import("node:fs");
   const path = await import("node:path");
+  const { createHash } = await import("node:crypto");
   const { spawn } = await import("node:child_process");
   const result = { uidBoundary: false, peak: { files: 0, bytes: 0 } };
   let stage = "uid-boundary";
@@ -163,7 +210,7 @@ async function guestProbes(options, classifySockets) {
         cwd: path.join(process.env.HOME, "work"), env: process.env,
         stdio: ["ignore", "pipe", "pipe"],
       });
-      let bytes = 0, stdout = "", failure = null, signalFailure = null;
+      let bytes = 0, stderrBytes = 0, stdout = "", failure = null, signalFailure = null;
       function stop(reason) {
         failure ??= reason;
         // This is only our direct same-UID child. PID 1 owns cross-UID/cgroup cleanup.
@@ -174,6 +221,7 @@ async function guestProbes(options, classifySockets) {
       const monitor = setInterval(() => { try { measure(); } catch { stop("fixture-budget"); } }, 200);
       function capture(chunk, isStdout) {
         bytes += chunk.length;
+        if (!isStdout) stderrBytes += chunk.length;
         if (bytes > 1024 * 1024) { stop("output-budget"); return; }
         if (isStdout) stdout += chunk;
       }
@@ -184,7 +232,7 @@ async function guestProbes(options, classifySockets) {
         clearTimeout(timer);
         clearInterval(monitor);
         try { measure(); } catch { failure ??= "fixture-budget"; }
-        resolve({ status, signal, failure, signalFailure, markerMatch: marker.test(stdout) });
+        resolve({ status, signal, failure, signalFailure, stderrBytes, markerMatch: typeof marker === "function" ? marker(stdout) : marker.test(stdout) });
       });
     });
   }
@@ -214,9 +262,23 @@ async function guestProbes(options, classifySockets) {
       catch (error) { assert(["ENOENT", "EACCES"].includes(error.code)); }
     }
     Object.assign(result, { uidBoundary: true, supplementaryGroups: 0, capabilities: 0, canaryUnreadable: true });
+    stage = "temporary-config";
+    const config = path.join(process.env.CODEX_HOME, "config.toml"), configBytes = Buffer.from(renderConfig());
+    const fd = fs.openSync(config, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600);
+    try {
+      fs.writeFileSync(fd, configBytes);
+      const stat = fs.fstatSync(fd);
+      assert(stat.isFile() && stat.uid === process.getuid() && stat.gid === process.getgid()
+        && (stat.mode & 0o7777) === 0o600 && stat.nlink === 1 && stat.size === configBytes.length);
+      result.temporaryConfig = Object.fromEntries(["dev", "ino", "uid", "gid", "nlink", "size"].map((key) => [key, stat[key]]));
+      Object.assign(result.temporaryConfig, { mode: 0o600, sha256: createHash("sha256").update(configBytes).digest("hex") });
+    } finally {
+      fs.closeSync(fd);
+    }
     measure();
     for (const [name, command, args, marker] of [
       ["codexVersion", options.codex, ["--version"], /^codex-cli 0\.159\.3\n$/],
+      ["plugins", options.codex, ["features", "list"], checkPlugins],
       ["containment", process.execPath, [options.preflight], /^mount_readonly=\S+ landlock=\S+\n$/],
       ["sandbox", options.codex, [
         "sandbox", "--permission-profile", ":read-only", "-C", path.join(process.env.HOME, "work"),
@@ -227,6 +289,7 @@ async function guestProbes(options, classifySockets) {
       result[name] = await child(command, args, marker);
       const value = result[name];
       assert(value.status === 0 && !value.signal && !value.failure && !value.signalFailure && value.markerMatch);
+      if (name === "plugins") assert.equal(value.stderrBytes, 0);
     }
   } catch {
     result.failure = { stage, reason: "guest prerequisite failed closed" };
@@ -236,7 +299,14 @@ async function guestProbes(options, classifySockets) {
 }
 
 export function guestProbeSource(options) {
-  return `import assert from "node:assert/strict"; await (${guestProbes.toString()})(${JSON.stringify(options)}, ${classifySocketDescriptors.toString()});`;
+  return `import assert from "node:assert/strict"; await (${guestProbes.toString()})(${JSON.stringify(options)}, ${classifySocketDescriptors.toString()}, ${proofCodexConfig.toString()}, ${pluginsDisabled.toString()});`;
+}
+
+export function qualificationConfigCleanupSource(expected, uid, gid, terminated) {
+  return `import assert from "node:assert/strict"; import fs from "node:fs"; import crypto from "node:crypto";
+    const proofCodexConfig = ${proofCodexConfig.toString()};
+    const sha256 = ${sha256.toString()};
+    (${removeQualificationConfig.toString()})(${JSON.stringify(`${ROOT}/private/codex/config.toml`)}, ${JSON.stringify(expected)}, ${uid}, ${gid}, ${JSON.stringify(terminated)});`;
 }
 
 export async function main(argv = process.argv.slice(2)) {
@@ -473,9 +543,14 @@ export async function main(argv = process.argv.slice(2)) {
       assert(report.supervisor.terminated, "privileged child termination unconfirmed");
       assert(!observationFailed, "supervisor observation failed");
       try { report.probes = JSON.parse(probe.stdout); } catch { report.probes = { uidBoundary: false }; }
+      stage = "remove-temporary-config";
+      await rootCommand(process.execPath, ["--input-type=module", "-e",
+        qualificationConfigCleanupSource(report.probes.temporaryConfig, uid, gid, report.supervisor.terminated)]);
+      report.temporaryConfigRemoved = true;
       assert(!stopped || (stopped.status === 0 && !stopped.failure && !stopped.signal));
       assert(probe.status === 0 && !probe.failure && !probe.signal && !report.probes.failure);
-      assert(report.probes.uidBoundary && report.probes.containment?.markerMatch && report.probes.sandbox?.markerMatch);
+      assert(report.probes.uidBoundary && report.probes.containment?.markerMatch && report.probes.sandbox?.markerMatch
+        && report.probes.plugins?.markerMatch);
       assert.deepEqual(inventory(`${build}/dist`), report.compiled);
       assert.equal(await git("status", "--porcelain", "--untracked-files=no"), "");
       assert.deepEqual({ head, tree, ...sourceInventory(workspace, index) }, report.source);

@@ -9,7 +9,9 @@ import path from "node:path";
 import { PassThrough } from "node:stream";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { main } from "../scripts/e2e/repair-config-guest-qualification.mjs";
+import {
+  guestProbeSource, main, pluginsDisabled, proofCodexConfig, qualificationConfigCleanupSource, removeQualificationConfig,
+} from "../scripts/e2e/repair-config-guest-qualification.mjs";
 import {
   LIMITS, PINS, admitAcquisitionInput, admitDeadline, assertRetention, classifyExec, commandTimeout, controllerClosure, controllerFailureRecord, controllerPlan, digest,
   dispatchAfterReadback, executionEnvelope, fixtureGH, fixtureGit, fixtureUsage, gitLauncherSource, jobText, observeService,
@@ -68,8 +70,10 @@ async function verifyFixture(t, change = () => {}) {
     probes: {
       uidBoundary: true, unexpectedSocketDescriptors: 0,
       containment: { markerMatch: true }, sandbox: { markerMatch: true },
+      plugins: { status: 0, signal: null, failure: null, signalFailure: null, stderrBytes: 0, markerMatch: true },
     },
     supervisor: { terminated: true },
+    temporaryConfigRemoved: true,
     steps: [{ setting: "kernel.unprivileged_userns_clone", readable: true, after: "1" }],
   };
   const expectedSource = structuredClone(receipt.source);
@@ -220,6 +224,14 @@ const cases = [
   ["wrong Codex digest", (f) => { f.receipt.codex.sha256 = "d".repeat(64); }],
   ["changed Codex executable", (f) => { fs.appendFileSync(f.codexFile, "changed"); }],
   ["unqualified sandbox", (f) => { f.receipt.probes.sandbox.markerMatch = false; }],
+  ["unqualified plugins", (f) => { f.receipt.probes.plugins.markerMatch = false; }],
+  ["failed feature command", (f) => { f.receipt.probes.plugins.status = 1; }],
+  ["feature stderr", (f) => { f.receipt.probes.plugins.stderrBytes = 1; }],
+  ["missing feature stderr count", (f) => { delete f.receipt.probes.plugins.stderrBytes; }],
+  ["unknown feature stderr count", (f) => { f.receipt.probes.plugins.stderrBytes = null; }],
+  ["string feature stderr count", (f) => { f.receipt.probes.plugins.stderrBytes = "0"; }],
+  ["missing feature result", (f) => { delete f.receipt.probes.plugins; }],
+  ["temporary config not removed", (f) => { f.receipt.temporaryConfigRemoved = false; }],
   ["unconfirmed termination", (f) => { f.receipt.supervisor.terminated = false; }],
 ];
 for (const [name, change] of cases) {
@@ -242,7 +254,7 @@ test("workflow uses repository-established immutable action pins and bounded his
   const body = fs.readFileSync(workflow, "utf8");
   assert.match(body, /uses: actions\/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1\b/);
   assert.match(body, /uses: actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a\b/);
-  assert.match(body, /fetch-depth: 14\b/);
+  assert.match(body, /fetch-depth: 15\b/);
   assert.match(body, /fetch-tags: false\b/);
   assert.doesNotMatch(body, /fetch-depth: 0\b|--unshallow|--deepen|uses: actions\/(?:checkout|upload-artifact)@v/);
 });
@@ -251,6 +263,235 @@ function temporaryFixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "repair-config-contract-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
   return root;
+}
+
+test("proof config disables only plugins and preserves escaped model and effort settings", () => {
+  assert.equal(proofCodexConfig(), "[features]\nplugins = false\n");
+  const model = 'fixture-"model\\name';
+  const expected = `model = ${JSON.stringify(model)}\nmodel_reasoning_effort = "medium"\n[features]\nplugins = false\n`;
+  for (const revision of ["baseline", "candidate"]) {
+    assert.equal(proofCodexConfig(model), expected, revision);
+    assert.doesNotMatch(proofCodexConfig(model), /remote_plugin|sandbox|network|approval|login|service_tier/);
+  }
+  assert.equal(LIMITS.fixtureFiles, 1024);
+  assert.equal(LIMITS.fixtureBytes, 128 * 1024 * 1024);
+});
+
+const disabledFeatures = "other_feature\tstable\ttrue\nplugins\tstable\tfalse\n";
+for (const [name, output, expected] of [
+  ["disabled", disabledFeatures, true],
+  ["space columns", "plugins                 stable              false\n", true],
+  ["missing", "other_feature\tstable\tfalse\n", false],
+  ["enabled", "plugins\tstable\ttrue\n", false],
+  ["duplicate", `${disabledFeatures}plugins\tstable\tfalse\n`, false],
+  ["duplicate malformed", `${disabledFeatures} plugins = false\n`, false],
+  ["unterminated", "plugins\tstable\tfalse", false],
+  ["suffix", "plugins\tstable\tfalse extra\n", false],
+  ["unknown state", "plugins\tstable\tdisabled\n", false],
+  ["unknown maturity", "plugins\tunrecognized\tfalse\n", false],
+  ["under development", "plugins\tunder development\tfalse\n", false],
+  ["experimental", "plugins\texperimental\tfalse\n", false],
+  ["deprecated", "plugins\tdeprecated\tfalse\n", false],
+  ["removed", "plugins\tremoved\tfalse\n", false],
+  ["ANSI", "\x1b[0mplugins\tstable\tfalse\n", false],
+  ["control byte", "plugins\tstable\tfalse\0\n", false],
+]) {
+  test(`plugin feature list ${name}`, () => assert.equal(pluginsDisabled(output), expected));
+}
+
+// Execute the generated qualification program, with only guest I/O and native
+// children replaced. Config creation and metadata use real test-owned files.
+async function guestConfigFixture(t, options = {}) {
+  const home = temporaryFixture(t), codexHome = path.join(home, "codex");
+  for (const dir of ["tmp", "work", "codex"]) fs.mkdirSync(path.join(home, dir), { mode: 0o700 });
+  const config = path.join(codexHome, "config.toml"), canary = path.join(home, "unreadable-canary");
+  if (options.preexisting) fs.writeFileSync(config, "preexisting\n", { flag: "wx", mode: 0o600 });
+  const original = {
+    env: process.env, exitCode: process.exitCode,
+    readFileSync: fs.readFileSync, readdirSync: fs.readdirSync, readlinkSync: fs.readlinkSync,
+    accessSync: fs.accessSync, openSync: fs.openSync,
+  };
+  const env = {
+    HOME: home, TMPDIR: path.join(home, "tmp"), TMP: path.join(home, "tmp"), TEMP: path.join(home, "tmp"),
+    CODEX_HOME: codexHome, PATH: "/usr/bin:/bin", LANG: "C.UTF-8",
+  };
+  const source = guestProbeSource({
+    uid: process.getuid(), codex: CODEX, canary, preflight: path.join(home, "preflight.js"),
+    envNames: Object.keys(env).sort(),
+  });
+  assert(source.includes(proofCodexConfig.toString()));
+  assert(source.includes(pluginsDisabled.toString()));
+  const commands = [];
+  let output = "", exitCode, raceCreated = false;
+  try {
+    process.env = env;
+    process.exitCode = undefined;
+    t.mock.method(fs, "readFileSync", (file, ...args) => {
+      if (file === canary) throw Object.assign(new Error("fixture denied"), { code: "EACCES" });
+      if (file === "/proc/self/status") return "Groups:\t\nCapInh:\t0000\nCapPrm:\t0000\nCapEff:\t0000\nCapBnd:\t0000\nCapAmb:\t0000\nNoNewPrivs:\t1\n";
+      return original.readFileSync(file, ...args);
+    });
+    t.mock.method(fs, "readdirSync", (dir, ...args) => dir === "/proc/self/fd" ? ["1", "2"] : original.readdirSync(dir, ...args));
+    t.mock.method(fs, "readlinkSync", (file, ...args) => file.startsWith("/proc/self/fd/") ? "socket:[fixture-standard-stream]" : original.readlinkSync(file, ...args));
+    t.mock.method(fs, "accessSync", (file, ...args) => {
+      if (["/run/docker.sock", "/var/run/docker.sock", "/run/podman/podman.sock"].includes(file))
+        throw Object.assign(new Error("fixture absent"), { code: "ENOENT" });
+      return original.accessSync(file, ...args);
+    });
+    t.mock.method(fs, "openSync", (file, flags, mode) => {
+      if (options.createRace && file === config && !raceCreated) {
+        raceCreated = true;
+        const fd = original.openSync(file, "wx", 0o600);
+        try { fs.writeFileSync(fd, "raced\n"); } finally { fs.closeSync(fd); }
+      }
+      return original.openSync(file, flags, mode);
+    });
+    t.mock.method(childProcess, "spawn", (command, args, childOptions) => {
+      assert.deepEqual(childOptions.env, env);
+      assert.deepEqual(childOptions.stdio, ["ignore", "pipe", "pipe"]);
+      assert.equal(original.readFileSync(config, "utf8"), proofCodexConfig());
+      assert.equal(fs.statSync(config).mode & 0o777, 0o600);
+      assert.equal(fs.existsSync(path.join(codexHome, "auth.json")), false);
+      commands.push({ command, args });
+      const features = command === CODEX && args.join(" ") === "features list";
+      let text;
+      if (command === CODEX && args.join(" ") === "--version") text = options.version ?? "codex-cli 0.159.3\n";
+      else if (features) text = options.features ?? disabledFeatures;
+      else if (command === process.execPath && args[0] === path.join(home, "preflight.js")) text = "mount_readonly=true landlock=true\n";
+      else { assert.equal(command, CODEX); assert.equal(args[0], "sandbox"); text = "REPAIR_CONFIG_SANDBOX_OK\n"; }
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(), stderr: new PassThrough(),
+        kill(signal) { assert.equal(signal, "SIGKILL"); return true; },
+      });
+      queueMicrotask(() => {
+        if (features && options.spawnError) child.emit("error", Object.assign(new Error("synthetic secret must not appear"), { code: "ENOENT" }));
+        child.stdout.end(text);
+        child.stderr.end(features ? options.featureStderr ?? "" : options.otherStderr ?? "");
+        child.emit("close", features ? options.featureStatus ?? 0 : 0, features ? options.featureSignal ?? null : null);
+      });
+      return child;
+    });
+    syncBuiltinESMExports();
+    t.mock.method(process.stdout, "write", (bytes) => { output += bytes.toString(); return true; });
+    await import(`data:text/javascript;base64,${Buffer.from(`${source}\n// ${crypto.randomUUID()}`).toString("base64")}`);
+    exitCode = process.exitCode ?? 0;
+  } finally {
+    t.mock.restoreAll();
+    syncBuiltinESMExports();
+    process.env = original.env;
+    process.exitCode = original.exitCode;
+  }
+  assert.doesNotMatch(output, /synthetic secret|STDERR_PRIVATE_CANARY|OPENAI_API_KEY|auth\.json/);
+  return { report: JSON.parse(output), exitCode, commands, config, home };
+}
+
+test("generated qualifier renders the shared config, checks pinned features and removes only after termination", async (t) => {
+  const f = await guestConfigFixture(t);
+  assert.equal(f.exitCode, 0);
+  assert.equal(f.report.plugins.markerMatch, true);
+  assert.equal(f.report.plugins.stderrBytes, 0);
+  assert.deepEqual(f.commands.map(({ args }) => args.slice(0, 2)), [
+    ["--version"], ["features", "list"], [path.join(f.home, "preflight.js")], ["sandbox", "--permission-profile"],
+  ]);
+  const expected = f.report.temporaryConfig;
+  assert.equal(expected.sha256, hash(proofCodexConfig()));
+  assert.throws(() => removeQualificationConfig(f.config, expected, process.getuid(), process.getgid(), false));
+  assert.equal(fs.readFileSync(f.config, "utf8"), proofCodexConfig());
+  const sentinel = path.join(f.home, "codex", "keep");
+  fs.writeFileSync(sentinel, "unchanged", { mode: 0o600 });
+  const original = Object.fromEntries(["lstatSync", "openSync", "unlinkSync"].map((name) => [name, fs[name]]));
+  try {
+    for (const name of Object.keys(original))
+      t.mock.method(fs, name, (file, ...args) => {
+        assert.equal(file, `${ROOT}/private/codex/config.toml`);
+        return original[name](f.config, ...args);
+      });
+    syncBuiltinESMExports();
+    const source = qualificationConfigCleanupSource(expected, process.getuid(), process.getgid(), true);
+    await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+  } finally {
+    t.mock.restoreAll(); syncBuiltinESMExports();
+  }
+  assert.equal(fs.existsSync(f.config), false);
+  assert.equal(fs.readFileSync(sentinel, "utf8"), "unchanged");
+  fs.writeFileSync(f.config, proofCodexConfig("fixture-model"), { flag: "wx", mode: 0o600 });
+  assert.equal(fs.readFileSync(f.config, "utf8"), proofCodexConfig("fixture-model"));
+  assert.throws(() => fs.writeFileSync(f.config, proofCodexConfig(), { flag: "wx", mode: 0o600 }), { code: "EEXIST" });
+});
+
+test("generated qualifier preserves other probes' existing stderr acceptance", async (t) => {
+  const stderr = "STDERR_PRIVATE_CANARY\n";
+  const f = await guestConfigFixture(t, { otherStderr: stderr });
+  assert.equal(f.exitCode, 0);
+  assert.equal(f.report.failure, undefined);
+  assert.equal(f.commands.length, 4);
+  assert.equal(f.report.plugins.stderrBytes, 0);
+  for (const name of ["codexVersion", "containment", "sandbox"]) {
+    assert.equal(f.report[name].stderrBytes, Buffer.byteLength(stderr));
+    assert.equal(f.report[name].markerMatch, true);
+  }
+});
+
+for (const [name, options, stage, count] of [
+  ["nonempty home", { preexisting: true }, "uid-boundary", 0],
+  ["exclusive creation race", { createRace: true }, "temporary-config", 0],
+  ["wrong native version", { version: "codex-cli 0.159.2\n" }, "codexVersion", 1],
+  ["missing plugins", { features: "other\tstable\tfalse\n" }, "plugins", 2],
+  ["enabled plugins", { features: "plugins\tstable\ttrue\n" }, "plugins", 2],
+  ["removed plugins", { features: "plugins\tremoved\tfalse\n" }, "plugins", 2],
+  ["feature stderr despite native success", { featureStderr: "STDERR_PRIVATE_CANARY\n" }, "plugins", 2],
+  ["duplicate plugins", { features: `${disabledFeatures}${disabledFeatures}` }, "plugins", 2],
+  ["incomplete output", { features: "plugins\tstable\tfalse" }, "plugins", 2],
+  ["nonzero native result", { featureStatus: 1 }, "plugins", 2],
+  ["native signal", { featureSignal: "SIGTERM" }, "plugins", 2],
+  ["spawn failure", { spawnError: true }, "plugins", 2],
+  ["output overflow", { features: "x".repeat(1024 * 1024 + 1) }, "plugins", 2],
+]) {
+  test(`generated qualifier rejects ${name} without continuing`, async (t) => {
+    const f = await guestConfigFixture(t, options);
+    assert.equal(f.exitCode, 1);
+    assert.equal(f.report.failure.stage, stage);
+    assert.equal(f.commands.length, count);
+    if (options.featureStderr) {
+      assert.equal(f.report.plugins.status, 0);
+      assert.equal(f.report.plugins.markerMatch, true);
+      assert.equal(f.report.plugins.stderrBytes, Buffer.byteLength(options.featureStderr));
+    }
+    assert.equal(fs.existsSync(f.config), true, "failure never blindly removes config");
+    if (options.preexisting) assert.equal(fs.readFileSync(f.config, "utf8"), "preexisting\n");
+    if (options.createRace) assert.equal(fs.readFileSync(f.config, "utf8"), "raced\n");
+  });
+}
+
+for (const [name, change] of [
+  ["unknown termination", (f) => { f.terminated = false; }],
+  ...["dev", "ino", "uid", "gid", "mode", "nlink", "size"].map((key) => [`wrong ${key}`, (f) => { f.expected[key]++; }]),
+  ["wrong digest", (f) => { f.expected.sha256 = "0".repeat(64); }],
+  ["changed mode", (f) => fs.chmodSync(f.file, 0o644)],
+  ["changed bytes", (f) => fs.writeFileSync(f.file, proofCodexConfig().replace("false", "true "))],
+  ["hard link", (f) => fs.linkSync(f.file, `${f.file}.linked`)],
+  ["replacement inode", (f) => { fs.renameSync(f.file, `${f.file}.original`); fs.writeFileSync(f.file, proofCodexConfig(), { mode: 0o600 }); }],
+  ["symlink", (f) => { fs.renameSync(f.file, `${f.file}.original`); fs.symlinkSync(`${f.file}.original`, f.file); }],
+  ["missing", (f) => fs.unlinkSync(f.file)],
+]) {
+  test(`qualification config cleanup rejects ${name} without unlinking`, (t) => {
+    const file = path.join(temporaryFixture(t), "config.toml");
+    fs.writeFileSync(file, proofCodexConfig(), { flag: "wx", mode: 0o600 });
+    const stat = fs.lstatSync(file);
+    const f = {
+      file, terminated: true,
+      expected: { ...Object.fromEntries(["dev", "ino", "uid", "gid", "nlink", "size"].map((key) => [key, stat[key]])), mode: 0o600, sha256: hash(proofCodexConfig()) },
+    };
+    change(f);
+    const before = fs.existsSync(file) ? fs.lstatSync(file) : null;
+    assert.throws(() => removeQualificationConfig(file, f.expected, process.getuid(), process.getgid(), f.terminated));
+    if (before) {
+      const after = fs.lstatSync(file);
+      assert.equal(after.dev, before.dev);
+      assert.equal(after.ino, before.ino);
+      assert.equal(after.mode, before.mode);
+    } else assert.equal(fs.existsSync(file), false);
+  });
 }
 
 for (const mask of [0o077, 0o022]) {
