@@ -2285,14 +2285,11 @@ test("agent workflows install pinned CLI releases and keep runner models secret"
 
   assert.match(action, /codex-version:[\s\S]*default: "0\.159\.3"/);
   assert.match(action, /proxy-version:[\s\S]*default: "0\.159\.2"/);
-  assert.match(action, /Install upstream show-me skill/);
-  assert.match(action, /show_me_revision="ca7c8088db69e315a8b2deea43820270457f8f3c"/);
-  assert.match(
+  assert.doesNotMatch(
     action,
-    /show_me_sha256="434a2346cc95e313b0d367d477dda2e23ba642dd2181757415a09500664af100"/,
+    /Install upstream show-me skill|show_me_revision|humanlayer\/skills\/\$show_me_revision/,
   );
-  assert.match(action, /CODEX_HOME:\?}\/skills\/show-me/);
-  assert.match(action, /actual_sha256.*show_me_sha256/);
+  assert.match(readText(".agents/skills/show-me/SKILL.md"), /^name: show-me$/m);
   assert.ok(ciWorkflow.includes("(?:-[\\w.-]+)?"));
   assert.doesNotMatch(action, /@latest/);
   assert.match(localCheck, /CLAWSWEEPER_LOCAL_CODEX_MODEL \?\? "gpt-6\.1-sol"/);

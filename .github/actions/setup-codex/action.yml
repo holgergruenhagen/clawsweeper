@@ -110,27 +110,6 @@ runs:
         export CODEX_HOME="$codex_home"
         echo "Using isolated CODEX_HOME=$CODEX_HOME"
 
-    - name: Install upstream show-me skill
-      shell: bash
-      run: |
-        set -euo pipefail
-        skill_dir="${CODEX_HOME:?}/skills/show-me"
-        # Update these pins together after reviewing the upstream skill diff.
-        show_me_revision="ca7c8088db69e315a8b2deea43820270457f8f3c"
-        show_me_sha256="434a2346cc95e313b0d367d477dda2e23ba642dd2181757415a09500664af100"
-        mkdir -p "$skill_dir"
-        curl --fail --silent --show-error --location --retry 3 \
-          "https://raw.githubusercontent.com/humanlayer/skills/$show_me_revision/plugins/show-me/skills/show-me/SKILL.md" \
-          --output "$skill_dir/SKILL.md"
-        test "$(wc -c < "$skill_dir/SKILL.md")" -le 20000
-        grep -Eq '^name: show-me$' "$skill_dir/SKILL.md"
-        actual_sha256="$(node -e 'const { createHash } = require("node:crypto"); const { readFileSync } = require("node:fs"); process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"));' "$skill_dir/SKILL.md")"
-        if [[ "$actual_sha256" != "$show_me_sha256" ]]; then
-          echo "HumanLayer show-me checksum mismatch at $show_me_revision" >&2
-          exit 1
-        fi
-        echo "Installed HumanLayer show-me at $show_me_revision."
-
     - name: Configure internal Codex model
       if: ${{ inputs['auth-mode'] != 'clawrouter' }}
       shell: bash

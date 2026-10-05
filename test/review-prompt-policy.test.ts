@@ -191,14 +191,31 @@ test("review prompt routes PR likely owners through feature history", () => {
   assert.match(prompt, /use names without email addresses/);
 });
 
-test("review prompt uses upstream show-me for the GitHub architecture section", () => {
+test("PR review prompt includes the vendored show-me skill for its architecture section", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
+  const skill = readFileSync(".agents/skills/show-me/SKILL.md", "utf8");
+  const skillInstructions = skill.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n/, "").trim();
   const schema = JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8"));
+  const assembledPrompt = reviewPromptForTest(
+    item({ kind: "pull_request" }),
+    {},
+    { mainSha: "a".repeat(40), latestRelease: null },
+  );
+  const issuePrompt = reviewPromptForTest(
+    item({ kind: "issue" }),
+    {},
+    { mainSha: "a".repeat(40), latestRelease: null },
+  );
 
-  assert.match(prompt, /upstream `show-me` skill/);
+  assert.match(prompt, /vendored upstream `show-me` skill/);
   assert.match(prompt, /one fenced code block/);
   assert.match(prompt, /`mermaid`, `text`, or `diff`/);
-  assert.match(schema.properties.architectureDiagram.description, /upstream show-me skill/);
+  assert.match(
+    schema.properties.architectureDiagram.description,
+    /vendored upstream show-me skill/,
+  );
+  assert.ok(assembledPrompt.includes(skillInstructions));
+  assert.equal(issuePrompt.includes(skillInstructions), false);
 });
 
 test("issue reviews close fixed work and automatically route small source-proven bugs", () => {

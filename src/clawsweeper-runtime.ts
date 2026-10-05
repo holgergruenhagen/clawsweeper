@@ -194,6 +194,7 @@ let activeRepositoryProfile = repositoryProfileFor(
   process.env.CLAWSWEEPER_TARGET_REPO ?? DEFAULT_TARGET_REPO,
 );
 const REVIEW_ITEM_PROMPT_PATH = join(ROOT, "prompts", "review-item.md");
+const SHOW_ME_SKILL_PATH = join(ROOT, ".agents", "skills", "show-me", "SKILL.md");
 const CLAWSWEEPER_DECISION_SCHEMA_PATH = join(ROOT, "schema", "clawsweeper-decision.schema.json");
 const PR_CLOSE_COVERAGE_PROOF_PROMPT_PATH = join(ROOT, "prompts", "pr-close-coverage-proof.md");
 const PR_CLOSE_COVERAGE_PROOF_SCHEMA_PATH = join(
@@ -729,6 +730,7 @@ const { collectItemContext } = createItemContext({
 
 const reviewRuntime = createReviewRuntime({
   reviewItemPromptPath: REVIEW_ITEM_PROMPT_PATH,
+  showMeSkillPath: SHOW_ME_SKILL_PATH,
   decisionSchemaPath: CLAWSWEEPER_DECISION_SCHEMA_PATH,
   prCloseCoverageProofPromptPath: PR_CLOSE_COVERAGE_PROOF_PROMPT_PATH,
   targetRepo,

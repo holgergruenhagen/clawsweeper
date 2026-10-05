@@ -225,14 +225,17 @@ sentence. Keep `summary` for the review decision and rationale.
 
 Set `systemContext` to one or two plain-language sentences that orient a reader
 inside the larger product: name the changed subsystem, what feeds into it, and
-what it affects next. Use the upstream `show-me` skill to choose the smallest
-useful visual for `architectureDiagram`: a Mermaid flowchart or sequence, a
-plain-text tree or call sketch, or a compact diff. Return one fenced code block
-using `mermaid`, `text`, or `diff`, with no heading or prose around it. Prefer
-product terms over class/function names. Do not include URLs, links, Mermaid
-click/style/init directives, or speculative components. Use empty strings for
-both fields only when the repository evidence cannot support a concrete system
-explanation.
+what it affects next. Use the vendored upstream `show-me` skill below to choose
+the smallest useful visual for `architectureDiagram`. Its HTML artifact path is
+not suitable for a GitHub comment; use one fenced code block tagged with one of
+`mermaid`, `text`, or `diff`, with no heading or prose around it. Prefer product
+terms over class/function names. Do not include URLs, links, Mermaid
+click/style/init directives, or speculative components. Use empty strings for both fields only
+when the repository evidence cannot support a concrete system explanation.
+
+### Vendored show-me skill instructions
+
+{{SHOW_ME_SKILL}}
 
 Keep user-visible fields non-overlapping. `summary` is the verdict and
 rationale, `changeSummary` is only the requested change or PR diff,

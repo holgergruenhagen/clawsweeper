@@ -70,6 +70,7 @@ import { readBoundedReviewResult } from "./review-output-policy.js";
 
 interface ReviewRuntimeDependencies {
   reviewItemPromptPath: string;
+  showMeSkillPath?: string;
   decisionSchemaPath: string;
   prCloseCoverageProofPromptPath: string;
   targetRepo: () => string;
@@ -93,6 +94,7 @@ interface ReviewRuntimeDependencies {
 
 export function createReviewRuntime({
   reviewItemPromptPath: REVIEW_ITEM_PROMPT_PATH,
+  showMeSkillPath: SHOW_ME_SKILL_PATH,
   decisionSchemaPath: CLAWSWEEPER_DECISION_SCHEMA_PATH,
   prCloseCoverageProofPromptPath: PR_CLOSE_COVERAGE_PROOF_PROMPT_PATH,
   targetRepo,
@@ -107,6 +109,7 @@ export function createReviewRuntime({
   stringOrUndefined,
 }: ReviewRuntimeDependencies) {
   let reviewPromptTemplateCache: string | undefined;
+  let showMeSkillTemplateCache: string | undefined;
   let reviewDecisionSchemaCache: string | undefined;
   let prCloseCoverageProofPromptTemplateCache: string | undefined;
 
@@ -456,6 +459,21 @@ export function createReviewRuntime({
     return reviewPromptTemplateCache;
   }
 
+  function showMeSkillTemplate(): string {
+    if (!SHOW_ME_SKILL_PATH) {
+      throw new Error("The vendored show-me skill path is not configured");
+    }
+    if (!showMeSkillTemplateCache) {
+      const skill = readFileSync(SHOW_ME_SKILL_PATH, "utf8");
+      const frontmatter = skill.match(/^---\r?\n[\s\S]*?\r?\n---\r?\n/);
+      if (!frontmatter?.[0].includes("name: show-me")) {
+        throw new Error("The vendored show-me skill has invalid frontmatter");
+      }
+      showMeSkillTemplateCache = skill.slice(frontmatter[0].length).trim();
+    }
+    return showMeSkillTemplateCache;
+  }
+
   function prCloseCoverageProofPromptTemplate(): string {
     prCloseCoverageProofPromptTemplateCache ??= readFileSync(
       PR_CLOSE_COVERAGE_PROOF_PROMPT_PATH,
@@ -481,7 +499,12 @@ export function createReviewRuntime({
     additionalPrompt = "",
     runtimeHints: ReviewPromptRuntimeHints = {},
   ): ReviewPromptBuild {
-    const prompt = reviewPromptTemplate();
+    const showMeSkillPrompt = item.kind === "pull_request" ? showMeSkillTemplate() : "";
+    const promptTemplate = reviewPromptTemplate();
+    const prompt = promptTemplate.replace("{{SHOW_ME_SKILL}}", showMeSkillPrompt);
+    if (prompt.includes("{{SHOW_ME_SKILL}}")) {
+      throw new Error("The review prompt did not consume the show-me skill placeholder");
+    }
     const contextJson = contextJsonForPrompt(context, item.kind);
     const prEvidence =
       item.kind === "pull_request"
