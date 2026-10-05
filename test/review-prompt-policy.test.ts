@@ -207,14 +207,17 @@ test("PR review prompt includes the vendored show-me skill for its architecture 
     { mainSha: "a".repeat(40), latestRelease: null },
   );
 
-  assert.match(prompt, /vendored upstream `show-me` skill/);
+  assert.match(prompt, /smallest useful visual/);
+  assert.match(prompt, /\{\{SHOW_ME_SKILL_GUIDANCE\}\}/);
   assert.match(prompt, /one fenced code block/);
-  assert.match(prompt, /`mermaid`, `text`, or `diff`/);
+  assert.match(prompt, /`mermaid`, `text`,\s*or `diff`/);
+  assert.match(schema.properties.architectureDiagram.description, /compact architecture sketch/);
   assert.match(
-    schema.properties.architectureDiagram.description,
-    /vendored upstream show-me skill/,
+    assembledPrompt,
+    /For pull-request reviews, use the vendored upstream `show-me` skill/,
   );
   assert.ok(assembledPrompt.includes(skillInstructions));
+  assert.doesNotMatch(issuePrompt, /show-me skill|SHOW_ME_SKILL_GUIDANCE/i);
   assert.equal(issuePrompt.includes(skillInstructions), false);
 });
 

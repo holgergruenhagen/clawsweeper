@@ -499,11 +499,14 @@ export function createReviewRuntime({
     additionalPrompt = "",
     runtimeHints: ReviewPromptRuntimeHints = {},
   ): ReviewPromptBuild {
-    const showMeSkillPrompt = item.kind === "pull_request" ? showMeSkillTemplate() : "";
+    const showMeSkillPrompt =
+      item.kind === "pull_request"
+        ? `For pull-request reviews, use the vendored upstream \`show-me\` skill below to choose the visual form. Its HTML artifact path is not suitable for a GitHub comment.\n\n### Vendored show-me skill instructions\n\n${showMeSkillTemplate()}`
+        : "";
     const promptTemplate = reviewPromptTemplate();
-    const prompt = promptTemplate.replace("{{SHOW_ME_SKILL}}", showMeSkillPrompt);
-    if (prompt.includes("{{SHOW_ME_SKILL}}")) {
-      throw new Error("The review prompt did not consume the show-me skill placeholder");
+    const prompt = promptTemplate.replace("{{SHOW_ME_SKILL_GUIDANCE}}", showMeSkillPrompt);
+    if (prompt.includes("{{SHOW_ME_SKILL_GUIDANCE}}")) {
+      throw new Error("The review prompt did not consume the show-me guidance placeholder");
     }
     const contextJson = contextJsonForPrompt(context, item.kind);
     const prEvidence =
