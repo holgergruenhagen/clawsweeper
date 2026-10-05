@@ -123,6 +123,10 @@ test("architecture sketch sanitizer accepts the show-me code shapes", () => {
     "",
   );
   assert.equal(
+    architectureSanitizer("```mermaid\nflowchart LR\n    A[\"<img src='/image.png'>\"]\n```"),
+    "",
+  );
+  assert.equal(
     architectureSanitizer("flowchart LR\n    app --> gateway"),
     "```mermaid\nflowchart LR\n    app --> gateway\n```",
   );
@@ -132,6 +136,12 @@ test("architecture sketch sanitizer rejects unsafe or section-breaking content",
   assert.equal(
     architectureSanitizer("```mermaid\nflowchart LR\nclick app href https://example.com\n```"),
     "",
+  );
+  assert.equal(architectureSanitizer('```mermaid\nflowchart LR\nA["<br/>"]\n```'), "");
+  assert.equal(architectureSanitizer("```text\n<diagram>\n```"), "```text\n<diagram>\n```");
+  assert.equal(
+    architectureSanitizer("```diff\n- <old>\n+ <new>\n```"),
+    "```diff\n- <old>\n+ <new>\n```",
   );
   assert.equal(architectureSanitizer("```text\napp\n```\n## Injected heading"), "");
 });

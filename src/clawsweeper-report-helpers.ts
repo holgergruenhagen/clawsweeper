@@ -219,6 +219,9 @@ export function createReportHelpers(dependencies: CreateReportHelpersDependencie
     // "Data: PR input" are not mistaken for data:/file: URLs.
     if (/\b(?:data|javascript|vbscript|https?|ftp|file|blob|mailto):\S/i.test(body)) return "";
     if (format === "mermaid") {
+      // Mermaid interprets labels as diagram markup, so retain the old HTML
+      // boundary here while allowing angle brackets inside inert text/diff fences.
+      if (/<[a-z!/]/i.test(body)) return "";
       const declarationLine = body.split(/\r?\n/, 1)[0] ?? "";
       const validFlowchart = /^flowchart[ \t]+(?:LR|RL|TB|BT|TD)[ \t]*;?[ \t]*$/i.test(
         declarationLine,
