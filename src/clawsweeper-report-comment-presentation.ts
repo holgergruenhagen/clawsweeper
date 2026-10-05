@@ -364,7 +364,7 @@ export function createReportCommentPresentation(
         appendHeadingSection(
           lines,
           "How this fits together",
-          `${systemContext}\n\n\`\`\`mermaid\n${architectureDiagram}\n\`\`\``,
+          `${systemContext}\n\n${architectureDiagram}`,
         );
       }
       if (decisionPacketBlock) {

@@ -201,36 +201,40 @@ export function createReportHelpers(dependencies: CreateReportHelpersDependencie
   }
 
   function sanitizeArchitectureDiagram(value: string): string {
-    const diagram = value.trim();
-    if (!diagram || diagram.length > 4000) return "";
-    if (!/^flowchart\b/i.test(diagram)) return "";
-    // No fence-breaking backticks, node metadata (image/icon nodes), HTML tags, init
-    // directives, or URLs of any form, including scheme-relative and data: URLs.
-    if (diagram.includes("`") || diagram.includes("~~~") || diagram.includes("@{")) return "";
-    if (/<[a-z!/]/i.test(diagram)) return "";
-    // Heading-shaped lines could terminate the report section the diagram is
-    // serialized into; Mermaid flowcharts never need a leading #.
-    if (/^[ \t]*#/m.test(diagram)) return "";
-    if (/%%\{/.test(diagram)) return "";
-    if (diagram.includes("//")) return "";
+    const source = value.trim();
+    if (!source || source.length > 4000) return "";
+    const fenced = /^```(mermaid|text|diff)[ \t]*\r?\n([\s\S]*?)\r?\n```$/i.exec(source);
+    const legacyMermaid = !fenced && /^flowchart\b/i.test(source);
+    if (!fenced && !legacyMermaid) return "";
+    const format = legacyMermaid ? "mermaid" : fenced?.[1]?.toLowerCase();
+    const body = (legacyMermaid ? source : (fenced?.[2] ?? "")).trim();
+    if (!format || !body) return "";
+    // Keep generated Markdown inert. The validated body is re-wrapped below, so
+    // embedded fences, links, URLs, and Markdown headings are never published.
+    if (body.includes("`") || body.includes("~~~") || body.includes("@{")) return "";
+    if (/^[ \t]*#/m.test(body)) return "";
+    if (/%%\{/.test(body)) return "";
+    if (body.includes("//")) return "";
     // Require a non-space after the colon so human-readable labels such as
     // "Data: PR input" are not mistaken for data:/file: URLs.
-    if (/\b(?:data|javascript|vbscript|https?|ftp|file|blob|mailto):\S/i.test(diagram)) return "";
-    // The declaration line must be exactly "flowchart <direction>" so no further
-    // statement can hide after it on the same line.
-    const declarationLine = diagram.split(/\r?\n/, 1)[0] ?? "";
-    if (!/^flowchart[ \t]+(?:LR|RL|TB|BT|TD)[ \t]*;?[ \t]*$/i.test(declarationLine)) return "";
-    // Interaction and styling directives start a statement (newline- or
-    // semicolon-separated); the same words are fine inside human-readable node labels.
-    for (const statement of diagram.split(/[;\r\n]+/)) {
-      if (/^\s*(?:click|style|classDef|class|linkStyle)\b/i.test(statement)) return "";
+    if (/\b(?:data|javascript|vbscript|https?|ftp|file|blob|mailto):\S/i.test(body)) return "";
+    if (format === "mermaid") {
+      const declarationLine = body.split(/\r?\n/, 1)[0] ?? "";
+      const validFlowchart = /^flowchart[ \t]+(?:LR|RL|TB|BT|TD)[ \t]*;?[ \t]*$/i.test(
+        declarationLine,
+      );
+      const validSequence = /^sequenceDiagram[ \t]*$/i.test(declarationLine);
+      if (!validFlowchart && !validSequence) return "";
+      for (const statement of body.split(/[;\r\n]+/)) {
+        if (/^\s*(?:click|style|classDef|class|linkStyle)\b/i.test(statement)) return "";
+        if (/^\s*links?\s+[\w-]+\s*:/i.test(statement)) return "";
+      }
+      // Mermaid can begin another directive on a line without a separator.
+      if (/\bclick[ \t]+[\w-]+[ \t]+(?:href|call)\b/i.test(body)) return "";
+      if (/\b(?:style|linkStyle)[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(body)) return "";
+      if (/\bclassDef[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(body)) return "";
     }
-    // Directive shapes are also rejected mid-line, where Mermaid can begin a new
-    // statement without a separator.
-    if (/\bclick[ \t]+[\w-]+[ \t]+(?:href|call)\b/i.test(diagram)) return "";
-    if (/\b(?:style|linkStyle)[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(diagram)) return "";
-    if (/\bclassDef[ \t]+[\w-]+[ \t]+[\w-]+[ \t]*:/i.test(diagram)) return "";
-    return diagram;
+    return `\`\`\`${format}\n${body}\n\`\`\``;
   }
 
   return {

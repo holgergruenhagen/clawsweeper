@@ -191,6 +191,16 @@ test("review prompt routes PR likely owners through feature history", () => {
   assert.match(prompt, /use names without email addresses/);
 });
 
+test("review prompt uses upstream show-me for the GitHub architecture section", () => {
+  const prompt = readFileSync("prompts/review-item.md", "utf8");
+  const schema = JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8"));
+
+  assert.match(prompt, /upstream `show-me` skill/);
+  assert.match(prompt, /one fenced code block/);
+  assert.match(prompt, /`mermaid`, `text`, or `diff`/);
+  assert.match(schema.properties.architectureDiagram.description, /upstream show-me skill/);
+});
+
 test("issue reviews close fixed work and automatically route small source-proven bugs", () => {
   const prompt = readFileSync("prompts/review-item.md", "utf8");
 

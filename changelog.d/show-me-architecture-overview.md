@@ -1,0 +1,1 @@
+- Use the upstream show-me skill to generate concise architecture sketches in review comments.

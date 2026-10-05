@@ -92,6 +92,50 @@ const evidenceParser = createReportParser({
   }),
 } as Parameters<typeof createReportParser>[0]);
 
+const architectureSanitizer = createReportHelpers({
+  OWNED_REVIEW_SECTION_HEADINGS: new Set(),
+  parseBacktickLocation: () => null,
+}).sanitizeArchitectureDiagram;
+
+test("architecture sketch sanitizer accepts the show-me code shapes", () => {
+  assert.equal(
+    architectureSanitizer("```text\napp\n  -> gateway\n    -> response\n```"),
+    "```text\napp\n  -> gateway\n    -> response\n```",
+  );
+  assert.equal(
+    architectureSanitizer("```diff\n- old flow\n+ new flow\n```"),
+    "```diff\n- old flow\n+ new flow\n```",
+  );
+  assert.equal(
+    architectureSanitizer("```mermaid\nsequenceDiagram\n    UI->>Gateway: connect\n```"),
+    "```mermaid\nsequenceDiagram\n    UI->>Gateway: connect\n```",
+  );
+  assert.equal(
+    architectureSanitizer(
+      "```mermaid\nsequenceDiagram\n    participant A\n    link A: dashboard @ /settings\n```",
+    ),
+    "",
+  );
+  assert.equal(
+    architectureSanitizer(
+      '```mermaid\nsequenceDiagram\n    participant A\n    links A: {"Dashboard": "/settings"}\n```',
+    ),
+    "",
+  );
+  assert.equal(
+    architectureSanitizer("flowchart LR\n    app --> gateway"),
+    "```mermaid\nflowchart LR\n    app --> gateway\n```",
+  );
+});
+
+test("architecture sketch sanitizer rejects unsafe or section-breaking content", () => {
+  assert.equal(
+    architectureSanitizer("```mermaid\nflowchart LR\nclick app href https://example.com\n```"),
+    "",
+  );
+  assert.equal(architectureSanitizer("```text\napp\n```\n## Injected heading"), "");
+});
+
 function evidenceReport(
   evidence: Evidence[],
   decisionKind: DecisionKind = "close",
@@ -1182,9 +1226,11 @@ OpenClaw resolves a session's model override before sending the next agent reque
 
 ## Architecture Diagram
 
-flowchart LR
-    session["Session settings"] --> resolver["Model resolver"]
-    resolver --> request["Agent request"]
+\`\`\`text
+iOS app
+  -> gateway disconnect
+    -> clear active operator state
+\`\`\`
 
 ## Real Behavior Proof
 
@@ -1268,7 +1314,7 @@ Full review comments:
   assert.match(comment, /\| \*\*Evidence reviewed\*\* \| 1 item \| targeted lane:/);
   assert.match(
     comment,
-    /## How this fits together\n\nOpenClaw resolves a session's model override before sending the next agent request\.\n\n```mermaid\nflowchart LR/,
+    /## How this fits together\n\nOpenClaw resolves a session's model override before sending the next agent request\.\n\n```text\niOS app\n  -> gateway disconnect\n    -> clear active operator state\n```/,
   );
   assert.ok(comment.indexOf("## Verification") < comment.indexOf("## How this fits together"));
   assert.doesNotMatch(comment, /## Proof/);

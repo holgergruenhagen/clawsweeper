@@ -109,7 +109,7 @@
     },
     "architectureDiagram": {
       "type": "string",
-      "description": "Mermaid flowchart source without code fences. Use 4-8 plainly labeled nodes to show the changed subsystem, its important inputs, decisions, and outputs. Do not use click directives, URLs, HTML, initialization directives, styling directives, or source-code-only symbol names. Use an empty string when systemContext is empty."
+      "description": "One fenced Markdown code block chosen with the upstream show-me skill: mermaid for a flowchart or sequence, text for a tree or call sketch, or diff for a compact change shape. Return no heading or surrounding prose. Prefer plain-language product terms; do not include URLs, links, Mermaid click/style/init directives, or speculative components. Use an empty string when systemContext is empty."
     },
     "evidence": {
       "type": "array",
