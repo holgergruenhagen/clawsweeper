@@ -5,6 +5,7 @@ import {
   appendFloorBackfillCandidates,
   hotIntakeRecencyMs,
   nextReviewDueAtMs,
+  reviewPolicyForItem,
   reviewPriority,
   reviewedAtMs,
   schedulerBucket,
@@ -57,6 +58,34 @@ test("review policy changes force fresh complete reports back into planning", ()
 
   assert.equal(shouldReviewItem(item(), review, now, "new-policy"), true);
   assert.equal(shouldReviewItem(item(), review, now, "old-policy"), false);
+});
+
+test("vendored PR skill policy changes do not stale issue reviews", () => {
+  const now = Date.parse("2026-10-05T12:00:00Z");
+  const issuePolicy = "a".repeat(16);
+  const pullPolicy = "c".repeat(16);
+  const currentPolicy = `policy-set-v1:${issuePolicy}:${pullPolicy}`;
+  const issue = item({
+    kind: "issue",
+    createdAt: "2026-01-01T00:00:00Z",
+    updatedAt: "2026-01-01T00:00:00Z",
+  });
+  const pullRequest = {
+    ...issue,
+    kind: "pull_request",
+    number: issue.number + 1,
+  };
+  const review = (reviewPolicy) => ({
+    reviewedAt: new Date(now - 1_000).toISOString(),
+    itemUpdatedAt: issue.updatedAt,
+    reviewStatus: "complete",
+    reviewPolicy,
+  });
+
+  assert.equal(reviewPolicyForItem(currentPolicy, "issue"), issuePolicy);
+  assert.equal(reviewPolicyForItem(currentPolicy, "pull_request"), pullPolicy);
+  assert.equal(shouldReviewItem(issue, review(issuePolicy), now, currentPolicy), false);
+  assert.equal(shouldReviewItem(pullRequest, review("b".repeat(16)), now, currentPolicy), true);
 });
 
 test("hot new items review daily unless target-side activity requires hourly cadence", () => {

@@ -104,7 +104,7 @@ export function createReviewPlanningInventory(dependencies: ReviewPlanningDepend
     reviewIndex?: ExistingReviewIndex,
   ): DueCandidate | null {
     const review = indexedExistingReview(item, itemsDir, reviewIndex);
-    if (!review || hasReviewPolicyMismatch(review, reviewPolicy)) return null;
+    if (!review || hasReviewPolicyMismatch(review, reviewPolicy, item.kind)) return null;
     const reviewedAt = reviewedAtMs(review);
     if (reviewedAt === null) return null;
     if (now - reviewedAt < minReviewAgeMs) return null;

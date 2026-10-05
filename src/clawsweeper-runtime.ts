@@ -112,6 +112,7 @@ import type {
   Evidence,
   GitInfo,
   Item,
+  ItemKind,
   ItemContext,
   MantisRecommendation,
   MutationRunner,
@@ -391,29 +392,42 @@ const {
   reviewCommentContentRevision,
 } = sourceRevisionTools;
 
-function reviewPolicyHash(options: { model?: string; sandboxMode?: string }): string {
+function reviewPolicyHash(
+  options: { model?: string; sandboxMode?: string },
+  itemKind?: ItemKind,
+  showMeSkillContent?: string,
+): string {
   const policyTargetRepo = targetRepo();
-  return sha256(
-    stableJson({
-      version: REVIEW_POLICY_VERSION,
-      freshDays: FRESH_DAYS,
-      // Model changes roll through normal review cadence. Keep this sentinel
-      // stable; bump REVIEW_POLICY_VERSION to invalidate stored reviews.
-      model: "model-excluded-2026-07",
-      reasoningEffort: "per-item-author-profile-v1",
-      itemExecutionProfile: "maintainer-high-fast-otherwise-medium-standard-v1",
-      sandboxMode: options.sandboxMode ?? "read-only",
-      // Keep the historical hash value so service tier changes do not invalidate reviews.
-      serviceTier: "",
-      targetRepo: policyTargetRepo,
-      ...(policyTargetRepo.toLowerCase() === "openclaw/openclaw"
-        ? { openclawCodexSourceProvisioning: "v1" }
-        : {}),
-      repositoryProfile: targetProfile(),
-      prompt: reviewPromptTemplate(),
-      schema: reviewDecisionSchemaText(),
-    }),
+  const effectiveShowMeSkillContent =
+    itemKind === "issue" ? "" : (showMeSkillContent ?? readFileSync(SHOW_ME_SKILL_PATH, "utf8"));
+  const sharedPolicy = {
+    version: REVIEW_POLICY_VERSION,
+    freshDays: FRESH_DAYS,
+    // Model changes roll through normal review cadence. Keep this sentinel
+    // stable; bump REVIEW_POLICY_VERSION to invalidate stored reviews.
+    model: "model-excluded-2026-07",
+    reasoningEffort: "per-item-author-profile-v1",
+    itemExecutionProfile: "maintainer-high-fast-otherwise-medium-standard-v1",
+    sandboxMode: options.sandboxMode ?? "read-only",
+    // Keep the historical hash value so service tier changes do not invalidate reviews.
+    serviceTier: "",
+    targetRepo: policyTargetRepo,
+    ...(policyTargetRepo.toLowerCase() === "openclaw/openclaw"
+      ? { openclawCodexSourceProvisioning: "v1" }
+      : {}),
+    repositoryProfile: targetProfile(),
+    prompt: reviewPromptTemplate(),
+    schema: reviewDecisionSchemaText(),
+  };
+  const issuePolicy = sha256(stableJson(sharedPolicy)).slice(0, 16);
+  // Only PR prompts use the vendored skill, so skill edits must not stale issue reviews.
+  const pullRequestPolicy = sha256(
+    stableJson({ ...sharedPolicy, showMeSkill: sha256(effectiveShowMeSkillContent) }),
   ).slice(0, 16);
+  if (itemKind === "issue") return issuePolicy;
+  if (itemKind === "pull_request") return pullRequestPolicy;
+  // Planning scans mixed item kinds and resolves this pair per candidate.
+  return `policy-set-v1:${issuePolicy}:${pullRequestPolicy}`;
 }
 
 export function reviewPolicyHashForTest(
@@ -421,8 +435,10 @@ export function reviewPolicyHashForTest(
     model?: string;
     sandboxMode?: string;
   } = {},
+  itemKind?: ItemKind,
+  showMeSkillContent?: string,
 ): string {
-  return reviewPolicyHash(options);
+  return reviewPolicyHash(options, itemKind, showMeSkillContent);
 }
 
 const decisionParser = createDecisionParser({

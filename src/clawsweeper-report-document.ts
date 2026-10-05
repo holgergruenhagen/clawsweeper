@@ -31,6 +31,7 @@ import {
   reviewStructuralPullStateDigest,
   type ReviewStructuralRecord,
 } from "./review-structural-cache.js";
+import { reviewPolicyForItem } from "./scheduler-policy.js";
 import type { CreateReportRenderingDependencies } from "./clawsweeper-report-rendering-dependencies.js";
 import type { createReportContextRendering } from "./clawsweeper-report-context.js";
 import type { createReportCommentHelpers } from "./clawsweeper-report-comment-helpers.js";
@@ -619,7 +620,7 @@ regression_provenance_source_author: ${regressionProvenance?.sourceAuthor ?? "un
 regression_provenance_related_pr_url: ${suspectedRegressionProvenance?.relatedPullRequestUrl ?? "unknown"}
 regression_provenance_related_pr_number: ${suspectedRegressionProvenance?.relatedPullRequestNumber ?? "unknown"}
 regression_provenance_related_repo: ${suspectedRegressionProvenance?.relatedRepo ?? "unknown"}
-review_policy: ${options.reviewPolicy}
+review_policy: ${reviewPolicyForItem(options.reviewPolicy, options.item.kind)}
 review_model: ${options.runtime.model}
 review_reasoning_effort: ${options.runtime.reasoningEffort}
 review_sandbox: ${options.runtime.sandboxMode ?? "unknown"}

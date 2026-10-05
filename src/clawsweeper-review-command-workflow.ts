@@ -54,7 +54,7 @@ import {
   reviewStructuralRecordsDescribeSameVerdictInput,
   type ReviewStructuralRecord,
 } from "./review-structural-cache.js";
-import { reviewContentCacheHit } from "./scheduler-policy.js";
+import { reviewContentCacheHit, reviewPolicyForItem } from "./scheduler-policy.js";
 import type { CreateReviewCommandWorkflowDependencies } from "./clawsweeper-review-command-dependencies.js";
 import { prepareReviewCommand } from "./clawsweeper-review-preparation.js";
 import { parsePrHydrationSnapshot } from "./pr-hydration-snapshot.js";
@@ -582,6 +582,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           );
           return cachePreflightState === "passed";
         };
+        const itemReviewPolicy = reviewPolicyForItem(reviewPolicy, item.kind) ?? reviewPolicy;
         activeReviewItem = item;
         let reviewItemFailed = false;
         let itemRecoveryRequired = false;
@@ -606,7 +607,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             writeOutputReport(item, reportPath, hostReport(markdownFor({
               item, context, decision, git, action, reviewMode: "propose",
               snapshotHash: itemSnapshotHash(item, context), contentDigest: itemContentDigest(item, context),
-              reviewPolicy, runtime,
+              reviewPolicy: itemReviewPolicy, runtime,
               // The workflow owns reservation and fenced publication. Carry its
               // tuple to the shared durable-comment writer without hydrating here.
               ...(suppliedReviewLease ? {
@@ -787,7 +788,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
           structuralCacheChecks += 1;
           const structuralProbeDecision = reviewStructuralCacheProbeDecision({
             review: cacheEligibleReview,
-            reviewPolicy,
+            reviewPolicy: itemReviewPolicy,
             reviewModel: PUBLIC_CODEX_MODEL,
             explicitDispatch,
             maintainerRequest,
@@ -805,7 +806,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               structuralRecord = fetchReviewStructuralRecord({
                 item,
                 git,
-                reviewPolicy,
+                reviewPolicy: itemReviewPolicy,
                 reviewModel: PUBLIC_CODEX_MODEL,
               });
               if (!reviewStructuralRecordAtLeastAsFresh(structuralRecord, item.updatedAt)) {
@@ -831,7 +832,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
               review: priorReview,
               priorRecord: priorReview?.structuralRecord ?? null,
               currentRecord: structuralRecord,
-              reviewPolicy,
+              reviewPolicy: itemReviewPolicy,
               reviewModel: PUBLIC_CODEX_MODEL,
               explicitDispatch,
               maintainerRequest,
@@ -933,7 +934,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                   onPullIdentity: (identity) => { structuralScanIdentity = identity; },
                   item,
                   git,
-                  reviewPolicy,
+                  reviewPolicy: itemReviewPolicy,
                   reviewModel: PUBLIC_CODEX_MODEL,
                 });
                 if (
@@ -963,7 +964,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                   : priorReview,
                 priorRecord: initialStructuralRecord,
                 currentRecord: revalidatedStructuralRecord,
-                reviewPolicy,
+                reviewPolicy: itemReviewPolicy,
                 reviewModel: PUBLIC_CODEX_MODEL,
                 explicitDispatch,
                 maintainerRequest,
@@ -1185,7 +1186,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             const candidate = fetchReviewStructuralRecord({
               item,
               git,
-              reviewPolicy,
+              reviewPolicy: itemReviewPolicy,
               reviewModel: PUBLIC_CODEX_MODEL,
             });
             if (
@@ -1234,7 +1235,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             candidate = fetchReviewStructuralRecord({
               item,
               git: refreshedGit,
-              reviewPolicy,
+              reviewPolicy: itemReviewPolicy,
               reviewModel: PUBLIC_CODEX_MODEL,
             });
           } catch (error) {
@@ -1356,7 +1357,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             : cacheEligibleReview;
         const contentCacheHit = reviewContentCacheHit({
             review: contentCacheReview,
-            reviewPolicy,
+            reviewPolicy: itemReviewPolicy,
             contentDigest,
             now: Date.now(),
             explicitDispatch,
@@ -1571,7 +1572,7 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
             reviewMode: "propose",
             snapshotHash,
             contentDigest,
-            reviewPolicy,
+            reviewPolicy: itemReviewPolicy,
             runtime,
             structuralRecord,
             ...(acquiredReviewLease

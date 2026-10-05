@@ -9,6 +9,16 @@ export interface SchedulerItem {
   labels?: readonly string[] | undefined;
 }
 
+export function reviewPolicyForItem(
+  reviewPolicy: string | undefined,
+  itemKind: SchedulerItemKind,
+): string | undefined {
+  if (!reviewPolicy) return undefined;
+  const policySet = /^policy-set-v1:([\da-f]{16}):([\da-f]{16})$/.exec(reviewPolicy);
+  if (!policySet) return reviewPolicy;
+  return itemKind === "issue" ? policySet[1] : policySet[2];
+}
+
 export interface SchedulerExistingReview {
   reviewedAt?: string | undefined;
   itemUpdatedAt?: string | undefined;
@@ -142,8 +152,10 @@ function reviewCadenceMs(
 export function hasReviewPolicyMismatch(
   review: SchedulerExistingReview | null,
   reviewPolicy?: string,
+  itemKind?: SchedulerItemKind,
 ): boolean {
-  return Boolean(review && reviewPolicy && review.reviewPolicy !== reviewPolicy);
+  const expectedPolicy = itemKind ? reviewPolicyForItem(reviewPolicy, itemKind) : reviewPolicy;
+  return Boolean(review && expectedPolicy && review.reviewPolicy !== expectedPolicy);
 }
 
 export function shouldReviewItem(
@@ -152,7 +164,7 @@ export function shouldReviewItem(
   now = Date.now(),
   reviewPolicy?: string,
 ): boolean {
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return true;
+  if (hasReviewPolicyMismatch(review, reviewPolicy, item.kind)) return true;
   const reviewedAt = reviewedAtMs(review);
   if (reviewedAt === null) return true;
   return (
@@ -167,6 +179,7 @@ export function reviewContentCacheHit(options: {
   review: SchedulerExistingReview | null;
   reviewPolicy: string | undefined;
   contentDigest: string;
+  itemKind?: SchedulerItemKind;
   now?: number;
   explicitDispatch: boolean;
   maintainerRequest: boolean;
@@ -176,7 +189,7 @@ export function reviewContentCacheHit(options: {
   if (!review || review.reviewStatus !== "complete") return false;
   if (review.decision !== "keep_open") return false;
   if (review.lastFullReviewDecision !== "keep_open") return false;
-  if (hasReviewPolicyMismatch(review, options.reviewPolicy)) return false;
+  if (hasReviewPolicyMismatch(review, options.reviewPolicy, options.itemKind)) return false;
   if (!review.contentDigest || review.contentDigest !== options.contentDigest) return false;
   const lastFullReviewAt = timestampMs(review.lastFullReviewAt);
   if (lastFullReviewAt === null) return false;
@@ -196,7 +209,7 @@ export function reviewPriority(
   if (item.kind === "pull_request") return 3;
   const createdAt = Date.parse(item.createdAt);
   if (Number.isFinite(createdAt) && now - createdAt < RECENT_ISSUE_DAYS * DAY_MS) return 4;
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return 5;
+  if (hasReviewPolicyMismatch(review, reviewPolicy, item.kind)) return 5;
   return 6;
 }
 
@@ -223,7 +236,7 @@ export function nextReviewDueAtMs(
   now = Date.now(),
   reviewPolicy?: string,
 ): number {
-  if (hasReviewPolicyMismatch(review, reviewPolicy)) return 0;
+  if (hasReviewPolicyMismatch(review, reviewPolicy, item.kind)) return 0;
   const reviewedAt = reviewedAtMs(review);
   if (reviewedAt === null) return 0;
   return (

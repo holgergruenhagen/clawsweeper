@@ -152,7 +152,7 @@ export function createReviewPlanningHotIntake(
     reviewPolicy: string,
   ): boolean {
     if (item.kind !== "pull_request") return false;
-    if (hasReviewPolicyMismatch(review, reviewPolicy)) return false;
+    if (hasReviewPolicyMismatch(review, reviewPolicy, item.kind)) return false;
     if (!review || hasUncapturedActivitySinceExactReview(item, review)) return false;
     const reviewed = hotIntakeExactReviewSnapshotFromReport(review, now);
     if (!reviewed) return false;
@@ -205,11 +205,11 @@ export function createReviewPlanningHotIntake(
       reviewCommentSyncedAt: options.reviewCommentSyncedAt,
       labelsSyncedAt: options.labelsSyncedAt,
     } as ExistingReview;
-    if (hasReviewPolicyMismatch(review, options.currentReviewPolicy)) return false;
     const item = {
       kind: "pull_request",
       updatedAt: options.itemUpdatedAt ?? options.reviewedAt ?? "",
     } as Item;
+    if (hasReviewPolicyMismatch(review, options.currentReviewPolicy, item.kind)) return false;
     if (hasUncapturedActivitySinceExactReview(item, review)) return false;
     const reviewed = hotIntakeExactReviewSnapshotFromReport(review, options.now);
     if (

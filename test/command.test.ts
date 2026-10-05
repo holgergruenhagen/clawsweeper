@@ -32,6 +32,16 @@ import { writeFakeScanner } from "./agent-input-scan-helpers.ts";
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
 
+test("review policy hash tracks vendored show-me only for PRs", () => {
+  const issuePolicy = reviewPolicyHashForTest({}, "issue");
+  const pullRequestPolicy = reviewPolicyHashForTest({}, "pull_request");
+  assert.equal(reviewPolicyHashForTest({}, "issue", "changed vendored instructions"), issuePolicy);
+  assert.notEqual(
+    reviewPolicyHashForTest({}, "pull_request", "changed vendored instructions"),
+    pullRequestPolicy,
+  );
+});
+
 test("synthetic GitHub commands preserve arguments without polluting production coverage", () => {
   const output = execFileSync(process.execPath, ["scripts/e2e/fixture-coverage.mjs"], {
     encoding: "utf8",
@@ -262,7 +272,7 @@ test("CSW-088 scheduled hot planning suppresses #117063, observes an in-flight u
         number,
         title: pull.title,
         reviewed_at: reviewedAt,
-        review_policy: reviewPolicyHashForTest(),
+        review_policy: reviewPolicyHashForTest({}, "pull_request"),
         item_updated_at: reviewedAt,
         item_source_revision: sourceRevision,
         pull_head_sha: headSha,
