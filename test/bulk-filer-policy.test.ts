@@ -43,25 +43,73 @@ test("bulk-filer detection includes the threshold boundary and leaves labeling t
 
   const candidate = item({ number: 44, createdAt: "2026-07-09T12:00:00.001Z" });
   let observedWindowStart = "";
+  let observedWindowEnd = "";
   const result = detectBulkFilerForTest({
     item: candidate,
     cache: new Map(),
     now,
-    searchCount: ({ windowStart }) => {
+    searchCount: ({ windowStart, windowEnd }) => {
       searches += 1;
       observedWindowStart = windowStart;
+      observedWindowEnd = windowEnd;
       return 10;
     },
   });
 
   assert.equal(searches, 1);
-  assert.equal(observedWindowStart, "2026-07-09T12:00:00.000Z");
+  assert.equal(observedWindowStart, "2026-07-02T12:00:00.001Z");
+  assert.equal(observedWindowEnd, "2026-07-09T12:00:00.001Z");
   assert.equal(result.context?.issueCount, 10);
   assert.equal(result.context?.threshold, 10);
   assert.equal(result.context?.windowDays, 7);
   assert.equal(result.labelPending, true);
   assert.equal(result.labelApplied, false);
   assert.equal(candidate.labels.includes("clawsweeper:bulk-filed"), false);
+});
+
+test("bulk-filer count ends at the issue's creation, not at review time", () => {
+  // Real shape from openclaw/openclaw: nine issues by 10-04, three more afterwards.
+  const filedAt = [
+    "2026-10-01T14:52:00Z",
+    "2026-10-02T22:24:00Z",
+    "2026-10-03T20:02:00Z",
+    "2026-10-03T21:38:00Z",
+    "2026-10-03T22:19:00Z",
+    "2026-10-03T22:19:30Z",
+    "2026-10-03T22:29:00Z",
+    "2026-10-04T14:54:00Z",
+    "2026-10-04T15:07:54Z",
+    "2026-10-05T17:59:00Z",
+    "2026-10-06T18:30:00Z",
+    "2026-10-06T23:00:00Z",
+  ].map((value) => Date.parse(value));
+  // Like GitHub search: an absent upper bound counts everything filed after the start.
+  const searchCount = ({ windowStart, windowEnd }: { windowStart: string; windowEnd?: string }) =>
+    filedAt.filter(
+      (ms) =>
+        ms > Date.parse(windowStart) &&
+        ms <= (windowEnd ? Date.parse(windowEnd) : Number.POSITIVE_INFINITY),
+    ).length;
+  const cache = new Map();
+  const reReviewNow = Date.parse("2026-10-08T12:00:00.000Z");
+
+  const earlier = detectBulkFilerForTest({
+    item: item({ author: "reporter", number: 164972, createdAt: "2026-10-04T15:07:54Z" }),
+    cache,
+    now: reReviewNow,
+    searchCount,
+  });
+  assert.deepEqual(earlier, { context: null, labelPending: false, labelApplied: false });
+
+  const tenth = detectBulkFilerForTest({
+    item: item({ author: "reporter", number: 165709, createdAt: "2026-10-05T17:59:00Z" }),
+    cache,
+    now: reReviewNow,
+    searchCount,
+  });
+  assert.equal(tenth.context?.issueCount, 10);
+  assert.equal(tenth.labelPending, true);
+  assert.equal(cache.size, 2);
 });
 
 test("bulk-filer policy exempts only owners and members", () => {

@@ -1,0 +1,1 @@
+- Count bulk-filer issues in the window that ends when the reviewed issue was filed, so a later filing burst no longer adds `clawsweeper:bulk-filed` retroactively to issues filed below the threshold when they are re-reviewed (https://github.com/openclaw/clawsweeper/issues/1769).

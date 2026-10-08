@@ -285,7 +285,7 @@ export interface BulkFilerDetectionOptions {
   cache: BulkFilerCountCache;
   now: number;
   env?: Record<string, string | undefined>;
-  searchCount: (options: { author: string; windowStart: string }) => number;
+  searchCount: (options: { author: string; windowStart: string; windowEnd: string }) => number;
   onSearchError?: (error: unknown) => void;
 }
 

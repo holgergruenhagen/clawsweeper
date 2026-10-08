@@ -650,8 +650,8 @@ export function createReviewCommandWorkflow(dependencies: CreateReviewCommandWor
                 item,
                 cache: bulkFilerCountCache,
                 now: bulkFilerWindowNow,
-                searchCount: ({ author, windowStart }) =>
-                  authorIssueCountInBulkFilerWindow(author, windowStart),
+                searchCount: ({ author, windowStart, windowEnd }) =>
+                  authorIssueCountInBulkFilerWindow(author, windowStart, windowEnd),
                 onSearchError: (error) => {
                   console.error(
                     `[review] ${new Date().toISOString()} shard=${shardIndex}/${shardCount} bulk-filer-search=failed #${item.number}: ${

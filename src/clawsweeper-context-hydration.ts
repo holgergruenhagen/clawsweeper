@@ -599,14 +599,18 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
       return { context: null, labelPending: false, labelApplied: false };
     }
     const threshold = bulkFilerThreshold(options.env);
-    const windowStart = new Date(windowStartMs).toISOString();
-    const cacheKey = options.item.author.trim().toLowerCase();
+    // Count the window that ends when this issue was filed, so a later burst cannot
+    // retroactively label an issue that was filed below the threshold.
+    const windowStart = new Date(itemCreatedAtMs - windowDays * DAY_MS).toISOString();
+    const windowEnd = new Date(itemCreatedAtMs).toISOString();
+    const cacheKey = `${options.item.author.trim().toLowerCase()}\n${windowEnd}`;
     let issueCount = options.cache.get(cacheKey);
     if (!options.cache.has(cacheKey)) {
       try {
         const searchedCount = options.searchCount({
           author: options.item.author,
           windowStart,
+          windowEnd,
         });
         if (!Number.isInteger(searchedCount) || searchedCount < 0) {
           throw new Error("GitHub bulk-filer search omitted a valid total_count");
@@ -679,12 +683,18 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
     return bulkFilerPolicyInvalidatesCachedReview(markdown, exemptionApplied);
   }
 
-  function authorIssueCountInBulkFilerWindow(author: string, windowStart: string): number {
+  function authorIssueCountInBulkFilerWindow(
+    author: string,
+    windowStart: string,
+    windowEnd: string,
+  ): number {
+    // GitHub search ranges include both ends; start 1 ms later to keep the window start exclusive.
+    const rangeStart = new Date(Date.parse(windowStart) + 1).toISOString();
     const query = [
       `repo:${targetRepo()}`,
       "type:issue",
       `author:${quoteGitHubSearchTerm(author)}`,
-      `created:>${windowStart}`,
+      `created:${rangeStart}..${windowEnd}`,
     ].join(" ");
     const result = ghJsonOnce<{ total_count?: number; incomplete_results?: boolean }>(
       ["api", "search/issues", "--method", "GET", "-f", `q=${query}`, "-f", "per_page=1"],
