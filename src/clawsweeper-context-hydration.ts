@@ -622,8 +622,11 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
       }
       options.cache.set(cacheKey, issueCount ?? null);
     }
-    if (issueCount === undefined || issueCount === null || issueCount < threshold) {
+    if (issueCount === undefined || issueCount === null) {
       return { context: null, labelPending: false, labelApplied: false };
+    }
+    if (issueCount < threshold) {
+      return { context: null, labelPending: false, labelApplied: false, belowThreshold: true };
     }
     const alreadyLabeled = options.item.labels.some(
       (label) => label.toLowerCase() === BULK_FILED_LABEL,
@@ -651,9 +654,13 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
     detection: BulkFilerDetectionResult,
   ): string {
     return replaceFrontMatterValue(
-      markdown,
-      "bulk_filer_detected",
-      String(detection.context?.detected === true),
+      replaceFrontMatterValue(
+        markdown,
+        "bulk_filer_detected",
+        String(detection.context?.detected === true),
+      ),
+      "bulk_filer_below_threshold",
+      String(detection.belowThreshold === true),
     );
   }
 
@@ -667,8 +674,17 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
   function bulkFilerPolicyInvalidatesCachedReview(
     markdown: string | null,
     exemptionApplied: boolean,
+    belowThreshold = false,
   ): boolean {
-    if (!exemptionApplied || markdown === null) return false;
+    if (markdown === null) return false;
+    if (!exemptionApplied) {
+      // A report decided under bulk suppression is stale once the issue's own
+      // filing window is confirmed below the threshold.
+      return (
+        belowThreshold &&
+        /^true$/i.test(frontMatterValue(markdown, "last_full_review_bulk_filer_detected") ?? "")
+      );
+    }
     // Legacy reports predate this field. Refresh them once rather than preserving
     // a possibly bulk-filer-suppressed cached verdict under the new exemption.
     return !/^false$/i.test(
@@ -679,8 +695,9 @@ export function createContextHydration(dependencies: CreateContextHydrationDepen
   function bulkFilerPolicyInvalidatesCachedReviewForTest(
     markdown: string | null,
     exemptionApplied: boolean,
+    belowThreshold = false,
   ): boolean {
-    return bulkFilerPolicyInvalidatesCachedReview(markdown, exemptionApplied);
+    return bulkFilerPolicyInvalidatesCachedReview(markdown, exemptionApplied, belowThreshold);
   }
 
   function authorIssueCountInBulkFilerWindow(

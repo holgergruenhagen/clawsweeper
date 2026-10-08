@@ -275,6 +275,8 @@ export interface BulkFilerDetectionResult {
   context: BulkFilerReviewContext | null;
   labelPending: boolean;
   labelApplied: boolean;
+  /** Set only when the count search succeeded and stayed below the threshold. */
+  belowThreshold?: true;
 }
 
 export type BulkFilerCountCache = Map<string, number | null>;

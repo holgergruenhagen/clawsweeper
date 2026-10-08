@@ -78,6 +78,7 @@ export interface CreateReviewCommandWorkflowDependencies {
   bulkFilerPolicyInvalidatesCachedReview: (
     markdown: string | null,
     exemptionApplied: boolean,
+    belowThreshold?: boolean,
   ) => boolean;
   bulkFilerRepositoryPermission: (
     author: string,

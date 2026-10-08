@@ -99,7 +99,12 @@ test("bulk-filer count ends at the issue's creation, not at review time", () => 
     now: reReviewNow,
     searchCount,
   });
-  assert.deepEqual(earlier, { context: null, labelPending: false, labelApplied: false });
+  assert.deepEqual(earlier, {
+    context: null,
+    labelPending: false,
+    labelApplied: false,
+    belowThreshold: true,
+  });
 
   const tenth = detectBulkFilerForTest({
     item: item({ author: "reporter", number: 165709, createdAt: "2026-10-05T17:59:00Z" }),
@@ -258,6 +263,85 @@ test("the publisher applies a detected bulk-filer label only for non-exempt auth
       dryRun: true,
     }),
     { labels: ["clawsweeper:bulk-filed"], changed: true },
+  );
+});
+
+test("a confirmed below-threshold count removes a retroactive label, a failed search keeps it", () => {
+  const offline = () => {
+    throw new Error("a dry run must not call gh");
+  };
+  const { syncBulkFilerLabel } = createLabelSyncOperations(
+    createLabelMutationOperations({ ghJson: offline, ghObservedMutationCommand: offline }),
+  );
+  const retroactivelyLabeled = {
+    number: 164972,
+    labels: ["clawsweeper:bulk-filed", "P2"],
+    bulkFilerDetected: false,
+    authorAssociation: "CONTRIBUTOR",
+    dryRun: true,
+  };
+  assert.deepEqual(syncBulkFilerLabel({ ...retroactivelyLabeled, bulkFilerBelowThreshold: true }), {
+    labels: ["P2"],
+    changed: true,
+  });
+  assert.deepEqual(syncBulkFilerLabel(retroactivelyLabeled), {
+    labels: ["clawsweeper:bulk-filed", "P2"],
+    changed: false,
+  });
+  assert.deepEqual(
+    syncBulkFilerLabel({
+      ...retroactivelyLabeled,
+      bulkFilerDetected: true,
+      bulkFilerBelowThreshold: true,
+    }),
+    { labels: ["clawsweeper:bulk-filed", "P2"], changed: false },
+  );
+
+  const below = detectBulkFilerForTest({
+    item: item({ createdAt: "2026-07-16T11:59:59.999Z" }),
+    cache: new Map(),
+    now: Date.parse("2026-07-16T12:00:00.000Z"),
+    searchCount: () => 9,
+  });
+  assert.match(
+    updateBulkFilerDetectedFrontMatterForTest("---\nreview_cache_hit: true\n---\n", below),
+    /^bulk_filer_below_threshold: true$/m,
+  );
+  const failed = detectBulkFilerForTest({
+    item: item({ createdAt: "2026-07-16T11:59:59.999Z" }),
+    cache: new Map(),
+    now: Date.parse("2026-07-16T12:00:00.000Z"),
+    searchCount: () => {
+      throw new Error("search unavailable");
+    },
+  });
+  assert.match(
+    updateBulkFilerDetectedFrontMatterForTest("---\nreview_cache_hit: true\n---\n", failed),
+    /^bulk_filer_below_threshold: false$/m,
+  );
+});
+
+test("a confirmed below-threshold count bypasses a cached bulk-suppressed review", () => {
+  const suppressed =
+    "---\nbulk_filer_detected: true\nlast_full_review_bulk_filer_detected: true\nreview_cache_hit: false\n---\n";
+  assert.equal(bulkFilerPolicyInvalidatesCachedReviewForTest(suppressed, false, true), true);
+  assert.equal(bulkFilerPolicyInvalidatesCachedReviewForTest(suppressed, false, false), false);
+  assert.equal(
+    bulkFilerPolicyInvalidatesCachedReviewForTest(
+      "---\nlast_full_review_bulk_filer_detected: false\nreview_cache_hit: false\n---\n",
+      false,
+      true,
+    ),
+    false,
+  );
+  // Legacy reports without the field are not re-reviewed just because the count is low.
+  assert.equal(
+    bulkFilerPolicyInvalidatesCachedReviewForTest(
+      "---\nreview_cache_hit: false\n---\n",
+      false,
+      true,
+    ),
+    false,
   );
 });
 
