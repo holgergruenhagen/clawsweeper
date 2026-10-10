@@ -228,6 +228,15 @@ export interface GuardReads {
   targetRepo: () => string;
 }
 
+export type PullRequestHeadActivityReader = (
+  number: number,
+  pull: {
+    created_at?: string;
+    head?: { ref?: string; repo?: { full_name?: string; id?: unknown }; sha?: string };
+  },
+  timeline?: unknown[],
+) => Pick<PullRequestLiveActivity, "headSha" | "headActivityAtMs">;
+
 export function createApplyGuardActivity({ ghJson, ghPaged, targetRepo }: GuardReads) {
   function issueRecentHumanCommentBlockReason(number: number, days: number): string | null {
     return issueRecentHumanCommentBlockReasonFromComments(
