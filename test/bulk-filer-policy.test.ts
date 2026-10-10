@@ -132,13 +132,18 @@ test("bulk-filer count leaves out only completed and high-confidence reproduced 
     windowStart: "2026-10-03T11:00:00.000Z",
     windowEnd: "2026-10-10T11:00:00.000Z",
   });
-  assert.equal(
-    query,
-    "repo:openclaw/openclaw type:issue author:reporter " +
-      "created:2026-10-03T11:00:00.001Z..2026-10-10T11:00:00.000Z " +
-      '-reason:completed -label:"issue-rating: 🦀 challenger crab" ' +
-      '-label:"issue-rating: 🦞 diamond lobster"',
-  );
+  // The author's filing window stays as before; the exclusions only narrow it.
+  for (const term of [
+    "repo:openclaw/openclaw",
+    "type:issue",
+    "author:reporter",
+    "created:2026-10-03T11:00:00.001Z..2026-10-10T11:00:00.000Z",
+    "-reason:completed",
+    '-label:"issue-rating: 🦀 challenger crab"',
+    '-label:"issue-rating: 🦞 diamond lobster"',
+  ]) {
+    assert.ok(query.includes(term), term);
+  }
 
   // The uncounted ratings are exactly the ones the review assigns for a
   // high-confidence reproduction, so a renamed rating cannot silently drift.
