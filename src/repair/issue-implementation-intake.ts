@@ -4,6 +4,9 @@ import { reportAllowsAutomation } from "../manual-publication-policy.js";
 import { asJsonObject, type JsonValue, type LooseRecord } from "./json-types.js";
 import { sha256 } from "../content-hash.js";
 import { parseFrontMatterStringArray, reportWithoutReviewRecord } from "../report-front-matter.js";
+import { readReviewRecordOrLegacy } from "../review-record.js";
+import { legacyReviewDecision } from "../review-record-backfill.js";
+import type { Decision } from "../clawsweeper-types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -64,6 +67,9 @@ type IntakeDecision = {
 type ReviewReport = {
   frontmatter: Record<string, string>;
   body: string;
+  workPrompt: string;
+  workReason: string;
+  securityStatus: string;
 };
 
 type IntakeContext = {
@@ -651,7 +657,48 @@ export function parseReviewReport(markdown: string): ReviewReport {
       frontmatter[kv[1] ?? ""] = stripQuotes(kv[2] ?? "");
     }
   }
-  return { frontmatter, body: match ? markdown.slice(match[0].length) : markdown };
+  const body = match ? markdown.slice(match[0].length) : markdown;
+  const { decision: recorded } = readReviewRecordOrLegacy(markdown, () => null);
+  if (!recorded) {
+    return {
+      frontmatter,
+      body,
+      workPrompt: section(body, "Repair Work Prompt"),
+      workReason: frontmatter.work_reason_sha256 ?? "",
+      securityStatus:
+        section(markdown, "Security Review")
+          .match(/^Status:\s*([a-z_]+)\s*$/im)?.[1]
+          ?.toLowerCase() ?? "",
+    };
+  }
+  // Keep host-owned metadata, but never let its repeated decision fields override the record.
+  Object.assign(frontmatter, {
+    decision: recorded.decision,
+    confidence: recorded.confidence,
+    close_reason: recorded.closeReason,
+    requires_product_decision: String(recorded.requiresProductDecision),
+    requires_new_feature: String(recorded.requiresNewFeature),
+    requires_new_config_option: String(recorded.requiresNewConfigOption),
+    work_candidate: recorded.workCandidate,
+    work_confidence: recorded.workConfidence,
+    work_validation: JSON.stringify(recorded.workValidation),
+    work_likely_files: JSON.stringify(recorded.workLikelyFiles),
+    work_cluster_refs: JSON.stringify(recorded.workClusterRefs),
+    item_category: recorded.itemCategory,
+    reproduction_status: recorded.reproductionStatus,
+    reproduction_confidence: recorded.reproductionConfidence,
+    auto_implementation_candidate: recorded.autoImplementationCandidate,
+    implementation_complexity: recorded.implementationComplexity,
+    vision_fit: recorded.visionFit,
+    vision_fit_evidence: JSON.stringify(recorded.visionFitEvidence),
+  });
+  return {
+    frontmatter,
+    body,
+    workPrompt: recorded.workPrompt,
+    workReason: recorded.workReason,
+    securityStatus: recorded.securityReview.status,
+  };
 }
 
 export function reportOnlyDecision({
@@ -810,13 +857,13 @@ function eligibilityDecision({
   const reportPauseLabels = reportLabels.filter(isAutomaticImplementationPauseLabel);
   if (reportPauseLabels.length > 0)
     blockers.push(`automatic issue implementation is paused by ${reportPauseLabels.join(", ")}`);
-  const securityStatus = reportSecurityReviewStatus(reportMarkdown);
+  const securityStatus = report.securityStatus;
   if (securityStatus === "needs_attention") blockHard("security-sensitive signal present");
   else if (securityStatus !== "cleared" && securityStatus !== "not_applicable") {
     blockHard(`security review status is ${securityStatus || "missing"}`);
   }
   if (candidateKind !== "viable") {
-    if (!section(report.body, "Repair Work Prompt").trim()) blockHard("missing repair work prompt");
+    if (!report.workPrompt.trim()) blockHard("missing repair work prompt");
     if (parseFrontMatterStringArray(fm.work_validation).length === 0)
       blockers.push("missing validation commands");
   }
@@ -946,7 +993,7 @@ function writeJob(context: IntakeContext) {
 }
 
 function viableImplementationPrompt(context: IntakeContext) {
-  const workPrompt = section(context.report.body, "Repair Work Prompt");
+  const workPrompt = context.report.workPrompt;
   return [
     "ClawSweeper finished reviewing this open issue and found no active implementation PR.",
     "",
@@ -967,7 +1014,7 @@ function reviewImplementationPrompt(context: IntakeContext) {
   const likelyFiles = parseFrontMatterStringArray(fm.work_likely_files);
   const visionEvidence = parseFrontMatterStringArray(fm.vision_fit_evidence);
   const visionFit = context.candidateKind === "vision_fit";
-  const workPrompt = section(context.report.body, "Repair Work Prompt");
+  const workPrompt = context.report.workPrompt;
   return [
     ...(visionFit
       ? [
@@ -1007,7 +1054,7 @@ function reviewImplementationPrompt(context: IntakeContext) {
     "Review work prompt:",
     "",
     workPrompt.trim() ||
-      fm.work_reason_sha256 ||
+      context.report.workReason ||
       (visionFit ? "Implement the narrow vision-fit issue." : "Fix the narrow reproduced bug."),
     "",
     "Likely files:",
@@ -1061,10 +1108,48 @@ ${context.decision.blockers.length ? context.decision.blockers.map((blocker: str
   fs.writeFileSync(context.auditPath, body, "utf8");
 }
 
-// The review_record line repeats the review. A backfill that adds it must not look
-// like a new review to implementation jobs.
+// Equivalent backfills preserve the old revision. Record-only changes to eligibility
+// or effective job inputs must invalidate prior intake audits and prepared jobs.
 export function reportRevisionSha256(markdown: string) {
-  return sha256(reportWithoutReviewRecord(markdown));
+  const legacy = reportWithoutReviewRecord(markdown);
+  const legacyRevision = sha256(legacy);
+  const { decision: recorded } = readReviewRecordOrLegacy(markdown, () => null);
+  if (!recorded) return legacyRevision;
+  const intakeInputs = (decision: Decision) => {
+    const workPrompt = decision.workPrompt.trim();
+    return JSON.stringify({
+      decision: decision.decision,
+      closeReason: decision.closeReason,
+      confidence: decision.confidence,
+      requiresProductDecision: decision.requiresProductDecision,
+      requiresNewFeature: decision.requiresNewFeature,
+      requiresNewConfigOption: decision.requiresNewConfigOption,
+      workCandidate: decision.workCandidate,
+      workConfidence: decision.workConfidence,
+      autoImplementationCandidate: decision.autoImplementationCandidate,
+      securityStatus: decision.securityReview.status,
+      workPrompt,
+      workReason: workPrompt ? "" : decision.workReason,
+      validation: decision.workValidation,
+      likelyFiles: decision.workLikelyFiles,
+      clusterRefs: decision.workClusterRefs,
+      itemCategory: decision.itemCategory,
+      reproductionStatus: decision.reproductionStatus,
+      reproductionConfidence: decision.reproductionConfidence,
+      visionFit: decision.visionFit,
+      implementationComplexity: decision.implementationComplexity,
+      visionEvidence: decision.visionFitEvidence,
+    });
+  };
+  const recordedInputs = intakeInputs(recorded);
+  try {
+    // The backfill normalizes absent fields and placeholders. Compare against
+    // that same canonical baseline, not the historical text reader's defaults.
+    if (intakeInputs(legacyReviewDecision(legacy)) === recordedInputs) return legacyRevision;
+  } catch {
+    // An unconvertible legacy report cannot establish equivalence with its record.
+  }
+  return sha256(JSON.stringify([legacyRevision, recordedInputs]));
 }
 
 function matchingIntakeAudit({
@@ -1553,15 +1638,6 @@ function isAutomaticImplementationPauseLabel(label: string): boolean {
 
 function visionFitItemCategoryAllowed(value: string | undefined): boolean {
   return ["bug", "regression", "feature", "skill", "docs", "cleanup"].includes(value ?? "");
-}
-
-// The review model owns the security judgement. Read only its typed status line.
-function reportSecurityReviewStatus(markdown: string): string {
-  return (
-    section(markdown, "Security Review")
-      .match(/^Status:\s*([a-z_]+)\s*$/im)?.[1]
-      ?.toLowerCase() ?? ""
-  );
 }
 
 function stringArg(key: string, fallback = ""): string {
