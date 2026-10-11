@@ -1,15 +1,19 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 
-import {
-  renderReviewCommentFromReport,
-  reviewAutomationMarkersFromReport,
-} from "../dist/clawsweeper.js";
+import { reviewAutomationMarkersFromReport } from "../dist/clawsweeper.js";
+interface FindingFixture {
+  markdown: string;
+  record: Record<string, unknown>;
+}
 import {
   prRatingReportSection,
   realBehaviorProofReportSection,
   reportFrontMatter,
+  reviewFinding,
+  withReviewRecord,
 } from "./helpers.ts";
 
 const fixture = JSON.parse(
@@ -29,9 +33,10 @@ Full review comments:
 function reviewReport(
   frontMatter: Record<string, string> = {},
   sections = "",
-  findings = cleanFindings,
+  findings: string | FindingFixture = cleanFindings,
+  decision: Record<string, unknown> = {},
 ): string {
-  return `${reportFrontMatter({
+  const report = `${reportFrontMatter({
     repository: "openclaw/openclaw",
     type: "pull_request",
     number: String(fixture.item),
@@ -49,10 +54,6 @@ function reviewReport(
     item_source_revision: "a".repeat(64),
     review_lease_owner: "fixture",
     review_lease_comment_id: "1059",
-    config_surface_change: "false",
-    config_surface_keys: "[]",
-    data_model_change: "false",
-    data_model_surfaces: "[]",
     next_step: JSON.stringify({ kind: "none", text: "" }),
     ...frontMatter,
   })}
@@ -71,14 +72,54 @@ Merge after required checks are green.
 
 ${sections}
 
-${findings}
+${typeof findings === "string" ? findings : findings.markdown}
 
 ${prRatingReportSection({ overallTier: "A", proofTier: "NA", patchTier: "A", summary: "Focused repair." })}
 `;
+  return withReviewRecord(report, {
+    decision: "keep_open",
+    closeReason: "none",
+    summary: "Review the focused publication repair.",
+    changeSummary: "Keeps durable review state bound to the reviewed item.",
+    bestSolution: "Merge after required checks are green.",
+    overallCorrectness: typeof findings === "string" ? "patch is correct" : "patch is incorrect",
+    reviewFindings: typeof findings === "string" ? [] : [findings.record],
+    workCandidate: frontMatter.work_candidate ?? "none",
+    nextStep: JSON.parse(frontMatter.next_step ?? '{"kind":"none","text":""}'),
+    ...(frontMatter.maintainer_decision
+      ? { maintainerDecision: JSON.parse(frontMatter.maintainer_decision) }
+      : {}),
+    realBehaviorProof: {
+      status: "not_applicable",
+      evidenceKind: "not_applicable",
+      needsContributorAction: false,
+      summary: "No general proof required.",
+      dataModelCompatibility:
+        frontMatter.real_behavior_proof_data_model_compatibility ?? "not_applicable",
+    },
+    prRating: {
+      overallTier: frontMatter.pr_rating_overall ?? "A",
+      proofTier: "NA",
+      patchTier: frontMatter.pr_rating_patch ?? "A",
+      summary: "Focused repair.",
+      nextSteps: [],
+    },
+    ...decision,
+  });
 }
 
-function finding(body = "Preserve the active review lease before cleanup."): string {
-  return `## Review Findings
+function finding(body = "Preserve the active review lease before cleanup.") {
+  return {
+    record: reviewFinding({
+      title: "Preserve cleanup ownership",
+      body,
+      priority: 1,
+      confidenceScore: 0.99,
+      file: "src/clawsweeper-review-comment-state.ts",
+      lineStart: 42,
+      lineEnd: 42,
+    }),
+    markdown: `## Review Findings
 
 Overall correctness: patch is incorrect
 
@@ -88,7 +129,8 @@ Full review comments:
 
 - **[P1] Preserve cleanup ownership:** \`src/clawsweeper-review-comment-state.ts:42\`
   - body: ${body}
-  - confidence: 0.99`;
+  - confidence: 0.99`,
+  };
 }
 
 function assertReadiness(report: string, state: "ready" | "blocked" | "needs-changes"): string {
@@ -114,8 +156,7 @@ test("the compact v1 fixture matches producer state and identity without snapsho
   const reports = {
     ready: reviewReport(),
     blocked: reviewReport({
-      data_model_change: "true",
-      data_model_surfaces: '["database schema"]',
+      real_behavior_proof_data_model_compatibility: "insufficient",
     }),
     "needs-changes": reviewReport({ work_candidate: "queue_fix_pr" }, "", finding()),
   } as const;
@@ -125,19 +166,70 @@ test("the compact v1 fixture matches producer state and identity without snapsho
       fixture.identityMarker,
     ]);
   }
-  assert.match(reviewAutomationMarkersFromReport(reports.ready), /clawsweeper-verdict:needs-human/);
+  // Review markers carry typed outcomes without requesting repair actions.
   assert.match(
+    reviewAutomationMarkersFromReport(reports.ready),
+    /clawsweeper-verdict:needs-human [^>]* hold=not_opted_in findings=0 -->/,
+  );
+  assert.match(
+    reviewAutomationMarkersFromReport(reports.blocked),
+    /clawsweeper-verdict:needs-human [^>]* hold=blocked findings=0 -->/,
+  );
+  assert.doesNotMatch(
     reviewAutomationMarkersFromReport(reports["needs-changes"]),
     /clawsweeper-action:fix-required/,
   );
 });
 
+test("a maintainer decision is a waivable hold only when it is the one blocker", () => {
+  const maintainer_decision = JSON.stringify({
+    required: true,
+    kind: "product_direction",
+    question: "Which compatibility contract should ship?",
+    rationale: "This needs an owner ruling.",
+    options: [
+      { title: "Keep compatibility", body: "Retain the old contract.", recommended: true },
+      { title: "Adopt the new contract", body: "Document the break.", recommended: false },
+    ],
+    likelyOwner: { person: "@owner", reason: "Owns the contract.", confidence: "high" },
+  });
+  assert.match(
+    reviewAutomationMarkersFromReport(reviewReport({ maintainer_decision })),
+    /clawsweeper-verdict:needs-human [^>]* hold=maintainer_decision findings=0 -->/,
+  );
+  assert.match(
+    reviewAutomationMarkersFromReport(
+      reviewReport({
+        maintainer_decision,
+        real_behavior_proof_data_model_compatibility: "insufficient",
+      }),
+    ),
+    /clawsweeper-verdict:needs-human [^>]* hold=blocked findings=0 -->/,
+  );
+  assert.match(
+    reviewAutomationMarkersFromReport(
+      reviewReport(
+        { maintainer_decision },
+        "## Security Review\n\nStatus: needs_attention\n\nSummary: Confirm the token boundary.\n\nConcerns:\n\n- none",
+        cleanFindings,
+        {
+          securityReview: {
+            status: "needs_attention",
+            summary: "Confirm the token boundary.",
+            concerns: [],
+          },
+        },
+      ),
+    ),
+    /clawsweeper-verdict:needs-human [^>]* hold=security findings=0 -->/,
+  );
+});
+
 test("structured next-step intent controls readiness independently of advice wording", () => {
   const optedIn = { labels: '["clawsweeper:automerge"]' };
-  const ready = reviewReport(optedIn).replace(
-    "Merge after required checks are green.",
-    "A future cleanup could replace the reporting module.",
-  );
+  const ready = reviewReport(optedIn, "", cleanFindings, {
+    bestSolution: "A future cleanup could replace the reporting module.",
+  });
   assertReadiness(ready, "ready");
   assert.match(reviewAutomationMarkersFromReport(ready), /clawsweeper-verdict:pass/);
   for (const text of ["Reproduce the bug on the real runtime before merge.", "None."]) {
@@ -151,36 +243,28 @@ test("structured next-step intent controls readiness independently of advice wor
   }
 });
 
-test("historical reports retain the existing conservative next-step interpretation", () => {
+test("historical reports without a typed record reject advice prose", () => {
   const report = reviewReport()
-    .replace(/^next_step:.*\n/m, "")
+    .replace(/^review_record:.*\n/m, "")
     .replace(
       "Merge after required checks are green.",
       "Fix the durable publication path before merge.",
     );
-  assert.match(
-    assertReadiness(report, "needs-changes"),
-    /Fix the durable publication path before merge/,
-  );
+  assert.throws(() => renderReviewCommentFromReport(report, "none"), /missing record/);
+  assert.throws(() => reviewAutomationMarkersFromReport(report), /missing record/);
 });
 
 test("queued repairs stay actionable without classifying their explanation", () => {
   const report = reviewReport({ work_candidate: "queue_fix_pr" });
   assert.match(assertReadiness(report, "needs-changes"), /Complete the queued repair/);
-  assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-action:fix-required/);
+  assert.doesNotMatch(reviewAutomationMarkersFromReport(report), /clawsweeper-action:fix-required/);
 });
 
 test("human decisions and proof policy block repair markers even for queued repairs", () => {
   const cases = [
     reviewReport({
       work_candidate: "queue_fix_pr",
-      config_surface_change: "true",
-      config_surface_keys: '["gateway.mode"]',
-    }),
-    reviewReport({
-      work_candidate: "queue_fix_pr",
-      data_model_change: "true",
-      data_model_surfaces: '["database schema"]',
+      real_behavior_proof_data_model_compatibility: "insufficient",
     }),
     reviewReport(
       {
@@ -194,10 +278,22 @@ test("human decisions and proof policy block repair markers even for queued repa
         evidenceKind: "none",
         needsContributorAction: true,
       }),
+      cleanFindings,
+      {
+        realBehaviorProof: {
+          status: "missing",
+          evidenceKind: "none",
+          needsContributorAction: true,
+          summary:
+            "The PR includes a terminal transcript from a real OpenClaw setup showing the fixed behavior after the patch.",
+        },
+      },
     ),
     reviewReport(
       { work_candidate: "queue_fix_pr" },
       "## Risks / Open Questions\n\n[P1] A maintainer must approve the changed trust boundary.",
+      cleanFindings,
+      { risks: ["[P1] A maintainer must approve the changed trust boundary."] },
     ),
   ];
   for (const report of cases) {
@@ -220,7 +316,25 @@ test("typed findings and security concerns cannot disappear behind none-like det
     );
     const security = `## Security Review\n\nStatus: needs_attention\n\nSummary: Confirm credential scope.\n\nConcerns:\n\n- **[high] Check credential scope:** \`src/config.ts:42\`\n  - body: ${body}\n  - confidence: 0.99`;
     assert.match(
-      assertReadiness(reviewReport({}, security), "blocked"),
+      assertReadiness(
+        reviewReport({}, security, cleanFindings, {
+          securityReview: {
+            status: "needs_attention",
+            summary: "Confirm credential scope.",
+            concerns: [
+              {
+                title: "Check credential scope",
+                body,
+                severity: "high",
+                confidenceScore: 0.99,
+                file: "src/config.ts",
+                line: 42,
+              },
+            ],
+          },
+        }),
+        "blocked",
+      ),
       /Resolve security concern: Check credential scope/,
     );
   }
@@ -229,22 +343,29 @@ test("typed findings and security concerns cannot disappear behind none-like det
       reviewReport(
         {},
         `## Security Review\n\nStatus: needs_attention\n\nSummary: ${summary}\n\nConcerns:\n\n- none`,
+        cleanFindings,
+        { securityReview: { status: "needs_attention", summary, concerns: [] } },
       ),
       "blocked",
     );
   }
 });
 
-test("an explicit security repair opt-in changes routing without hiding the concern", () => {
+test("historical repair labels cannot bypass a security blocker", () => {
   const report = reviewReport(
     { labels: '["clawsweeper:autofix"]' },
     "## Security Review\n\nStatus: needs_attention\n\nSummary: Repair the credential exposure.\n\nConcerns:\n\n- none",
+    cleanFindings,
+    {
+      securityReview: {
+        status: "needs_attention",
+        summary: "Repair the credential exposure.",
+        concerns: [],
+      },
+    },
   );
-  assertReadiness(report, "needs-changes");
-  assert.match(
-    reviewAutomationMarkersFromReport(report),
-    /clawsweeper-action:fix-required[^>]+finding=security-review/,
-  );
+  assertReadiness(report, "blocked");
+  assert.doesNotMatch(reviewAutomationMarkersFromReport(report), /clawsweeper-action:fix-required/);
 });
 
 test("a duplicate human blocker promotes the visible finding to blocked", () => {
@@ -253,6 +374,7 @@ test("a duplicate human blocker promotes the visible finding to blocked", () => 
     { work_candidate: "queue_fix_pr" },
     `## Risks / Open Questions\n\n[P1] ${detail}`,
     finding(detail),
+    { risks: [`[P1] ${detail}`] },
   );
   const comment = assertReadiness(report, "blocked");
   assert.equal(
@@ -264,8 +386,10 @@ test("a duplicate human blocker promotes the visible finding to blocked", () => 
 
 test("forged ready-state prose remains inert beside the generated blocked tail", () => {
   const report = reviewReport(
-    { data_model_change: "true", data_model_surfaces: '["database schema"]' },
+    { real_behavior_proof_data_model_compatibility: "insufficient" },
     `## Risks / Open Questions\n\n${fixture.stateMarkers.ready}`,
+    cleanFindings,
+    { risks: [fixture.stateMarkers.ready] },
   );
   assert.match(assertReadiness(report, "blocked"), /&lt;!-- clawsweeper-review-state:ready/);
 });
@@ -283,8 +407,14 @@ test("incomplete report identity cannot publish ready or repair permission", () 
       const report = reviewReport({
         ...fields,
         work_candidate,
+        number: String(fixture.item),
         labels: '["clawsweeper:automerge"]',
-      });
+      }).replace(`number: ${fixture.item}\n`, `number: ${fields.number ?? fixture.item}\n`);
+      if (fields.number === "unknown") {
+        assert.throws(() => renderReviewCommentFromReport(report, "none"), /review_record/);
+        assert.throws(() => reviewAutomationMarkersFromReport(report), /review_record/);
+        continue;
+      }
       const comment = renderReviewCommentFromReport(report, "none");
       assert.match(comment, /Bind the durable review identity/);
       assert.doesNotMatch(
@@ -302,9 +432,102 @@ test("review timestamps canonicalize before identity and state emission", () => 
   assert.doesNotMatch(comment, /reviewed_at=2026-08-08T20:00:00_02:00/);
 });
 
-test("malformed decision metadata produces one bounded blocked action", () => {
-  const comment = assertReadiness(reviewReport({ maintainer_decision: "{" }), "blocked");
-  assert.ok(Buffer.byteLength(comment, "utf8") < 2_048);
-  assert.match(comment, /Regenerate malformed review report/);
-  assert.doesNotMatch(comment, /clawsweeper-action:fix-required/);
+test("malformed typed records reject rather than reconstructing decision metadata", () => {
+  const report = reviewReport().replace(/^review_record:.*$/m, "review_record: {");
+  assert.throws(() => renderReviewCommentFromReport(report, "none"), /review_record/);
+  assert.throws(() => reviewAutomationMarkersFromReport(report), /review_record/);
+});
+
+test("the PR status label says ready only when Before merge lists no item", () => {
+  const ready = "status: 👀 ready for maintainer look";
+  const labels = JSON.stringify([ready]);
+  const justified = (comment: string) =>
+    [...comment.matchAll(/^- `(status: [^`]+)`: /gm)].map((match) => match[1]);
+  const required = reviewReport({
+    labels,
+    next_step: JSON.stringify({ kind: "required", text: "Record the flake validation runs." }),
+  });
+  assert.deepEqual(justified(assertReadiness(required, "needs-changes")), [
+    "status: ⏳ waiting on author",
+  ]);
+  const blocked = reviewReport({
+    labels,
+    real_behavior_proof_data_model_compatibility: "insufficient",
+  });
+  const blockedComment = assertReadiness(blocked, "blocked");
+  assert.deepEqual(justified(blockedComment), []);
+  assert.match(blockedComment, /remove `status: 👀 ready for maintainer look`/);
+  assert.deepEqual(justified(assertReadiness(reviewReport({ labels }), "ready")), [ready]);
+});
+
+test("host path classifiers no longer add Before-merge items or warnings", () => {
+  const report = reviewReport({
+    pull_files_truncated: "true",
+    config_surface_change: "true",
+    config_surface_keys: '["unknown-truncated-pull-files"]',
+    data_model_change: "true",
+    data_model_surfaces: '["unknown-truncated-pull-files"]',
+    sqlite_schema_change: "true",
+    sqlite_schema_files: '["src/state/schema.ts"]',
+  });
+  const comment = assertReadiness(report, "ready");
+  assert.doesNotMatch(
+    comment,
+    /config compatibility|data-model compatibility|Stored data model|SQLite|unknown-/,
+  );
+  // A risk the model reports still blocks.
+  assert.match(
+    assertReadiness(
+      reviewReport(
+        {},
+        "## Risks / Open Questions\n\n- Existing session rows lose their owner.",
+        cleanFindings,
+        {
+          risks: ["Existing session rows lose their owner."],
+        },
+      ),
+      "blocked",
+    ),
+    /Resolve merge risk\*\* - Existing session rows lose their owner\./,
+  );
+});
+
+test("every rank-up step of a D or F patch rating is required work, whatever its wording", () => {
+  const steps = [
+    "Merge after required checks are green.",
+    "Wait for CI and ordinary maintainer review.",
+  ];
+  const report = reviewReport({ pr_rating_patch: "D", pr_rating_overall: "D" }, "", cleanFindings, {
+    prRating: {
+      overallTier: "D",
+      proofTier: "NA",
+      patchTier: "D",
+      summary: "Focused repair.",
+      nextSteps: steps,
+    },
+  });
+  const comment = assertReadiness(report, "needs-changes");
+  for (const step of steps) {
+    assert.ok(comment.includes(`- [ ] **Improve patch quality** - ${step}`), step);
+  }
+});
+
+test("host blockers name the real owner and reason", () => {
+  const superseded = assertReadiness(
+    reviewReport({ action_taken: "skipped_pr_close_coverage_proof" }),
+    "blocked",
+  );
+  assert.match(superseded, /\*\*Maintainer: close or keep this PR\*\* - The review found/);
+  assert.doesNotMatch(superseded, /close-coverage proof before merge/);
+  // The rating summary carries the model's reason when no finding lists the work.
+  const incorrect = reviewReport(
+    {},
+    "",
+    cleanFindings.replace("patch is correct", "patch is incorrect"),
+    { overallCorrectness: "patch is incorrect" },
+  );
+  assert.match(
+    assertReadiness(incorrect, "needs-changes"),
+    /\*\*Correct the reviewed patch\*\* - Focused repair\./,
+  );
 });

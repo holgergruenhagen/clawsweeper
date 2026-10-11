@@ -5,8 +5,6 @@ import {
   createContext,
   Script,
   worker,
-  automaticIssueWork,
-  workerWorkKind,
   workflowJobsForRunSnapshot,
   ExactReviewQueue,
   MemoryKv,
@@ -173,53 +171,6 @@ function dashboardApplyObservabilityFixture() {
       last_failure_kind: "workflow_failure",
       last_failure_at: "2026-08-15T11:30:00.000Z",
     },
-  };
-}
-
-function dashboardAutomergeMetricsFixture() {
-  const generatedAt = Date.parse("2026-08-15T12:00:00.000Z");
-  const rangeStart = generatedAt - 7 * 24 * 60 * 60 * 1000;
-  const bucketWidth = 12 * 60 * 60 * 1000;
-  return {
-    generated_at: new Date(generatedAt).toISOString(),
-    range: "7d",
-    range_start: new Date(rangeStart).toISOString(),
-    telemetry_since: new Date(rangeStart).toISOString(),
-    coverage_percent: 100,
-    summary: {
-      terminal_sessions: 14,
-      merged_sessions: 7,
-      merge_success_rate_percent: 50,
-      command_to_merge_p50_ms: 1_000,
-      command_to_merge_p90_ms: 2_000,
-      base_sync_p50: 1,
-      base_sync_p90: 2,
-      multi_rebase_rate_percent: 21.4,
-      active_sessions: 2,
-    },
-    buckets: Array.from({ length: 14 }, (_, index) => {
-      const merged = index % 2 === 0;
-      return {
-        start: new Date(rangeStart + index * bucketWidth).toISOString(),
-        end: new Date(rangeStart + (index + 1) * bucketWidth).toISOString(),
-        terminal_count: 1,
-        merged_count: merged ? 1 : 0,
-        success_rate_percent: merged ? 100 : 0,
-        command_to_merge_p50_ms: merged ? 1_000 : null,
-        command_to_merge_p90_ms: merged ? 2_000 : null,
-        low_sample: true,
-      };
-    }),
-    terminal_outcomes: {
-      merged: 7,
-      repair_failed: 7,
-      maintainer_stopped: 0,
-      repair_cap_exhausted: 0,
-      pr_closed: 0,
-      automerge_disabled: 0,
-      unknown: 0,
-    },
-    repair_efficiency: { zero_base_sync: 7, one_base_sync: 4, multiple_base_sync: 3 },
   };
 }
 
@@ -399,7 +350,6 @@ test("dashboard polling ignores workflow snapshots without disabling other durab
     const env = {
       CLAWSWEEPER_REPO: "openclaw/clawsweeper",
       TARGET_REPOS: "openclaw/openclaw",
-      CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE: "poll",
       CLAWSWEEPER_WEBHOOK_SECRET: "synthetic-polling-secret",
       EXACT_REVIEW_QUEUE: namespace,
       STATUS_STORE: new MemoryKv(),
@@ -441,7 +391,6 @@ test("polling job censuses preserve versioned caches, incomplete pages, and erro
     const store = new MemoryKv();
     let queueReads = 0;
     const env = {
-      CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE: "poll",
       CLAWSWEEPER_WEBHOOK_SECRET: "synthetic-polling-secret",
       STATUS_STORE: store,
       EXACT_REVIEW_QUEUE: new MemoryDurableNamespace({
@@ -575,7 +524,7 @@ test("worker job cache requires an exact versioned total before claiming complet
   }
 });
 
-test("live worker job fetch versions complete cache and durable coverage", async () => {
+test("live worker job fetch versions its complete cache without repairing webhook state", async () => {
   const statusStore = new MemoryKv();
   let repairBody = null;
   const live = await workflowJobsForRunSnapshot(
@@ -609,8 +558,7 @@ test("live worker job fetch versions complete cache and durable coverage", async
   assert.equal(stored.schema_version, 2);
   assert.equal(stored.complete, true);
   assert.equal(stored.total_count, 1);
-  assert.equal(repairBody.workflow_job_census_version, 2);
-  assert.deepEqual(repairBody.complete_workflow_job_runs, [41]);
+  assert.equal(repairBody, null);
   const restarted = await workflowJobsForRunSnapshot(
     { STATUS_STORE: statusStore },
     "generated-owner/generated-repo",
@@ -674,11 +622,7 @@ test("live worker job fetch cannot claim a complete malformed or cross-run censu
     stored.jobs.map((job) => job.id),
     [2],
   );
-  assert.equal(repairBody.objects.length, 1);
-  assert.equal(repairBody.objects[0].runId, 41);
-  assert.equal("complete_workflow_job_runs" in repairBody, false);
-  assert.equal("workflow_job_census_started_at" in repairBody, false);
-  assert.equal("workflow_job_census_version" in repairBody, false);
+  assert.equal(repairBody, null);
 });
 
 test("live worker job fetch rejects malformed pages and ambiguous job identities", async () => {
@@ -747,15 +691,7 @@ test("live worker job fetch requires a strict stable total before completion", a
       String(await statusStore.get("workflow-jobs:generated-owner/generated-repo:41")),
     );
     assert.equal(stored.complete, false);
-    assert.equal(
-      repairBodies.some(
-        (body) =>
-          "complete_workflow_job_runs" in body ||
-          "workflow_job_census_started_at" in body ||
-          "workflow_job_census_version" in body,
-      ),
-      false,
-    );
+    assert.deepEqual(repairBodies, []);
   }
 
   const statusStore = new MemoryKv();
@@ -785,24 +721,6 @@ test("live worker job fetch requires a strict stable total before completion", a
   );
   assert.equal(stored.complete, false);
   assert.equal(stored.jobs.length, 100);
-});
-
-test("dashboard classifies issue conversion and PR repair workers", () => {
-  assert.equal(
-    workerWorkKind(
-      { title: "repair cluster jobs/openclaw/inbox/issue-openclaw-openclaw-123.md" },
-      "Execute and apply cluster actions",
-    ),
-    "issue_to_pr",
-  );
-  assert.equal(
-    workerWorkKind({ title: "automerge repair jobs/openclaw/inbox/automerge-456.md" }, ""),
-    "pr_repair",
-  );
-  assert.equal(
-    workerWorkKind({ title: "repair cluster jobs/openclaw/inbox/cluster-1.md" }, ""),
-    "repair_cluster",
-  );
 });
 
 test("dashboard HTML preserves UTF-8 emoji labels", async () => {
@@ -891,9 +809,7 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.match(html, /Inspect the cursor-write and state-publish steps/);
   assert.match(html, /const skipCount = skipReasons\[reason\]/);
   assert.doesNotMatch(html, /Apply needs attention/);
-  assert.match(html, /Automatic Builds/);
-  assert.match(html, /id="automatic-work"/);
-  assert.match(html, /Lifecycle Timeline/);
+  assert.doesNotMatch(html, /Automatic Builds|id="automatic-work"/);
   assert.match(html, /Active Workers/);
   assert.match(html, /id="worker-dialog"/);
   assert.match(html, /function renderPublicReferenceDialog/);
@@ -905,17 +821,10 @@ test("dashboard HTML preserves UTF-8 emoji labels", async () => {
   assert.match(html, /Step Timeline/);
   assert.match(html, /worker-target-title/);
   assert.match(html, /Refreshing live status in the background/);
-  assert.match(html, /Cluster Intake/);
   assert.match(html, /Active Pipeline/);
   assert.doesNotMatch(html, /Automerge Reliability/);
   assert.doesNotMatch(html, /id="automerge-reliability"/);
-  assert.match(html, /Automerge worker operations/);
-  assert.match(html, /separate from Automerge Product Health success rate/);
-  assert.match(html, /Time-window coverage/);
-  assert.match(html, /Active sessions/);
-  assert.match(html, /No terminal samples yet/);
-  assert.match(html, /Repair workflow failed/);
-  assert.match(html, /Other terminal outcome/);
+  assert.doesNotMatch(html, /Automerge Product Health|Cluster Intake|\/api\/automerge-metrics/);
   assert.doesNotMatch(html, /id="automerge-repo"/);
   assert.doesNotMatch(html, /id="automerge-policy"/);
   assert.doesNotMatch(html, /Recent automerge sessions/);
@@ -1235,13 +1144,6 @@ test("dashboard reprojects separately fetched public observability before render
   assert.match(elementFor("apply-observability-body").innerHTML, /8 \/ 5/);
   assert.match(elementFor("apply-observability-body").innerHTML, /workflow_failure/);
 
-  const validAutomerge = dashboardAutomergeMetricsFixture();
-  nextPayload = validAutomerge;
-  await context.loadAutomergeMetrics();
-  assert.match(elementFor("automerge-meta").textContent, /Time-window coverage 100%/);
-  assert.match(elementFor("automerge-product").innerHTML, /Merge success rate/);
-  assert.match(elementFor("automerge-product").innerHTML, /merged 7 \/ terminal 14/);
-
   new Script(`lastData = dashboardStatusSnapshot({
     schema_version: 1,
     generated_at: new Date().toISOString(),
@@ -1280,34 +1182,6 @@ test("dashboard reprojects separately fetched public observability before render
     { ...validApply, totals: { ...validApply.totals, net_drain: 999 } },
   ]) {
     assert.equal(context.dashboardApplyObservabilitySnapshot(malformed), null);
-  }
-  for (const malformed of [
-    { ...validAutomerge, range: marker },
-    { ...validAutomerge, generated_at: markerUrl },
-    {
-      ...validAutomerge,
-      buckets: validAutomerge.buckets.map((bucket, index) =>
-        index === 0 ? { ...bucket, start: markerUrl } : bucket,
-      ),
-    },
-    { ...validAutomerge, buckets: Array.from({ length: 100 }, () => ({ identity: marker })) },
-    {
-      ...validAutomerge,
-      summary: { ...validAutomerge.summary, terminal_sessions: { identity: markerUrl } },
-    },
-    {
-      ...validAutomerge,
-      terminal_outcomes: Object.fromEntries(
-        Array.from({ length: 33 }, (_, index) => [`${marker}-${index}`, 0]),
-      ),
-    },
-    {
-      ...validAutomerge,
-      terminal_outcomes: { ...validAutomerge.terminal_outcomes, repair_failed: 6 },
-    },
-    { ...validAutomerge, filters: { repo: marker, policy_version: null } },
-  ]) {
-    assert.equal(context.dashboardAutomergeMetricsSnapshot(malformed), null);
   }
   for (const malformed of [
     { ...validCoverage, generated_at: markerUrl },
@@ -1449,21 +1323,6 @@ test("dashboard reprojects separately fetched public observability before render
   assert.equal(
     elementFor("apply-observability-body").innerHTML,
     '<div class="empty">Durable apply telemetry could not be loaded.</div>',
-  );
-
-  nextPayload = {
-    ...validAutomerge,
-    generated_at: markerUrl,
-    buckets: validAutomerge.buckets.map((bucket, index) =>
-      index === 0 ? { ...bucket, start: markerUrl, nested: { identity: markerHash } } : bucket,
-    ),
-    error: `${marker} ${markerUrl}`,
-  };
-  await context.loadAutomergeMetrics();
-  assert.equal(elementFor("automerge-meta").textContent, "Telemetry unavailable");
-  assert.equal(
-    elementFor("automerge-product").innerHTML,
-    '<div class="empty">Automerge product telemetry could not be loaded.</div>',
   );
 
   nextPayload = {
@@ -1771,36 +1630,8 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
           },
         ],
       },
-      automerge: [],
-      automerge_reliability: {
-        sampled_runs: 3,
-        completed_attempts: 3,
-        failed_attempts: 2,
-        failure_rate_percent: 66.7,
-        active_attempts: 0,
-        stalled_attempts: 0,
-        average_duration_ms: 600_000,
-        longest_duration_ms: 1_200_000,
-        unresolved_failures: 1,
-        recovered_failures: 1,
-        failures: [
-          {
-            repository: "openclaw/openclaw",
-            number: 107691,
-            item_url: "https://github.com/openclaw/openclaw/pull/107691",
-            run_url: "https://github.com/openclaw/clawsweeper/actions/runs/29431617465",
-            status: "unresolved",
-            conclusion: "failure",
-            started_at: "2026-07-05T10:50:00Z",
-            completed_at: "2026-07-05T11:10:00Z",
-            duration_ms: 1_200_000,
-            recovered: false,
-          },
-        ],
-      },
       closed_items: [],
       closed_stats: { issues: 0, prs: 0, total: 0, window_hours: 24 },
-      cluster_repair: null,
       events: [],
       operation_counts: {},
     },
@@ -1836,6 +1667,27 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
   });
   new Script(script).runInContext(context);
   await new Promise((resolve) => setTimeout(resolve, 0));
+  const refreshReview = context.applyHealthRecommendedAction(
+    { target_repo: "openclaw/clawhub", mode: "close" },
+    "skipped_changed_since_review",
+  );
+  assert.equal(
+    refreshReview.command,
+    "gh workflow run review-plan.yml --repo openclaw/clawsweeper -f target_repo=openclaw/clawhub",
+  );
+  assert.equal(
+    refreshReview.url,
+    "https://github.com/openclaw/clawsweeper/actions/workflows/review-plan.yml",
+  );
+  for (const mode of ["close", "comment_sync"]) {
+    const apply = context.applyHealthRecommendedAction(
+      { target_repo: "openclaw/clawhub", mode },
+      "skipped_runtime_budget",
+    );
+    assert.match(apply.command, /^gh workflow run sweep\.yml /);
+    assert.match(apply.command, /-f apply_existing=true/);
+    assert.equal(apply.url, "https://github.com/openclaw/clawsweeper/actions/workflows/sweep.yml");
+  }
 
   const freshnessTimestamp = new Date(Date.now() - 1_000).toISOString();
   for (const state of ["fresh", "stale"]) {
@@ -2275,17 +2127,13 @@ test("dashboard hero treats apply and exact-review handoff health as attention",
   assert.doesNotMatch(initialLaneHtml, /DLQ/);
   assert.match(initialLaneHtml, /Ready<\/span><strong>3/);
   assert.match(initialLaneHtml, /Backoff<\/span><strong>1/);
-  assert.match(elementFor("worker-health").innerHTML, /Automerge worker operations/);
-  assert.match(elementFor("worker-health").innerHTML, /Active \/ stalled<\/span><strong>0 \/ 0/);
-  assert.match(elementFor("worker-health").innerHTML, /Failed attempts<\/span><strong>2/);
-  assert.match(
-    elementFor("worker-health").innerHTML,
-    /Recovered \/ unresolved<\/span><strong>1 \/ 1/,
-  );
-  assert.match(elementFor("worker-health").innerHTML, /avg runtime 10m/);
-  assert.doesNotMatch(elementFor("worker-health").innerHTML, /#107691/);
-  assert.doesNotMatch(elementFor("worker-health").innerHTML, /actions\/runs\//);
-  assert.match(elementFor("worker-health").innerHTML, /unresolved/);
+  const workerHealthHtml = elementFor("worker-health").innerHTML;
+  assert.match(workerHealthHtml, /Attempts sampled<\/span><strong>0/);
+  assert.match(workerHealthHtml, /Failed attempts<\/span><strong>0/);
+  assert.match(workerHealthHtml, /Recovered<\/span><strong>0/);
+  assert.match(workerHealthHtml, /No worker failures in the recent sample/);
+  assert.doesNotMatch(workerHealthHtml, /Automerge|Active \/ stalled|avg runtime/);
+  assert.doesNotMatch(workerHealthHtml, /actions\/runs\//);
   assert.match(elementFor("exact-review-lanes").innerHTML, /target 24 · adaptive 24–24/);
   assert.doesNotMatch(elementFor("exact-review-lanes").innerHTML, /GitHub rate limit/);
   assert.match(elementFor("exact-review-lanes").innerHTML, /No backlog history in this range/);
@@ -2622,144 +2470,6 @@ test("dashboard HTML emits early persistent theme controls", async () => {
     assert.match(html, /themeQuery\?\.addListener\?\.\(updateSystemTheme\)/);
     assert.match(html, /setAttribute\("aria-pressed", selected \? "true" : "false"\)/);
   }
-});
-
-test("dashboard groups automatic issue lifecycle events with active workers", () => {
-  const rows = automaticIssueWork(
-    [
-      {
-        event_type: "clawsweeper.issue_build_queued",
-        repository: "steipete/example",
-        source_item_number: 42,
-        source_item_url: "https://github.com/steipete/example/issues/42",
-        title: "Add compact export mode",
-        stage: "queued",
-        status: "queued",
-        run_url: "https://github.com/openclaw/clawsweeper/actions/runs/100",
-        work_kind: "issue_to_pr",
-        automatic: true,
-        received_at: "2026-06-14T10:00:00Z",
-      },
-      {
-        event_type: "clawsweeper.generated_pr_opened",
-        repository: "steipete/example",
-        source_item_number: 42,
-        source_item_url: "https://github.com/steipete/example/issues/42",
-        item_url: "https://github.com/steipete/example/pull/51",
-        pr_url: "https://github.com/steipete/example/pull/51",
-        title: "Add compact export mode",
-        stage: "pr_opened",
-        status: "completed",
-        work_kind: "issue_to_pr",
-        automatic: null,
-        received_at: "2026-06-14T10:10:00Z",
-      },
-    ],
-    [
-      {
-        id: 7001,
-        repository: "steipete/example",
-        item_number: 42,
-        work_kind: "issue_to_pr",
-        name: "Implement issue",
-        status: "in_progress",
-        current_step: "Run Codex",
-        run_url: "https://github.com/openclaw/clawsweeper/actions/runs/100",
-        updated_at: "2026-06-14T10:05:00Z",
-        target_items: [
-          {
-            number: 42,
-            title: "Add compact export mode",
-            url: "https://github.com/steipete/example/issues/42",
-          },
-        ],
-      },
-    ],
-  );
-
-  assert.equal(rows.length, 1);
-  assert.equal(rows[0].id, "steipete/example#42");
-  assert.equal(rows[0].title, "Add compact export mode");
-  assert.equal(rows[0].active, true);
-  assert.equal(rows[0].worker_id, "7001");
-  assert.equal(rows[0].pr_url, "https://github.com/steipete/example/pull/51");
-  assert.equal(rows[0].timeline.length, 3);
-});
-
-test("dashboard correlates issue implementation workers by run URL", () => {
-  const workers = [
-    {
-      id: 7002,
-      repository: null,
-      item_number: null,
-      item_numbers: [],
-      work_kind: "issue_to_pr",
-      name: "Execute and apply cluster actions",
-      status: "in_progress",
-      current_step: "Execute credited fix artifact",
-      run_url: "https://github.com/openclaw/clawsweeper/actions/runs/101",
-      updated_at: "2026-06-14T10:05:00Z",
-      target_items: [],
-    },
-  ];
-  const rows = automaticIssueWork(
-    [
-      {
-        event_type: "clawsweeper.issue_build_started",
-        repository: "openclaw/openclaw-ansible",
-        source_item_number: 20,
-        source_item_url: "https://github.com/openclaw/openclaw-ansible/issues/20",
-        title: "Install sudo when missing",
-        stage: "building",
-        status: "running",
-        run_url: "https://github.com/openclaw/clawsweeper/actions/runs/101",
-        work_kind: "issue_to_pr",
-        automatic: true,
-        received_at: "2026-06-14T10:04:00Z",
-      },
-    ],
-    workers,
-  );
-
-  assert.equal(rows[0].active, true);
-  assert.equal(rows[0].worker_id, "7002");
-  assert.equal(workers[0].repository, "openclaw/openclaw-ansible");
-  assert.equal(workers[0].item_number, 20);
-  assert.equal(workers[0].target_items[0].title, "Install sudo when missing");
-});
-
-test("dashboard preserves issue titles across generated PR repair events", () => {
-  const rows = automaticIssueWork(
-    [
-      {
-        event_type: "clawsweeper.issue_build_started",
-        repository: "openclaw/openclaw-ansible",
-        source_item_number: 20,
-        source_item_url: "https://github.com/openclaw/openclaw-ansible/issues/20",
-        title: "installation fails due to not sudo installed",
-        stage: "building",
-        status: "running",
-        automatic: true,
-        received_at: "2026-06-14T10:00:00Z",
-      },
-      {
-        event_type: "clawsweeper.contributor_branch_repaired",
-        repository: "openclaw/openclaw-ansible",
-        source_item_number: 20,
-        source_item_url: "https://github.com/openclaw/openclaw-ansible/issues/20",
-        item_url: "https://github.com/openclaw/openclaw-ansible/pull/49",
-        pr_url: "https://github.com/openclaw/openclaw-ansible/pull/49",
-        title: "openclaw/openclaw-ansible#49",
-        stage: "repair_contributor_branch",
-        status: "pushed",
-        received_at: "2026-06-14T10:10:00Z",
-      },
-    ],
-    [],
-  );
-
-  assert.equal(rows[0].title, "installation fails due to not sudo installed");
-  assert.equal(rows[0].pr_url, "https://github.com/openclaw/openclaw-ansible/pull/49");
 });
 
 test("dashboard exposes active worker jobs and their current steps", async () => {
@@ -3184,6 +2894,7 @@ test("dashboard keeps control-plane workflow fallbacks out of Codex capacity", a
     [5, "repair comment router", "clawsweeper_comment", "queued"],
     [6, "Reconcile exact-review leases", "Reconcile exact-review leases", "in_progress"],
     [7, "ClawSweeper", "Sync Codex review comments for openclaw/openclaw", "queued"],
+    [8, "ClawSweeper Review Plan", "Review ClawSweeper items", "in_progress"],
   ].map(([id, name, displayTitle, status]) => ({
     id,
     name,
@@ -3233,9 +2944,9 @@ test("dashboard keeps control-plane workflow fallbacks out of Codex capacity", a
       { waitUntil: () => undefined },
     );
     const status = await response.json();
-    assert.equal(status.fleet.active_codex_jobs, 3);
-    assert.equal(status.fleet.worker_detail_fallbacks, 3);
-    assert.equal(status.workers.length, 3);
+    assert.equal(status.fleet.active_codex_jobs, 4);
+    assert.equal(status.fleet.worker_detail_fallbacks, 4);
+    assert.equal(status.workers.length, 4);
     assert.equal(
       status.workers.every((entry: Record<string, unknown>) => !("id" in entry)),
       true,
@@ -3667,89 +3378,6 @@ test("dashboard cold-cache status bounds a stalled forty-run worker-health refre
   }
 });
 
-test("dashboard exposes scheduled cluster intake markers and runs", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalCaches = globalThis.caches;
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        match: async () => undefined,
-        put: async () => undefined,
-      },
-    },
-  });
-  const marker = {
-    target_repo: "openclaw/openclaw",
-    last_processed_store_sha256: "abc123def4567890",
-    last_processed_store_exported_at: "2026-05-25T12:00:00Z",
-    generated_count: 1,
-    generated_jobs: ["jobs/openclaw/inbox/gitcrawl-42-login-fix.md"],
-    run_url: "https://github.com/openclaw/clawsweeper/actions/runs/42",
-    updated_at: "2026-05-25T12:08:00Z",
-  };
-  globalThis.fetch = async (input) => {
-    const url = new URL(String(input));
-    if (url.pathname === "/repos/openclaw/clawsweeper/actions/runs") {
-      return jsonResponse({ workflow_runs: [] });
-    }
-    if (
-      url.pathname ===
-      "/repos/openclaw/clawsweeper/actions/workflows/repair-cluster-intake.yml/runs"
-    ) {
-      return jsonResponse({
-        workflow_runs: [
-          {
-            id: 42,
-            name: "repair cluster intake",
-            display_title: "repair cluster intake",
-            status: "completed",
-            conclusion: "success",
-            html_url: "https://github.com/openclaw/clawsweeper/actions/runs/42",
-            created_at: "2026-05-25T12:08:00Z",
-            updated_at: "2026-05-25T12:09:00Z",
-          },
-        ],
-      });
-    }
-    if (
-      url.pathname ===
-      "/repos/openclaw/clawsweeper-state/contents/results/cluster-repair-intake/openclaw-openclaw.json"
-    ) {
-      assert.equal(url.searchParams.get("ref"), "state");
-      return jsonResponse({
-        content: Buffer.from(JSON.stringify(marker)).toString("base64"),
-      });
-    }
-    if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
-    if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  try {
-    const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/api/status"), {
-      STATUS_STORE: new MemoryKv(),
-      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
-      TARGET_REPOS: "openclaw/openclaw",
-      CACHE_TTL_SECONDS: "0",
-    });
-    assert.equal(response.status, 200);
-    const status = await response.json();
-    assert.equal(status.recent.cluster_repair.markers.length, 1);
-    assert.equal("workflow" in status.recent.cluster_repair, false);
-    assert.equal("schedule" in status.recent.cluster_repair, false);
-    assert.equal(status.recent.cluster_repair.markers[0].generated_count, 1);
-    assert.equal(
-      "last_processed_store_short_sha" in status.recent.cluster_repair.markers[0],
-      false,
-    );
-    assert.equal("url" in status.recent.cluster_repair.latest_runs[0], false);
-  } finally {
-    globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-  }
-});
-
 test("dashboard exposes apply health from sweep status without broad scans", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
@@ -4082,150 +3710,138 @@ test("dashboard skips raw event persistence when the private status store is not
   }
 });
 
-for (const sources of [
-  [undefined, undefined],
-  [undefined, "webhook"],
-  ["poll", "poll"],
-  ["poll", "webhook"],
-]) {
-  test(`dashboard stale refresh coalescing respects workflow sources ${sources.join("/")}`, async () => {
-    const originalFetch = globalThis.fetch;
-    const originalCaches = globalThis.caches;
-    const cache = new MemoryCache();
-    Object.defineProperty(globalThis, "caches", {
-      configurable: true,
-      value: { default: cache },
-    });
-    await cache.put(
-      new Request("https://clawsweeper.openclaw.ai/api/status-cache/v7/_/stale"),
-      jsonResponse({
-        schema_version: 1,
-        generated_at: "2026-06-13T18:00:00Z",
-        source: {
-          clawsweeper_repo: "openclaw/clawsweeper",
-          target_repositories: ["openclaw/openclaw"],
-        },
-        fleet: { active_workflow_runs: 1 },
-        workers: [],
-        automatic_work: [],
-        pipeline: [{ id: "stale-row" }],
-        bay: {},
-        recent: {},
-        exact_review_queue: {
-          pending: 1,
-          dispatching: 1,
-          leased: 0,
-          handoff_health: { status: "stalled" },
-        },
-        diagnostics: { errors: [], exact_review_queue_error: null },
-      }),
-    );
-
-    const currentQueue = {
-      pending: 7,
-      dispatching: 0,
-      leased: 28,
-      storage_schema_version: 1,
-      handoff_health: {
-        status: "healthy",
-        reason: "handoff_current",
-        phases: {
-          pending: { count: 7 },
-          dispatching: { count: 0 },
-          leased: { count: 28 },
-        },
-      },
-    };
-    let queueReads = 0;
-    const exactReviewQueue = new MemoryDurableNamespace({
-      fetch: async () => {
-        queueReads += 1;
-        return jsonResponse(currentQueue);
-      },
-    });
-
-    let releaseFetch!: () => void;
-    const fetchGate = new Promise<void>((resolve) => {
-      releaseFetch = resolve;
-    });
-    let unfilteredRunRequests = 0;
-    globalThis.fetch = async (input) => {
-      const url = new URL(String(input));
-      await fetchGate;
-      if (url.pathname.includes("/actions/")) {
-        if (url.pathname.endsWith("/actions/runs") && !url.searchParams.has("status")) {
-          unfilteredRunRequests += 1;
-        }
-        return jsonResponse({ workflow_runs: [] });
-      }
-      if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
-      if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
-      return new Response(JSON.stringify({ message: "not found" }), { status: 404 });
-    };
-
-    try {
-      const waitUntilPromises: Promise<unknown>[] = [];
-      const env = {
-        CLAWSWEEPER_REPO: "openclaw/clawsweeper",
-        CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE: sources[0],
-        TARGET_REPOS: "openclaw/openclaw",
-        CACHE_TTL_SECONDS: "20",
-        EXACT_REVIEW_QUEUE: exactReviewQueue,
-      };
-      const context = {
-        waitUntil(promise: Promise<unknown>) {
-          waitUntilPromises.push(promise);
-        },
-      };
-      const caller = new AbortController();
-      const request = new Request("https://clawsweeper.openclaw.ai/api/status", {
-        signal: caller.signal,
-      });
-      const [first, second] = await Promise.all([
-        worker.fetch(
-          request,
-          { ...env, CLAWSWEEPER_DASHBOARD_WORKFLOW_SOURCE: sources[1] },
-          context,
-        ),
-        worker.fetch(request, env, context),
-      ]);
-
-      assert.equal(first.headers.get("x-clawsweeper-cache"), "stale");
-      assert.equal(second.headers.get("x-clawsweeper-cache"), "stale");
-      const firstStatus = await first.json();
-      const secondStatus = await second.json();
-      assert.equal(firstStatus.pipeline[0].id, undefined);
-      assert.equal(firstStatus.exact_review_queue.pending, 1);
-      assert.equal(firstStatus.exact_review_queue.handoff_health.status, "stalled");
-      assert.equal(firstStatus.freshness.state, "stale");
-      assert.equal(firstStatus.freshness.cache_state, "stale");
-      assert.equal(firstStatus.freshness.maximum_age_ms, 20_000);
-      assert.equal(secondStatus.exact_review_queue.handoff_health.status, "stalled");
-      assert.equal(queueReads, 0);
-      const refreshes = sources[0] === "poll" && sources[1] === "webhook" ? 2 : 1;
-      assert.equal(waitUntilPromises.length, refreshes, "each refresh owns its Worker lifetime");
-
-      caller.abort();
-      releaseFetch();
-      await Promise.all(waitUntilPromises);
-      assert.equal(unfilteredRunRequests, refreshes);
-      assert.equal(queueReads, 3 * refreshes);
-
-      const refreshed = await worker.fetch(request, env);
-      assert.equal(refreshed.headers.get("x-clawsweeper-cache"), "fresh");
-      const refreshedStatus = await refreshed.json();
-      assert.deepEqual(refreshedStatus.pipeline, []);
-      assert.equal(refreshedStatus.freshness.state, "fresh");
-      assert.equal(refreshedStatus.freshness.cache_state, "fresh");
-      assert.equal(refreshedStatus.exact_review_queue.pending, 7);
-      assert.equal(refreshedStatus.exact_review_queue.handoff_health.status, "healthy");
-      assert.equal(queueReads, 3 * refreshes);
-    } finally {
-      globalThis.fetch = originalFetch;
-      Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-    }
+test("dashboard stale refresh coalesces concurrent polling requests", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalCaches = globalThis.caches;
+  const cache = new MemoryCache();
+  Object.defineProperty(globalThis, "caches", {
+    configurable: true,
+    value: { default: cache },
   });
-}
+  await cache.put(
+    new Request("https://clawsweeper.openclaw.ai/api/status-cache/v7/_/stale"),
+    jsonResponse({
+      schema_version: 1,
+      generated_at: "2026-06-13T18:00:00Z",
+      source: {
+        clawsweeper_repo: "openclaw/clawsweeper",
+        target_repositories: ["openclaw/openclaw"],
+      },
+      fleet: { active_workflow_runs: 1 },
+      workers: [],
+      automatic_work: [],
+      pipeline: [{ id: "stale-row" }],
+      bay: {},
+      recent: {},
+      exact_review_queue: {
+        pending: 1,
+        dispatching: 1,
+        leased: 0,
+        handoff_health: { status: "stalled" },
+      },
+      diagnostics: { errors: [], exact_review_queue_error: null },
+    }),
+  );
+
+  const currentQueue = {
+    pending: 7,
+    dispatching: 0,
+    leased: 28,
+    storage_schema_version: 1,
+    handoff_health: {
+      status: "healthy",
+      reason: "handoff_current",
+      phases: {
+        pending: { count: 7 },
+        dispatching: { count: 0 },
+        leased: { count: 28 },
+      },
+    },
+  };
+  let queueReads = 0;
+  const exactReviewQueue = new MemoryDurableNamespace({
+    fetch: async () => {
+      queueReads += 1;
+      return jsonResponse(currentQueue);
+    },
+  });
+
+  let releaseFetch!: () => void;
+  const fetchGate = new Promise<void>((resolve) => {
+    releaseFetch = resolve;
+  });
+  let unfilteredRunRequests = 0;
+  globalThis.fetch = async (input) => {
+    const url = new URL(String(input));
+    await fetchGate;
+    if (url.pathname.includes("/actions/")) {
+      if (url.pathname.endsWith("/actions/runs") && !url.searchParams.has("status")) {
+        unfilteredRunRequests += 1;
+      }
+      return jsonResponse({ workflow_runs: [] });
+    }
+    if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
+    if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
+    return new Response(JSON.stringify({ message: "not found" }), { status: 404 });
+  };
+
+  try {
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const env = {
+      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
+      TARGET_REPOS: "openclaw/openclaw",
+      CACHE_TTL_SECONDS: "20",
+      EXACT_REVIEW_QUEUE: exactReviewQueue,
+    };
+    const context = {
+      waitUntil(promise: Promise<unknown>) {
+        waitUntilPromises.push(promise);
+      },
+    };
+    const caller = new AbortController();
+    const request = new Request("https://clawsweeper.openclaw.ai/api/status", {
+      signal: caller.signal,
+    });
+    const [first, second] = await Promise.all([
+      worker.fetch(request, env, context),
+      worker.fetch(request, env, context),
+    ]);
+
+    assert.equal(first.headers.get("x-clawsweeper-cache"), "stale");
+    assert.equal(second.headers.get("x-clawsweeper-cache"), "stale");
+    const firstStatus = await first.json();
+    const secondStatus = await second.json();
+    assert.equal(firstStatus.pipeline[0].id, undefined);
+    assert.equal(firstStatus.exact_review_queue.pending, 1);
+    assert.equal(firstStatus.exact_review_queue.handoff_health.status, "stalled");
+    assert.equal(firstStatus.freshness.state, "stale");
+    assert.equal(firstStatus.freshness.cache_state, "stale");
+    assert.equal(firstStatus.freshness.maximum_age_ms, 20_000);
+    assert.equal(secondStatus.exact_review_queue.handoff_health.status, "stalled");
+    assert.equal(queueReads, 0);
+    const refreshes = 1;
+    assert.equal(waitUntilPromises.length, refreshes, "each refresh owns its Worker lifetime");
+
+    caller.abort();
+    releaseFetch();
+    await Promise.all(waitUntilPromises);
+    assert.equal(unfilteredRunRequests, refreshes);
+    assert.equal(queueReads, 3 * refreshes);
+
+    const refreshed = await worker.fetch(request, env);
+    assert.equal(refreshed.headers.get("x-clawsweeper-cache"), "fresh");
+    const refreshedStatus = await refreshed.json();
+    assert.deepEqual(refreshedStatus.pipeline, []);
+    assert.equal(refreshedStatus.freshness.state, "fresh");
+    assert.equal(refreshedStatus.freshness.cache_state, "fresh");
+    assert.equal(refreshedStatus.exact_review_queue.pending, 7);
+    assert.equal(refreshedStatus.exact_review_queue.handoff_health.status, "healthy");
+    assert.equal(queueReads, 3 * refreshes);
+  } finally {
+    globalThis.fetch = originalFetch;
+    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
+  }
+});
 
 test("dashboard status survives cache persistence failures", async () => {
   const originalFetch = globalThis.fetch;
@@ -4236,11 +3852,7 @@ test("dashboard status survives cache persistence failures", async () => {
       default: {
         match: async () => undefined,
         put: async (request: Request) => {
-          if (
-            request.url.includes("/api/status-cache/") ||
-            request.url.includes("recent-automerge") ||
-            request.url.includes("recent-closed")
-          ) {
+          if (request.url.includes("/api/status-cache/") || request.url.includes("recent-closed")) {
             throw new Error("cache unavailable");
           }
         },
@@ -4266,7 +3878,8 @@ test("dashboard status survives cache persistence failures", async () => {
   }
 });
 
-test("dashboard parallelizes and caches historical GitHub telemetry", async () => {
+test("dashboard caches historical closed-item telemetry across live status refreshes", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -4278,41 +3891,10 @@ test("dashboard parallelizes and caches historical GitHub telemetry", async () =
       },
     },
   });
-  let searchRequests = 0;
   let closedRequests = 0;
-  let activeDetails = 0;
-  let maxActiveDetails = 0;
   globalThis.fetch = async (input) => {
     const url = new URL(String(input));
     if (url.pathname.includes("/actions/")) return jsonResponse({ workflow_runs: [] });
-    if (url.pathname === "/search/issues") {
-      searchRequests += 1;
-      return jsonResponse({
-        items: [101, 102, 103, 104].map((number) => ({
-          number,
-          title: `Merged PR ${number}`,
-          html_url: `https://github.com/openclaw/openclaw/pull/${number}`,
-        })),
-      });
-    }
-    if (/^\/repos\/openclaw\/openclaw\/(?:pulls\/\d+|issues\/\d+\/comments)$/.test(url.pathname)) {
-      activeDetails += 1;
-      maxActiveDetails = Math.max(maxActiveDetails, activeDetails);
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      activeDetails -= 1;
-      if (url.pathname.includes("/comments")) {
-        return jsonResponse([
-          {
-            body: "@clawsweeper automerge",
-            created_at: "2026-06-13T18:00:00Z",
-          },
-        ]);
-      }
-      return jsonResponse({
-        merged_at: "2026-06-13T18:01:00Z",
-        merge_commit_sha: "abc123",
-      });
-    }
     if (url.pathname === "/repos/openclaw/openclaw/issues") {
       closedRequests += 1;
       return jsonResponse([]);
@@ -4330,216 +3912,14 @@ test("dashboard parallelizes and caches historical GitHub telemetry", async () =
     const request = new Request("https://clawsweeper.openclaw.ai/api/status");
     const first = await worker.fetch(request, env);
     assert.equal(first.status, 200);
-    assert.equal((await first.json()).averages.automerge_samples, 4);
-    assert.ok(maxActiveDetails >= 4);
-    assert.equal(searchRequests, 1);
+    assert.equal((await first.json()).recent.closed_stats.total, 0);
     assert.equal(closedRequests, 1);
 
-    await new Promise((resolve) => setTimeout(resolve, 2));
+    t.mock.timers.tick(2);
     const second = await worker.fetch(request, env);
     assert.equal(second.status, 200);
-    assert.equal((await second.json()).averages.automerge_samples, 4);
-    assert.equal(searchRequests, 1);
+    assert.equal((await second.json()).recent.closed_stats.total, 0);
     assert.equal(closedRequests, 1);
-  } finally {
-    globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-  }
-});
-
-test("dashboard reports automerge worker reliability independently of merged PR timing", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalCaches = globalThis.caches;
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        match: async () => undefined,
-        put: async () => undefined,
-      },
-    },
-  });
-  let reliabilityRequests = 0;
-  globalThis.fetch = async (input) => {
-    const url = new URL(String(input));
-    if (
-      url.pathname ===
-      "/repos/openclaw/clawsweeper/actions/workflows/repair-cluster-worker.yml/runs"
-    ) {
-      reliabilityRequests += 1;
-      const workflowRun = (
-        id: number,
-        number: number,
-        conclusion: "failure" | "success",
-        createdAt: string,
-        updatedAt: string,
-      ) => ({
-        id,
-        display_title: `automerge repair jobs/openclaw/inbox/automerge-openclaw-openclaw-${number}.md`,
-        status: "completed",
-        conclusion,
-        html_url: `https://github.com/openclaw/clawsweeper/actions/runs/${id}`,
-        created_at: createdAt,
-        updated_at: updatedAt,
-      });
-      return jsonResponse({
-        workflow_runs: [
-          workflowRun(
-            29431617465,
-            107691,
-            "failure",
-            "2026-07-15T16:15:04Z",
-            "2026-07-15T16:34:51Z",
-          ),
-          workflowRun(
-            29434021623,
-            107691,
-            "success",
-            "2026-07-15T16:49:45Z",
-            "2026-07-15T16:51:53Z",
-          ),
-          workflowRun(
-            29435000000,
-            107692,
-            "failure",
-            "2026-07-15T17:00:00Z",
-            "2026-07-15T17:10:00Z",
-          ),
-        ],
-      });
-    }
-    if (url.pathname.includes("/actions/")) return jsonResponse({ workflow_runs: [] });
-    if (url.pathname === "/search/issues") return jsonResponse({ items: [] });
-    if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
-    return new Response(JSON.stringify({ message: "not found" }), { status: 404 });
-  };
-
-  try {
-    const response = await worker.fetch(new Request("https://clawsweeper.openclaw.ai/api/status"), {
-      STATUS_STORE: new MemoryKv(),
-      CLAWSWEEPER_REPO: "openclaw/clawsweeper",
-      TARGET_REPOS: "openclaw/openclaw",
-      CACHE_TTL_SECONDS: "-1",
-    });
-    assert.equal(response.status, 200);
-    const status = await response.json();
-    const reliability = status.recent.automerge_reliability;
-    assert.equal(reliabilityRequests, 1);
-    assert.equal(reliability.sampled_runs, 3);
-    assert.equal(reliability.failure_rate_percent, 66.7);
-    assert.equal(reliability.recovered_failures, 1);
-    assert.equal(reliability.unresolved_failures, 1);
-    assert.deepEqual(
-      reliability.failures.map((failure: { status: string }) => failure.status),
-      ["unresolved", "recovered"],
-    );
-    assert.ok(reliability.failures.every((failure: { number?: number }) => !failure.number));
-  } finally {
-    globalThis.fetch = originalFetch;
-    Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
-  }
-});
-
-test("dashboard batches recent automerge hydration with GraphQL when authenticated", async () => {
-  const originalFetch = globalThis.fetch;
-  const originalCaches = globalThis.caches;
-  Object.defineProperty(globalThis, "caches", {
-    configurable: true,
-    value: {
-      default: {
-        match: async () => undefined,
-        put: async () => undefined,
-      },
-    },
-  });
-  let searchRequests = 0;
-  let graphqlRequests = 0;
-  let restDetailRequests = 0;
-  globalThis.fetch = async (input) => {
-    const url = new URL(String(input));
-    if (url.pathname.includes("/actions/")) return jsonResponse({ workflow_runs: [] });
-    if (url.pathname === "/search/issues") {
-      searchRequests += 1;
-      return jsonResponse({
-        items: [101, 102].map((number) => ({
-          number,
-          title: `Merged PR ${number}`,
-          html_url: `https://github.com/openclaw/openclaw/pull/${number}`,
-        })),
-      });
-    }
-    if (url.pathname === "/graphql") {
-      graphqlRequests += 1;
-      return jsonResponse({
-        data: {
-          repository: {
-            pr0: {
-              mergedAt: "2026-06-13T18:01:00Z",
-              mergeCommit: { oid: "abc101" },
-              comments: {
-                nodes: [
-                  {
-                    body: "@clawsweeper automerge",
-                    createdAt: "2026-06-13T18:00:30Z",
-                  },
-                  {
-                    body: "/clawsweeper automerge",
-                    createdAt: "2026-06-13T18:00:00Z",
-                  },
-                ],
-              },
-            },
-            pr1: {
-              mergedAt: "2026-06-13T18:04:00Z",
-              mergeCommit: { oid: "abc102" },
-              comments: {
-                nodes: [
-                  {
-                    body: "/clawsweeper automerge",
-                    createdAt: "2026-06-13T18:02:00Z",
-                  },
-                ],
-              },
-            },
-          },
-        },
-      });
-    }
-    if (/^\/repos\/openclaw\/openclaw\/(?:pulls\/\d+|issues\/\d+\/comments)$/.test(url.pathname)) {
-      restDetailRequests += 1;
-      return jsonResponse({});
-    }
-    if (url.pathname === "/repos/openclaw/openclaw/issues") return jsonResponse([]);
-    throw new Error(`unexpected fetch ${url}`);
-  };
-
-  try {
-    const response = await worker.fetch(
-      new Request("https://clawsweeper.openclaw.ai/api/status"),
-      {
-        CLAWSWEEPER_REPO: "openclaw/clawsweeper",
-        TARGET_REPOS: "openclaw/openclaw",
-        CACHE_TTL_SECONDS: "-1",
-        GITHUB_TOKEN: "test-token",
-      },
-      {
-        waitUntil: () => undefined,
-      },
-    );
-    const status = await response.json();
-    assert.equal(response.status, 200);
-    assert.equal(status.averages.automerge_samples, 2);
-    assert.equal(status.averages.automerge_command_to_merge_ms, 90_000);
-    assert.equal(searchRequests, 1);
-    assert.equal(graphqlRequests, 1);
-    assert.equal(restDetailRequests, 0);
-    assert.equal(status.recent.automerge.length, 2);
-    assert.ok(
-      status.recent.automerge.every(
-        (item: { number?: number; merge_commit_sha?: string }) =>
-          item.number === undefined && item.merge_commit_sha === undefined,
-      ),
-    );
   } finally {
     globalThis.fetch = originalFetch;
     Object.defineProperty(globalThis, "caches", { configurable: true, value: originalCaches });
@@ -4610,7 +3990,7 @@ test("dashboard preserves repeated untargeted activity events", async () => {
   }
 });
 
-test("dashboard counts cluster-fixer operation events", async () => {
+test("dashboard counts review operations without retired repair counters", async () => {
   const originalFetch = globalThis.fetch;
   const originalCaches = globalThis.caches;
   Object.defineProperty(globalThis, "caches", {
@@ -4668,8 +4048,6 @@ test("dashboard counts cluster-fixer operation events", async () => {
     );
     const status = await response.json();
     assert.deepEqual(status.recent.operation_counts, {
-      inherited_label_cleanups: 1,
-      self_heal_conflict_repairs: 1,
       failed_review_retries: 1,
       failed_review_retry_exhaustions: 1,
       bot_owned_proof_decisions_requested: 1,

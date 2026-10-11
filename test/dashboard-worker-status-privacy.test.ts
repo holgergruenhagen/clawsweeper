@@ -8,7 +8,6 @@ import {
 } from "./helpers/publication-status-fixture.ts";
 
 import worker, {
-  activeBayItemKeys,
   composePublicBayActivityForTest,
   publicBayActiveTargetsForTest,
   publicExactReviewQueueProjection,
@@ -25,7 +24,6 @@ const publicStatusProjection = (value: Record<string, unknown>) =>
     source: { target_repository_count: 0 },
     fleet: {},
     workers: [],
-    automatic_work: [],
     pipeline: [],
     bay: {},
     recent: {},
@@ -44,7 +42,6 @@ const UNAVAILABLE_PUBLIC_STATUS = {
     budget_used_percent: 0,
   },
   workers: [],
-  automatic_work: [],
   pipeline: [],
   bay: {},
   recent: {},
@@ -471,7 +468,7 @@ test("public Bay retains simultaneous direct and legacy workers for one target",
   );
 });
 
-test("private active-key protection stays complete while public over-cap activity fails closed", () => {
+test("public over-cap activity fails closed", () => {
   const manyWorkers = Array.from({ length: 101 }, (_, index) => ({
     repository: "synthetic-owner/synthetic-repository",
     item_number: index + 1,
@@ -486,8 +483,6 @@ test("private active-key protection stays complete while public over-cap activit
     started_at: "2026-08-15T12:00:00Z",
   };
 
-  assert.equal(activeBayItemKeys(manyWorkers).length, 101);
-  assert.equal(activeBayItemKeys([manyItems]).length, 101);
   for (const source of [{ workers: manyWorkers }, { workers: [manyItems] }]) {
     const projected = publicStatusProjection(source);
     assert.equal(projected.workers.length, Math.min(source.workers.length, 100));

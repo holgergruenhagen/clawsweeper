@@ -16,7 +16,7 @@ import { createReviewCommandWorkflow } from "../dist/clawsweeper-review-command-
 import { suppliedReviewStartLeaseFromArgs } from "../dist/clawsweeper-review-lease.js";
 import { parseArgs } from "../dist/clawsweeper-args.js";
 import { repositoryProfileFor } from "../dist/repository-profiles.js";
-import { reviewActionForDecision } from "../dist/clawsweeper.js";
+import { reviewActionForDecision } from "../dist/clawsweeper-report-actions.js";
 import { item } from "./helpers.ts";
 
 for (const source of [
@@ -86,7 +86,6 @@ for (const source of [
       const stop = new Error("CONTROL_REACHED_NORMAL_HYDRATION");
       const base = {
         activeReviewMutationRunner: null,
-        asRecord: (value: unknown) => (value && typeof value === "object" ? value : {}),
         repoFromArgs: () => repositoryProfileFor(candidate.repo),
         targetRepo: () => candidate.repo,
         localExactReviewItem: () => false,
@@ -178,10 +177,8 @@ for (const source of [
           if (total > 50000) throw new Error("oversized admission must precede cache lookup");
           return null;
         },
-        frontMatterValue: () => undefined,
         bulkFilerPolicyInvalidatesCachedReview: () => false,
         localExactReviewHistoryPath: () => null,
-        stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
       };
       const dependencies = new Proxy(base, {
         get(target, property) {

@@ -1,13 +1,14 @@
 #!/usr/bin/env node
-import { stringOrEmpty as stringValue } from "../value-coerce.js";
-import { escapeRegExp } from "../clawsweeper-text.js";
+import { escapeRegExp } from "../clawsweeper-markdown.js";
 import type { JsonValue, LooseRecord } from "./json-types.js";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { parseArgs } from "./lib.js";
 import { isJsonObject } from "./json-types.js";
-import { readReportFrontMatterField, type FrontMatterField } from "../report-front-matter.js";
+import { frontMatterValue } from "../report-front-matter.js";
+import { reportReviewDecision } from "../report-review-decision.js";
+import { requireReviewRecord, ReviewRecordFormatError } from "../review-record.js";
 import { AUTOMATION_LIMITS, WORKER_CONFIG, workerLimit, type WorkerLane } from "../limits.js";
 import {
   fetchExactReviewQueuePressure,
@@ -289,18 +290,6 @@ async function runCli(): Promise<void> {
       });
       break;
     }
-    case "count-command-actions":
-      console.log(
-        countCommandActions(
-          requiredString("report"),
-          requiredString("action"),
-          optionalString("status"),
-        ),
-      );
-      break;
-    case "count-requeue-required":
-      console.log(countRequeueRequired(requiredString("dir")));
-      break;
     case "limit":
       process.stdout.write(String(automationLimit(optionalString("path") || positionalString(1))));
       break;
@@ -376,16 +365,7 @@ async function runCli(): Promise<void> {
 }
 
 function requiredWorkerLane(value: string): WorkerLane {
-  const allowed = new Set<WorkerLane>([
-    "normal_review",
-    "hot_intake",
-    "repair",
-    "automerge_repair",
-    "issue_implementation",
-    "cluster_repair",
-    "exact_item",
-    "assist",
-  ]);
+  const allowed = new Set<WorkerLane>(["normal_review", "hot_intake", "exact_item", "assist"]);
   if (allowed.has(value as WorkerLane)) return value as WorkerLane;
   throw new Error(`unknown worker lane: ${value}`);
 }
@@ -1166,31 +1146,6 @@ function applyReportHealthSummary(options: {
   return `${base} Attention: ${options.attentionReasons.join(", ")}.`;
 }
 
-export function countCommandActions(reportPath: string, action: string, status = ""): number {
-  const report = readJsonObject(reportPath);
-  const commands: JsonValue[] = Array.isArray(report.commands) ? report.commands : [];
-  const statuses = new Set(
-    status
-      .split(",")
-      .map((value) => value.trim())
-      .filter(Boolean),
-  );
-  return commands
-    .flatMap((command: JsonValue): JsonValue[] =>
-      isJsonObject(command) && Array.isArray(command.actions) ? command.actions : [],
-    )
-    .filter((entry: JsonValue): entry is LooseRecord => isJsonObject(entry))
-    .filter((entry: LooseRecord) => entry.action === action)
-    .filter((entry: LooseRecord) => statuses.size === 0 || statuses.has(String(entry.status)))
-    .length;
-}
-
-export function countRequeueRequired(reportDir: string): number {
-  return resultFiles(reportDir)
-    .flatMap((file) => resultActions(file))
-    .filter((action) => action.requeue_required === true).length;
-}
-
 export function mergeApplyReports(reportDir: string, outputPath: string): void {
   const reports = fs.existsSync(reportDir)
     ? fs
@@ -1377,6 +1332,15 @@ function prioritizeFastCloseCandidates(
   );
 }
 
+function readableReviewDecision(markdown: string) {
+  try {
+    return reportReviewDecision(markdown);
+  } catch (error) {
+    if (!(error instanceof ReviewRecordFormatError)) throw error;
+    return null;
+  }
+}
+
 function selectedProposedItemCandidates(
   options: ProposedItemOptions,
   selection: ProposedItemSelection,
@@ -1410,12 +1374,13 @@ function selectedProposedItemCandidates(
           if (options.itemNumbers && !options.itemNumbers.has(number)) return [];
           const markdown = fs.readFileSync(path.join(itemsDir, name), "utf8");
           if (repoFor(markdown, name) !== options.targetRepo) return [];
-          const type = frontMatterValue(markdown, "type");
+          const type = frontMatterValue(markdown, "type") ?? "";
           if (options.applyKind !== "all" && type && type !== options.applyKind) return [];
-          const decision = frontMatterValue(markdown, "decision");
-          const action = frontMatterValue(markdown, "action_taken");
-          const confidence = frontMatterValue(markdown, "confidence");
-          const reason = frontMatterValue(markdown, "close_reason");
+          const reviewed = readableReviewDecision(markdown);
+          if (!reviewed) return [];
+          const { decision, confidence } = reviewed;
+          const reason = reviewed.closeReason ?? "";
+          const action = frontMatterValue(markdown, "action_taken") ?? "";
           const selectableClose =
             decision === "close" &&
             confidence === "high" &&
@@ -1448,7 +1413,7 @@ function selectedProposedItemCandidates(
           const selectableProofPromotion =
             selectablePromotion &&
             selectedPromotionCloseReasons.includes("duplicate_or_superseded") &&
-            hasLinkedPullRequestSupersessionSignal(markdown, options.targetRepo);
+            hasCanonicalPullRequest(markdown, options.targetRepo);
           if (!selectableClose && !selectablePromotion) return [];
           const prCloseCoverageProofCanRun =
             type === "pull_request" &&
@@ -1470,8 +1435,8 @@ function selectedProposedItemCandidates(
           return [
             {
               number,
-              applyCheckedAt: frontMatterValue(markdown, "apply_checked_at"),
-              reviewedAt: frontMatterValue(markdown, "reviewed_at"),
+              applyCheckedAt: frontMatterValue(markdown, "apply_checked_at") ?? "",
+              reviewedAt: frontMatterValue(markdown, "reviewed_at") ?? "",
               action,
               stage: selectablePromotion
                 ? ("promotion_probe" as const)
@@ -1594,11 +1559,13 @@ function inconsistentOrStaleProposedItemCount(
       if (options.itemNumbers && !options.itemNumbers.has(number)) return false;
       const markdown = fs.readFileSync(path.join(itemsDir, name), "utf8");
       if (repoFor(markdown, name) !== options.targetRepo) return false;
-      const type = frontMatterValue(markdown, "type");
+      const type = frontMatterValue(markdown, "type") ?? "";
       if (options.applyKind !== "all" && type && type !== options.applyKind) return false;
       const action = frontMatterValue(markdown, "action_taken");
       if (action !== "proposed_close" && action !== "retry_pr_close_coverage_proof") return false;
-      const reason = frontMatterValue(markdown, "close_reason");
+      const reviewed = readableReviewDecision(markdown);
+      if (!reviewed) return false;
+      const reason = reviewed.closeReason ?? "";
       if (allowedCloseReasons && !allowedCloseReasons.has(reason)) return false;
       if (
         ALLOWED_CLOSE_REASONS.has(reason) &&
@@ -1769,7 +1736,7 @@ function hasPullRequestClosePromotionSignal(
   return (
     (hasAuthorPrBudgetPromotionSignal(markdown) &&
       olderThan(frontMatterValue(markdown, "item_created_at"), 7 * 24 * 60 * 60 * 1000)) ||
-    hasLinkedPullRequestSupersessionSignal(markdown, targetRepo) ||
+    hasCanonicalPullRequest(markdown, targetRepo) ||
     ((hasRecommendedPauseOrCloseOption(markdown) ||
       hasLowSignalPullRequestPromotionSignal(markdown)) &&
       olderThan(frontMatterValue(markdown, "item_created_at"), options.staleMinAgeMs))
@@ -1781,7 +1748,7 @@ function pullRequestClosePromotionReasons(
   targetRepo: string,
   options: { staleMinAgeMs: number },
 ): Array<"author_pr_budget_exceeded" | "duplicate_or_superseded" | "low_signal_unmergeable_pr"> {
-  const linkedSupersession = hasLinkedPullRequestSupersessionSignal(markdown, targetRepo);
+  const canonicalPullRequest = hasCanonicalPullRequest(markdown, targetRepo);
   const recommendedPauseOrClose = hasRecommendedPauseOrCloseOption(markdown);
   const reasons: Array<
     "author_pr_budget_exceeded" | "duplicate_or_superseded" | "low_signal_unmergeable_pr"
@@ -1792,10 +1759,10 @@ function pullRequestClosePromotionReasons(
   ) {
     reasons.push("author_pr_budget_exceeded");
   }
-  if (linkedSupersession || recommendedPauseOrClose) reasons.push("duplicate_or_superseded");
-  // Pause-or-close is a deterministic duplicate promotion. A linked PR is only
+  if (canonicalPullRequest || recommendedPauseOrClose) reasons.push("duplicate_or_superseded");
+  // Pause-or-close is a deterministic duplicate promotion. A canonical PR is only
   // speculative until live hydration, so an F-rated report can still fall back
-  // to the low-signal promotion when that linked candidate does not cover it.
+  // to the low-signal promotion when that canonical PR does not cover it.
   if (
     !recommendedPauseOrClose &&
     hasLowSignalPullRequestPromotionSignal(markdown) &&
@@ -1806,133 +1773,46 @@ function pullRequestClosePromotionReasons(
   return reasons;
 }
 
-function hasLinkedPullRequestSupersessionSignal(markdown: string, targetRepo: string): boolean {
-  const pullRef = sameRepoPullRequestRefRegex(targetRepo);
-  if (!pullRef) return false;
-  const signal =
-    /\b(supersed(?:e|ed|es|ing)|replace(?:s|d|ment)?|duplicate|duplicated|canonical|covered by|landed in)\b/i;
-  return closePromotionSignalTexts(markdown).some(
-    (text) =>
-      pullRef.test(normalizePullRequestMarkdownLinks(text, targetRepo)) && signal.test(text),
-  );
-}
-
-function normalizePullRequestMarkdownLinks(value: string, targetRepo: string): string {
-  const sameRepoPullRequestUrl = sameRepoPullRequestUrlRegex(targetRepo);
-  if (!sameRepoPullRequestUrl) return value;
-  return value.replace(markdownLinkRegex(), (_link, target: string) =>
-    sameRepoPullRequestUrl.test(target) ? target : " ",
-  );
-}
-
-function markdownLinkRegex(): RegExp {
-  return /\[[^\]\n]{1,200}\]\(([^\s)]{1,1000})\)/gi;
-}
-
-function sameRepoPullRequestUrlRegex(targetRepo: string): RegExp | null {
-  const [owner, repo] = targetRepo.split("/");
-  if (!owner || !repo) return null;
-  const escapedRepo = `${escapeRegExp(owner)}\\/${escapeRegExp(repo)}`;
-  return new RegExp(`^https:\\/\\/github\\.com\\/${escapedRepo}\\/pull\\/\\d+\\b`, "i");
-}
-
-function sameRepoPullRequestRefRegex(targetRepo: string): RegExp | null {
-  const [owner, repo] = targetRepo.split("/");
-  if (!owner || !repo) return null;
-  const escapedRepo = `${escapeRegExp(owner)}\\/${escapeRegExp(repo)}`;
-  return new RegExp(
-    [
-      `https:\\/\\/github\\.com\\/${escapedRepo}\\/pull\\/\\d+\\b`,
-      `(?:^|[^\\w/.-])${escapedRepo}#\\d+\\b`,
-      "(?:^|[^\\w/#-])#\\d+\\b",
-    ].join("|"),
-    "i",
-  );
+// The review model names the covering PR in `root_cause_cluster.canonicalRef`.
+// Report prose never selects a supersession candidate.
+function hasCanonicalPullRequest(markdown: string, targetRepo: string): boolean {
+  const cluster = requireReviewRecord(markdown).decision.rootCauseCluster;
+  const canonicalRef = isJsonObject(cluster) ? cluster.canonicalRef : null;
+  if (typeof canonicalRef !== "string") return false;
+  const canonicalNumber = canonicalRef.match(
+    new RegExp(`^https://github\\.com/${escapeRegExp(targetRepo)}/pull/(\\d+)$`, "i"),
+  )?.[1];
+  return Boolean(canonicalNumber) && canonicalNumber !== frontMatterValue(markdown, "number");
 }
 
 function hasRecommendedPauseOrCloseOption(markdown: string): boolean {
-  return jsonArrayFrontMatter(markdown, "merge_risk_options").some((entry) => {
+  const options = requireReviewRecord(markdown).decision.mergeRiskOptions;
+  return options.some((entry) => {
     if (!isJsonObject(entry)) return false;
     return entry.category === "pause_or_close" && entry.recommended === true;
   });
 }
 
-const PR_RATING_TIER_VALUES = new Set(["S", "A", "B", "C", "D", "F", "NA"]);
-const PROOF_STATUS_VALUES = new Set([
-  "sufficient",
-  "override",
-  "insufficient",
-  "mock_only",
-  "missing",
-  "not_applicable",
-]);
-
-function trustedPromotionValue(
-  markdown: string,
-  key: string,
-  legacySectionValue: string,
-  allowed: ReadonlySet<string>,
-): { invalid: boolean; value: string } {
-  const field = frontMatterField(markdown, key);
-  if (field.status === "ambiguous") return { invalid: true, value: "" };
-  const value = field.status === "value" ? field.value : legacySectionValue;
-  return { invalid: Boolean(value) && !allowed.has(value), value };
-}
-
 function hasLowSignalPullRequestPromotionSignal(markdown: string): boolean {
-  const ratingSection = sectionValue(markdown, "PR Rating");
-  const proofSection = sectionValue(markdown, "Real Behavior Proof");
-  const overallTier = trustedPromotionValue(
-    markdown,
-    "pr_rating_overall",
-    sectionLineValue(ratingSection, "Overall tier"),
-    PR_RATING_TIER_VALUES,
-  );
-  const proofTier = trustedPromotionValue(
-    markdown,
-    "pr_rating_proof",
-    sectionLineValue(ratingSection, "Proof tier"),
-    PR_RATING_TIER_VALUES,
-  );
-  const proofStatus = trustedPromotionValue(
-    markdown,
-    "real_behavior_proof_status",
-    sectionLineValue(proofSection, "Status"),
-    PROOF_STATUS_VALUES,
-  );
-  if (overallTier.invalid || proofTier.invalid || proofStatus.invalid) return false;
+  const { decision } = requireReviewRecord(markdown);
   return (
-    overallTier.value === "F" &&
-    (proofTier.value === "F" ||
-      ["missing", "mock_only", "insufficient"].includes(proofStatus.value))
+    decision.prRating.overallTier === "F" &&
+    (decision.prRating.proofTier === "F" ||
+      ["missing", "mock_only", "insufficient"].includes(decision.realBehaviorProof.status))
   );
 }
 
 function hasAuthorPrBudgetPromotionSignal(markdown: string): boolean {
-  const ratingSection = sectionValue(markdown, "PR Rating");
-  const proofSection = sectionValue(markdown, "Real Behavior Proof");
-  const overallTier = trustedPromotionValue(
-    markdown,
-    "pr_rating_overall",
-    sectionLineValue(ratingSection, "Overall tier"),
-    PR_RATING_TIER_VALUES,
-  );
-  const proofStatus = trustedPromotionValue(
-    markdown,
-    "real_behavior_proof_status",
-    sectionLineValue(proofSection, "Status"),
-    PROOF_STATUS_VALUES,
-  );
-  if (overallTier.invalid || proofStatus.invalid) return false;
+  const { decision } = requireReviewRecord(markdown);
   if (
-    ["S", "A", "B"].includes(overallTier.value) &&
-    ["sufficient", "override"].includes(proofStatus.value)
+    ["S", "A", "B"].includes(decision.prRating.overallTier) &&
+    ["sufficient", "override"].includes(decision.realBehaviorProof.status)
   ) {
     return false;
   }
   return (
-    ["D", "F"].includes(overallTier.value) ||
-    ["missing", "mock_only", "insufficient"].includes(proofStatus.value)
+    ["D", "F"].includes(decision.prRating.overallTier) ||
+    ["missing", "mock_only", "insufficient"].includes(decision.realBehaviorProof.status)
   );
 }
 
@@ -1944,18 +1824,6 @@ export function pullRequestClosePromotionSignalsForTest(markdown: string): {
     authorBudget: hasAuthorPrBudgetPromotionSignal(markdown),
     lowSignal: hasLowSignalPullRequestPromotionSignal(markdown),
   };
-}
-
-function closePromotionSignalTexts(markdown: string): string[] {
-  return [
-    ...stringArrayFrontMatter(markdown, "work_cluster_refs"),
-    ...jsonArrayFrontMatter(markdown, "merge_risk_options").flatMap((entry) =>
-      isJsonObject(entry) ? [stringValue(entry.title), stringValue(entry.body)] : [],
-    ),
-    sectionValue(markdown, "Best Possible Solution"),
-    sectionValue(markdown, "Evidence"),
-    sectionValue(markdown, "Close Comment"),
-  ].filter(Boolean);
 }
 
 export function commentSyncBatchOutput(options: CommentSyncBatchOptions): Record<string, string> {
@@ -2212,7 +2080,9 @@ function applyCheckedAtForItem(targetRepo: string, itemNumber: number): string {
       .readdirSync(dir)
       .find((entry) => /(?:^|[a-z0-9-]-)\d+\.md$/.test(entry) && numberFor(entry) === itemNumber);
     if (!name) continue;
-    return frontMatterValue(fs.readFileSync(path.join(dir, name), "utf8"), "apply_checked_at");
+    return (
+      frontMatterValue(fs.readFileSync(path.join(dir, name), "utf8"), "apply_checked_at") ?? ""
+    );
   }
   return "";
 }
@@ -2310,9 +2180,10 @@ function commentSyncCandidates(
       if (reviewStatus !== "complete" && !failedReview) return [];
       if (!frontMatterValue(markdown, "item_snapshot_hash")) return [];
       const actionTaken = frontMatterValue(markdown, "action_taken");
+      const reviewed = readableReviewDecision(markdown);
+      if (!reviewed) return [];
       if (actionTaken === "skipped_invalid_decision") {
-        const decision = frontMatterValue(markdown, "decision");
-        const closeReason = frontMatterValue(markdown, "close_reason");
+        const { decision, closeReason } = reviewed;
         if (
           decision === "close" &&
           !repositoryProfileFor(targetRepo).applyCloseRules[
@@ -2337,10 +2208,10 @@ function commentSyncCandidates(
         Boolean(storedReviewCommentUrl && !["none", "unknown"].includes(storedReviewCommentUrl));
       const changedDuplicateClose =
         actionTaken === "skipped_changed_since_review" &&
-        frontMatterValue(markdown, "decision") === "close" &&
-        frontMatterValue(markdown, "close_reason") === "duplicate_or_superseded" &&
+        reviewed.decision === "close" &&
+        reviewed.closeReason === "duplicate_or_superseded" &&
         hasStoredReviewComment;
-      const reviewCommentHash = frontMatterValue(markdown, "review_comment_sha256");
+      const reviewCommentHash = frontMatterValue(markdown, "review_comment_sha256") ?? "";
       const invalidReviewCommentHash = !/^[a-f\d]{64}$/i.test(reviewCommentHash);
       const requiresDurableCommentRepair =
         actionTaken === "retry_stale_canonical_comment_sync" ||
@@ -2469,21 +2340,6 @@ function reportsReviewCommentSync(entry: ApplyAction): boolean {
   );
 }
 
-function resultFiles(reportDir: string): string[] {
-  if (!fs.existsSync(reportDir)) return [];
-  return fs
-    .readdirSync(reportDir, { recursive: true })
-    .map((entry) => path.join(reportDir, String(entry)))
-    .filter((candidate) => ["apply-report.json", "result.json"].includes(path.basename(candidate)))
-    .filter((candidate) => fs.statSync(candidate).isFile());
-}
-
-function resultActions(reportPath: string): LooseRecord[] {
-  const parsed = readJsonObject(reportPath);
-  const actions: JsonValue[] = Array.isArray(parsed.actions) ? parsed.actions : [];
-  return actions.filter((action): action is LooseRecord => isJsonObject(action));
-}
-
 function readJsonObject(filePath: string): LooseRecord {
   const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
   if (!isJsonObject(parsed)) throw new Error(`${filePath} must contain a JSON object`);
@@ -2592,47 +2448,6 @@ function checkpointNumber(name: string): number {
   return Number(name.match(/\d+/)?.[0] ?? 0);
 }
 
-function frontMatterField(markdown: string, key: string): FrontMatterField {
-  const field = readReportFrontMatterField(markdown, key);
-  if (field.status !== "value") return field;
-  const value = field.value.trim().replace(/^"|"$/g, "");
-  return value ? { status: "value", value } : { status: "ambiguous" };
-}
-
-function frontMatterValue(markdown: string, key: string): string {
-  const field = frontMatterField(markdown, key);
-  return field.status === "value" ? field.value : "";
-}
-
-function jsonArrayFrontMatter(markdown: string, key: string): JsonValue[] {
-  const raw = frontMatterValue(markdown, key);
-  if (!raw) return [];
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function stringArrayFrontMatter(markdown: string, key: string): string[] {
-  return jsonArrayFrontMatter(markdown, key).filter(
-    (entry): entry is string => typeof entry === "string",
-  );
-}
-
-function sectionValue(markdown: string, heading: string): string {
-  const match = markdown.match(
-    new RegExp(`(?:^|\\n)## ${escapeRegExp(heading)}\\n\\n([\\s\\S]*?)(?=\\n## |\\n?$)`),
-  );
-  return match?.[1]?.trim() ?? "";
-}
-
-function sectionLineValue(markdown: string, key: string): string {
-  const match = markdown.match(new RegExp(`^${escapeRegExp(key)}:\\s*(.+)$`, "m"));
-  return match?.[1]?.trim() ?? "";
-}
-
 function repoFor(markdown: string, name: string): string {
   return (
     frontMatterValue(markdown, "repository") || (/^\d+\.md$/.test(name) ? "openclaw/openclaw" : "")
@@ -2665,9 +2480,9 @@ function allowedForTarget(
   return allowedReasons.has(reason);
 }
 
-function olderThan(iso: string, milliseconds: number): boolean {
+function olderThan(iso: string | undefined, milliseconds: number): boolean {
   if (milliseconds <= 0) return true;
-  const parsed = Date.parse(iso);
+  const parsed = Date.parse(iso ?? "");
   return Number.isFinite(parsed) && Date.now() - parsed > milliseconds;
 }
 

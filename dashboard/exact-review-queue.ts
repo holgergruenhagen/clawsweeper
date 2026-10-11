@@ -1,4 +1,5 @@
 import { stableJson } from "../src/stable-json.ts";
+import { CLAWSWEEPER_APP_BOT_LOGINS } from "../src/clawsweeper-bot-identity.ts";
 import { exactReviewSourceRevisionMaterial } from "./exact-review-source-revision.ts";
 import {
   normalizePublicReviewFailure,
@@ -16,7 +17,6 @@ import {
   type TerminalReviewFailureReason as ExactReviewFailureReason,
 } from "../src/exact-review-failure-reason.ts";
 import { REVIEW_PROOF_RESULT_MAX_BYTES } from "../src/review-proof-limits.ts";
-import { CommandProofRequestStore } from "./command-proof-requests.ts";
 import {
   parseReviewProofLease,
   parseReviewProofRequest,
@@ -44,10 +44,8 @@ import {
   type HostedTargetEligibility,
   type HostedTargetAdmission,
 } from "../src/hosted-target-admission.ts";
-import {
-  clawSweeperCommandAckMarker,
-  renderClawSweeperQueuedAcknowledgement,
-} from "../src/repair/comment-command-text.ts";
+import { renderClawSweeperQueuedAcknowledgement } from "../src/repair/comment-command-text.ts";
+import { commandAckMarker } from "../src/repair/markers.ts";
 import { planCommandAckConvergence } from "../src/repair/command-ack-convergence.ts";
 import type { DirectReReviewDecision } from "../src/repair/direct-re-review-admission.ts";
 import {
@@ -1014,8 +1012,6 @@ export class ExactReviewQueue {
     this.statsComputation = null;
   }
 
-  private readonly commandProofStore: CommandProofRequestStore;
-
   private reviewCoverageCache: { at: number; summary: ReviewCoverageSummary } | null = null;
   // Back off a wedged Bay row without adding durable queue state. Any durable
   // progress clears this single-slot deadline so the one-second drain resumes.
@@ -1051,7 +1047,6 @@ export class ExactReviewQueue {
     this.reviewLoopStore = new ExactReviewReviewLoopStore(this.storage);
     this.githubEgressTelemetryStore = new GithubEgressTelemetryStore(this.storage);
     this.commandIntakeStore = new ExactReviewCommandIntakeStore(this.storage);
-    this.commandProofStore = new CommandProofRequestStore(this.storage);
     this.artifactReceiptStore = new ExactReviewArtifactReceiptStore(
       this.storage,
       env.STATE_SNAPSHOTS,
@@ -1397,25 +1392,6 @@ export class ExactReviewQueue {
           targetBranch: decision.targetBranch,
         },
       });
-    }
-    if (request.method === "POST" && url.pathname.startsWith("/command-proof/")) {
-      const body = objectValue(await request.json().catch(() => null));
-      const now = Date.now();
-      if (url.pathname === "/command-proof/claim") {
-        const result = this.commandProofStore.claim(body.claim, now, body.batch === true);
-        return json({ ok: true, ...result });
-      }
-      if (url.pathname === "/command-proof/pending")
-        return json({ ok: true, records: this.commandProofStore.pending(now) });
-      if (url.pathname === "/command-proof/get" && /^[0-9a-f]{64}$/.test(String(body.requestId))) {
-        const record = this.commandProofStore.get(String(body.requestId));
-        return json({ ok: true, record });
-      }
-      if (url.pathname === "/command-proof/update") {
-        const record = this.commandProofStore.update(body, now);
-        return record ? json({ ok: true, record }) : json({ error: "invalid_proof_update" }, 409);
-      }
-      return json({ error: "invalid_proof_request" }, 400);
     }
     if (request.method === "POST" && url.pathname === "/github-egress-telemetry") {
       const now = Date.now();
@@ -1819,9 +1795,7 @@ export class ExactReviewQueue {
         return json({ error: "manual_publication_admission_disabled" }, 409);
       }
       const scheduledLane = exactReviewScheduledLane(decision);
-      const storesAdmissionReceipt = Boolean(
-        scheduledLane || manualAdmission || decision.sourceAction === "command_proof_result",
-      );
+      const storesAdmissionReceipt = Boolean(scheduledLane || manualAdmission);
       const bodyFingerprintHeader = request.headers.get(
         EXACT_REVIEW_AUTHENTICATED_BODY_FINGERPRINT_HEADER,
       );
@@ -1898,8 +1872,6 @@ export class ExactReviewQueue {
           if (!storedDispositionJson) return { deduped: true as const };
           const disposition = exactReviewScheduledDispositionFromJson(storedDispositionJson);
           if (!disposition) return { deduped: true as const };
-          if ("queued" in disposition && disposition.queued === true)
-            this.commandProofStore.completeAdmittedReviewSync(deliveryId, decision);
           return {
             replayed: true as const,
             disposition,
@@ -2741,7 +2713,6 @@ export class ExactReviewQueue {
               superseded_publications: supersededPublications,
             })
           : null;
-        this.commandProofStore.completeAdmittedReviewSync(deliveryId, decision);
         return {
           deduped: false as const,
           key,
@@ -10266,6 +10237,9 @@ export class ExactReviewQueue {
     const body = objectValue(value);
     const identity = exactReviewLifecycleIdentity(body);
     const receiptId = typeof body.receipt_id === "string" ? body.receipt_id : "";
+    // Publishers send not_required only for the configured scheduled-router
+    // target with execution enabled, whose missed commands have recovery.
+    // Other targets retain dispatch; durable also covers deferred close proof.
     const outcome = body.outcome === undefined ? "durable" : body.outcome;
     if (!identity || !receiptId || (outcome !== "durable" && outcome !== "not_required")) {
       return json({ error: "invalid_lifecycle_router_receipt" }, 400);
@@ -10284,6 +10258,15 @@ export class ExactReviewQueue {
           outcome !== "not_required"
         )
           throw new Error("manual publication router is not required");
+        // A recorded durable receipt already satisfies a not-required handoff.
+        if (
+          outcome === "not_required" &&
+          existing?.routerReceipts.some(
+            (entry) => entry.outcome === "durable" && entry.operationComplete,
+          )
+        ) {
+          return { projection: existing, duplicate: true };
+        }
         const receipt = existing?.routerReceipts.find((entry) => entry.receiptId === receiptId);
         const terminal = existing?.terminalDisposition;
         const result = this.lifecycleProjectionStore.recordRouterReceiptSync({
@@ -11206,6 +11189,17 @@ export class ExactReviewQueue {
           : EXACT_REVIEW_SOURCE_DRIFT_REQUEUE_SOURCE_ACTION,
       supersedesInProgress: true,
     };
+    // The successor is the same automatic source-drift generation that /enqueue
+    // admits, so the same loop breaker applies. Without it, a review whose own
+    // writes keep moving updated_at would requeue itself forever.
+    const loopKey = exactReviewLoopItemKey(decision);
+    const sourceDriftRequeueLimit = exactReviewSourceDriftRequeueLimit(this.env);
+    const sourceDriftLoopCounted =
+      sourceDriftRequeueLimit > 0 && exactReviewSourceDriftLoopCounted(decision);
+    const parksSourceDriftLoop =
+      sourceDriftLoopCounted &&
+      (this.reviewLoopStore.sourceDriftLoopSync(loopKey, now)?.consecutive ?? 0) >=
+        sourceDriftRequeueLimit;
     // This is a new review revision, not a replay of the direct receipt. The
     // old fenced projection retains its requeue terminal fact while the new
     // item receives fresh admission and claim facts when it is dispatched.
@@ -11230,7 +11224,23 @@ export class ExactReviewQueue {
     item.lastFailureReason = undefined;
     clearExactReviewDispatchFailure(item);
     clearExactReviewReviewRecovery(item);
-    Object.assign(item, exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env));
+    if (parksSourceDriftLoop) {
+      // Park the successor as /enqueue does; organic input, commands, and newer
+      // scheduled offers release it through ordinary admission.
+      item.state = "parked";
+      item.parkedReason = "source_drift_loop";
+      item.parkedTerminalCheckedAt = now;
+      item.nextAttemptAt = now;
+      this.reviewLoopStore.markSourceDriftLoopParkedSync(loopKey, now);
+      console.warn("exact-review source-drift loop parked", {
+        event: "source_drift_loop_parked",
+        configured_limit: ordinaryLogCount(sourceDriftRequeueLimit),
+      });
+    } else {
+      Object.assign(item, exactReviewQueueDebouncedAttempt(state, decision, now, now, this.env));
+      if (sourceDriftLoopCounted)
+        this.reviewLoopStore.recordSourceDriftGenerationSync(loopKey, now);
+    }
     advanceExactReviewSourceAuthorityWatermark(item, decision);
     return {
       requeued: true,
@@ -11370,7 +11380,6 @@ export class ExactReviewQueue {
   private async initializeStorage() {
     this.ensureStorageSchemaSync();
     this.commandIntakeStore.ensureSchemaSync();
-    this.commandProofStore.ensureSchemaSync();
     this.batchStore.ensureSchemaSync();
     this.directPublicationStore.ensureSchemaSync();
     this.recordSnapshotStore.ensureSchemaSync();
@@ -17931,7 +17940,7 @@ export async function convergeCommandAcknowledgement(options: {
   sourceCommentId: number;
 }) {
   const token = await options.token;
-  const ackMarker = clawSweeperCommandAckMarker(options.sourceCommentId);
+  const ackMarker = commandAckMarker(options.sourceCommentId);
   const statusMarker = options.decision.commandStatusMarker;
   const trustedBotLogins = exactReviewCommandBotLogins(options.env);
   const trustedAcknowledgement = (comment: Record<string, unknown>) =>
@@ -18040,9 +18049,7 @@ function exactReviewCommandBotLogins(env: Record<string, unknown>) {
     .split(",")
     .map((login) => login.trim().toLowerCase())
     .filter(Boolean);
-  return new Set(
-    configured.length ? configured : ["clawsweeper[bot]", "openclaw-clawsweeper[bot]"],
-  );
+  return new Set(configured.length ? configured : CLAWSWEEPER_APP_BOT_LOGINS);
 }
 
 async function addCommandReaction(options: {

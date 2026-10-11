@@ -1,3 +1,4 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import assert from "node:assert/strict";
 import test from "node:test";
 import { useFakeScanner } from "./agent-input-scan-helpers.ts";
@@ -10,7 +11,6 @@ import {
   renameSync,
   readFileSync,
   realpathSync,
-  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -20,13 +20,24 @@ import { basename, delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  buildLocalRangeReviewForTest,
-  renderReviewCommentFromReport,
-} from "../dist/clawsweeper.js";
+  pullCommitContentRevision,
+  reviewCommentContentRevision,
+} from "../dist/clawsweeper-source-revision.js";
 import { buildPullRequestReviewEvidence, readReviewGit } from "../dist/pr-review-evidence.js";
 import { createLocalRangeReviewer } from "../dist/clawsweeper-local-review.js";
 import { runText, SWEEPER_COMMAND_MAX_BUFFER_BYTES } from "../dist/command.js";
 import { changelogReviewDecision, reviewFinding } from "./helpers.ts";
+
+const buildLocalRangeReviewForTest = createLocalRangeReviewer({
+  run: (command, args, options = {}) =>
+    runText(command, args, {
+      ...options,
+      maxBuffer: SWEEPER_COMMAND_MAX_BUFFER_BYTES,
+      trim: "both",
+    }),
+  pullCommitContentRevision,
+  reviewCommentContentRevision,
+});
 
 const CLI = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
 
@@ -106,9 +117,9 @@ test("buildLocalRangeReview synthesizes a PR item + offline diff from the local 
     }>;
     assert.equal(files.length, 2);
     const byName = (name: string) => files.find((f) => f.filename === name);
-    assert.equal(byName("feature.txt")?.status, "A");
+    assert.equal(byName("feature.txt")?.status, "added");
     assert.match(byName("feature.txt")?.patch ?? "", /\+hello world/);
-    assert.equal(byName("keep.txt")?.status, "M");
+    assert.equal(byName("keep.txt")?.status, "modified");
     assert.match(byName("keep.txt")?.patch ?? "", /\+more/);
     assert.equal(result.context.counts.pullFiles, 2);
     assert.equal(result.context.counts.pullFilesHydrated, 2);
@@ -326,8 +337,8 @@ test(
           },
         );
       const expected = [
-        { filename: "file.txt", status: "M", additions: null, deletions: null },
-        { filename: "second.txt", status: "A", additions: null, deletions: null },
+        { filename: "file.txt", status: "modified", additions: null, deletions: null },
+        { filename: "second.txt", status: "added", additions: null, deletions: null },
       ];
       const assertCompletedReview = (mode: string) => {
         // Actual CLI/report/reload/renderer with fake Codex, scanner, and faulty numstat.
@@ -342,10 +353,11 @@ test(
         assert.ok(stored);
         assert.deepEqual(
           JSON.parse(stored[1]!),
-          expected.map(({ filename, additions, deletions }) => ({
+          expected.map(({ filename, additions, deletions, status }) => ({
             path: filename,
             additions,
             deletions,
+            status,
           })),
         );
         assert.match(report, /^pr_surface_files_truncated: false$/m);
@@ -508,7 +520,7 @@ test("buildLocalRangeReview handles renamed files (new path, non-empty patch, no
     assert.ok(!files.some((f) => f.filename.includes("\t")), "filename must not be tab-joined");
     const renamed = files.find((f) => f.filename === "new-name.txt");
     assert.ok(renamed, "renamed file should appear under its new path");
-    assert.match(renamed?.status ?? "", /^R/);
+    assert.equal(renamed?.status, "renamed");
     assert.match(renamed?.patch ?? "", /FOXTROT/); // patch resolved against the new path
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -572,10 +584,10 @@ test("buildLocalRangeReview distinguishes binary counts, real zeros, and edited 
           { filename: "source.txt", additions: 1, deletions: 0 },
         ],
       );
-      assert.equal(byName("renamed.txt").status, "R100");
+      assert.equal(byName("renamed.txt").status, "renamed");
       assert.equal(byName("renamed.txt").previous_filename, "old.txt");
       assert.match(byName("mode.sh").patch, /old mode 100644\nnew mode 100755/);
-      assert.match(byName("copy.txt").status, /^C/);
+      assert.equal(byName("copy.txt").status, "copied");
       assert.equal(byName("copy.txt").previous_filename, "source.txt");
       assert.match(byName("copy.txt").patch, /copy from source.txt/);
     }
@@ -733,54 +745,6 @@ test("--local-range failure emits one JSON result and removes default scratch", 
     assert.equal(git(dir, "status", "--porcelain"), "");
   } finally {
     rmSync(codexDir, { recursive: true, force: true });
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-test("--local-range proof-binding refusal removes all run-owned scratch", () => {
-  const dir = initRepo();
-  const scratch = mkdtempSync(join(tmpdir(), "lrr-proof-binding-scratch-"));
-  try {
-    writeFileSync(join(dir, "a.txt"), "base\n");
-    git(dir, "add", "a.txt");
-    git(dir, "commit", "-q", "-m", "init");
-    git(dir, "branch", "base-ref");
-    writeFileSync(join(dir, "a.txt"), "base\nfeature\n");
-    git(dir, "add", "a.txt");
-    git(dir, "commit", "-q", "-m", "feat: local range");
-
-    const result = spawnSync(
-      process.execPath,
-      [
-        CLI,
-        "review",
-        "--local-range",
-        "--base",
-        "base-ref",
-        "--target-repo",
-        "openclaw/clawsweeper",
-        "--review-source-action",
-        "command_proof_result",
-        "--result-format",
-        "json",
-      ],
-      {
-        cwd: dir,
-        encoding: "utf8",
-        env: { ...process.env, TMPDIR: scratch },
-        timeout: 30_000,
-      },
-    );
-
-    assert.notEqual(result.status, 0);
-    assert.match(
-      result.stdout,
-      /commanded proof reassessment is missing its exact-subject binding/,
-    );
-    assert.deepEqual(readdirSync(scratch), []);
-    assert.equal(git(dir, "status", "--porcelain"), "");
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });
@@ -1015,13 +979,16 @@ test("--local-range persists whole-range Git statistics beyond every display evi
         expected,
       );
       const renamed = files.find((file) => file.filename === "src/renamed.ts")!;
-      assert.match(String(renamed.status), /^R/);
+      assert.equal(renamed.status, "renamed");
       assert.equal(renamed.previous_filename, "src/old.ts");
       assert.match(String(renamed.patch), /rename from src\/old.ts/);
       assert.match(String(renamed.patch), /-rename line 9\n\+edited final line/);
-      assert.equal(files.find((file) => file.filename === "src/early.ts")?.status, "M");
-      assert.equal(files.find((file) => file.filename === "src/large.ts")?.status, "A");
-      assert.equal(files.find((file) => file.filename === "tests/removed.test.ts")?.status, "D");
+      assert.equal(files.find((file) => file.filename === "src/early.ts")?.status, "modified");
+      assert.equal(files.find((file) => file.filename === "src/large.ts")?.status, "added");
+      assert.equal(
+        files.find((file) => file.filename === "tests/removed.test.ts")?.status,
+        "removed",
+      );
       assert.ok(!files.some((file) => file.filename === "src/reversed.ts"));
     }
     const promptLarge = review.context.pullFiles.find((file) => file.filename === "src/large.ts");
@@ -1040,14 +1007,17 @@ test("--local-range persists whole-range Git statistics beyond every display evi
     assert.equal(evidence.introduced.patchComplete, false);
 
     const report = runReview("numeric");
-    assert.deepEqual(storedFiles(report), expected);
+    assert.deepEqual(
+      storedFiles(report).map(({ status: _status, ...file }) => file),
+      expected,
+    );
     assert.match(report, /^pr_surface_files_truncated: false$/m);
     const comment = renderReviewCommentFromReport(report, "none");
     const total = "| **Total** | **87** | **6087** | **4** | **+6083** |";
     assert.ok(comment.includes(total));
     assert.ok(comment.includes("| Source | 3 | 6003 | 1 | +6002 |"));
     assert.ok(comment.includes("| Tests | 2 | 2 | 3 | -1 |"));
-    assert.match(comment, /Total \+6083 across 87 files/);
+    assert.match(comment, /Total \+6083 across 87 files\. Added test files: 1\./);
     const historyPath = resolve(
       dir,
       git(dir, "rev-parse", "--git-path", "clawsweeper/reviews"),
@@ -1060,7 +1030,7 @@ test("--local-range persists whole-range Git statistics beyond every display evi
     const binaryReport = runReview("binary");
     assert.deepEqual(
       storedFiles(binaryReport).find((file) => file.path === "binary.dat"),
-      { path: "binary.dat", additions: null, deletions: null },
+      { path: "binary.dat", additions: null, deletions: null, status: "added" },
     );
     const binaryComment = renderReviewCommentFromReport(binaryReport, "none");
     assert.match(binaryComment, /PR surface statistics unavailable: complete line counts/);

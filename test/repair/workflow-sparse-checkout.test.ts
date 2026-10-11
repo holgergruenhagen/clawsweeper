@@ -17,8 +17,6 @@ import {
 const REPAIR_RUNTIME_PATHS = [
   ".github/actions/setup-pnpm",
   "config/automation-limits.json",
-  "prompts/pr-close-coverage-proof.md",
-  "schema/clawsweeper-pr-close-coverage-proof.schema.json",
   "package.json",
   "pnpm-lock.yaml",
   "pnpm-workspace.yaml",
@@ -72,12 +70,15 @@ test("checkout audit rejects the early helper sparse checkout from the reverted 
   );
 });
 
-test("every sweep setup-pnpm step follows a full checkout at its action path", () => {
-  const workflow = parse(readText(".github/workflows/sweep.yml")) as {
-    jobs: Record<string, { steps?: CheckoutAuditStep[] }>;
-  };
+test("every review and apply setup-pnpm step follows a full checkout at its action path", () => {
+  const workflows = ["sweep.yml", "review-plan.yml"].map(
+    (file) =>
+      parse(readText(`.github/workflows/${file}`)) as {
+        jobs: Record<string, { steps?: CheckoutAuditStep[] }>;
+      },
+  );
   let audited = 0;
-  for (const [jobName, job] of Object.entries(workflow.jobs)) {
+  for (const [jobName, job] of workflows.flatMap((workflow) => Object.entries(workflow.jobs))) {
     const steps = job.steps ?? [];
     for (const [index, step] of steps.entries()) {
       const actionPath = step.uses?.match(/^\.\/(.*)\.github\/actions\/setup-pnpm$/)?.[1];
@@ -98,24 +99,7 @@ test("every sweep setup-pnpm step follows a full checkout at its action path", (
       );
     }
   }
-  assert.ok(audited > 0, "must audit sweep setup-pnpm consumers");
-});
-
-test("repair planning and execution use a Node runtime accepted by current OpenClaw", () => {
-  const workflow = parse(
-    fs.readFileSync(".github/workflows/repair-cluster-worker.yml", "utf8"),
-  ) as {
-    jobs?: Record<
-      string,
-      { steps?: { id?: unknown; uses?: unknown; with?: Record<string, unknown> }[] }
-    >;
-  };
-  for (const jobName of ["cluster", "execute"]) {
-    const setup = workflow.jobs?.[jobName]?.steps?.find(
-      (step) => step.uses === "./.github/actions/setup-pnpm",
-    );
-    assert.equal(setup?.with?.["node-version"], "24.21.0", `${jobName} runtime`);
-  }
+  assert.ok(audited > 0, "must audit review and apply setup-pnpm consumers");
 });
 
 test("sparse repair build workflows include runtime dependencies", () => {
@@ -215,7 +199,7 @@ test("review jobs upload completed reviews without automatic live proof", () => 
   }
 });
 
-test("historical publication lanes preserve live-proof folding after generation retirement", () => {
+test("publication lanes ignore retired live-proof attachments", () => {
   const publicationSites: string[] = [];
   for (const workflowPath of fs.globSync(".github/workflows/*.yml").sort()) {
     const workflow = parse(fs.readFileSync(workflowPath, "utf8")) as {
@@ -246,29 +230,24 @@ test("historical publication lanes preserve live-proof folding after generation 
         continue;
       }
       if (site === ".github/workflows/exact-review-batch-publish.yml:publish") {
-        assert.match(
+        assert.doesNotMatch(
           fs.readFileSync("scripts/prepare-exact-review-batch.mjs", "utf8"),
           /live-proof-publish-artifacts/,
           site,
         );
         continue;
       }
-      const fold = runs.findIndex((run) => run.includes("live-proof-publish-artifacts"));
-      const publish = runs.findIndex(
-        (run) =>
-          run.includes("repair:publish-event-result") || run.includes("pnpm run apply-artifacts"),
+      assert.ok(
+        runs.every((run) => !run.includes("live-proof-publish-artifacts")),
+        site,
       );
-      assert.ok(fold >= 0 && publish > fold, `${site} must fold live proof before publication`);
     }
   }
   assert.equal(publicationSites.length, 3, JSON.stringify(publicationSites));
 });
 
 test("state-hydrating sparse repair workflows keep hydration dependencies", () => {
-  for (const workflowPath of [
-    ".github/workflows/repair-comment-router.yml",
-    ".github/workflows/spam-scanner.yml",
-  ]) {
+  for (const workflowPath of SPARSE_REPAIR_BUILD_WORKFLOWS) {
     const entries = sourceSparseCheckoutEntries(workflowPath);
     for (const requiredPath of [
       "scripts/hydrate-state.ts",
@@ -285,19 +264,21 @@ test("state-hydrating sparse repair workflows keep hydration dependencies", () =
 });
 
 test("CI and CodeQL avoid fragile lazy promisor checkouts", () => {
-  for (const [workflowPath, jobName] of [
-    [".github/workflows/ci.yml", "check"],
-    [".github/workflows/codeql.yml", "analyze"],
-  ]) {
+  for (const [workflowPath, jobNames] of [
+    [".github/workflows/ci.yml", ["check-fast", "check-tests", "check-coverage"]],
+    [".github/workflows/codeql.yml", ["analyze"]],
+  ] as const) {
     const workflow = parse(readText(workflowPath)) as {
       jobs: Record<string, { steps: Array<{ uses?: string; with?: Record<string, unknown> }> }>;
     };
-    const checkout = workflow.jobs[jobName]!.steps.find((step) =>
-      step.uses?.startsWith("actions/checkout@"),
-    );
-    assert.ok(checkout, `${workflowPath}:${jobName} must check out its source`);
-    assert.equal(checkout.with?.["sparse-checkout"], undefined);
-    assert.equal(checkout.with?.filter, undefined);
+    for (const jobName of jobNames) {
+      const checkout = workflow.jobs[jobName]!.steps.find((step) =>
+        step.uses?.startsWith("actions/checkout@"),
+      );
+      assert.ok(checkout, `${workflowPath}:${jobName} must check out its source`);
+      assert.equal(checkout.with?.["sparse-checkout"], undefined);
+      assert.equal(checkout.with?.filter, undefined);
+    }
   }
 });
 
@@ -323,7 +304,7 @@ test("repair comment router workflow preserves repository dispatch target branch
         /if \[ -n "\$target_branch" \]; then\n\s+args\+=\(--target-branch "\$target_branch"\)\n\s+fi/g,
       ),
     ].length,
-    2,
+    1,
   );
 });
 
@@ -344,11 +325,12 @@ test("repair comment router sparse checkout includes action ledger runtime", () 
 
 test("sweep workflow preserves one claimed target branch through exact review", () => {
   const workflow = readText(".github/workflows/sweep.yml");
+  const planner = readText(".github/workflows/review-plan.yml");
   const dispatchTargetBranchResolver =
     /target_branch="\$\{\{ github\.event_name == 'workflow_dispatch' && github\.event\.inputs\.target_branch \|\| github\.event\.client_payload\.target_branch \|\| 'main' \}\}"/g;
 
-  assert.match(workflow, /target_branch:\n\s+description: "Target repository branch to review"/);
-  assert.equal([...workflow.matchAll(dispatchTargetBranchResolver)].length, 1);
+  assert.match(planner, /target_branch:\n\s+description: "Target repository branch to review"/);
+  assert.equal([...planner.matchAll(dispatchTargetBranchResolver)].length, 1);
   assert.match(
     workflow,
     /CLAIM_TARGET_BRANCH: \$\{\{ fromJSON\(steps\.claim-exact-review-queue\.outputs\.decision\)\.targetBranch \}\}/,

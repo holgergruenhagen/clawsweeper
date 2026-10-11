@@ -1,21 +1,22 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import MarkdownIt from "markdown-it";
 
 import {
   canPatchReviewComment,
-  itemSourceRevisionSha256ForTest,
   isCodexReviewCommentBody,
-  newReviewStartLeaseOwnerForTest,
   parseDecision,
-  renderReviewCommentFromReport,
   renderReviewStartStatusComment,
   reviewAutomationMarkersFromReport,
-  reviewStartLeaseWinnerCommentIdForTest,
   shouldPreserveReviewStartLease,
   withReviewStartStatusLease,
 } from "../dist/clawsweeper.js";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
+import { postReviewStartStatusComment } from "../dist/clawsweeper-review-comment-leases.js";
 import { issueSourceRevisionSha256 } from "../dist/repair/issue-source-guard.js";
 import {
   closeDecision,
@@ -24,21 +25,18 @@ import {
   prRatingReportSection,
   realBehaviorProofReportSection,
   reviewReportFrontMatter as reportFrontMatter,
+  withMockGh,
+  withReviewRecord,
 } from "./helpers.ts";
-import { nextStepFromReport } from "../dist/clawsweeper-next-step.js";
-import { createRepositoryLinks } from "../dist/clawsweeper-links.js";
-import { createReportDocumentRendering } from "../dist/clawsweeper-report-document.js";
-import { createReportContextRendering } from "../dist/clawsweeper-report-context.js";
-import { createDashboardPresentation } from "../dist/clawsweeper-dashboard.js";
-import { createReportParser } from "../dist/clawsweeper-report-parser.js";
-import { createRecordMetadata } from "../dist/clawsweeper-record-metadata.js";
-import { createReportHelpers } from "../dist/clawsweeper-report-helpers.js";
-import { normalizeRepo, repositoryProfileFor } from "../dist/repository-profiles.js";
+import { readReviewRecord } from "../dist/review-record.js";
+import * as document from "../dist/clawsweeper-report-document.js";
+import { withGitHubRun } from "../dist/clawsweeper-github-runtime.js";
 import type {
   Decision,
   DecisionKind,
   Evidence,
   NextStepAssessment,
+  ReviewStartStatusCommentResult,
 } from "../dist/clawsweeper-types.js";
 
 function markdownLinkDestinations(markdown: string): Set<string> {
@@ -68,52 +66,13 @@ test("Markdown destination assertions reject prose and lookalike links inside de
   );
 });
 
-const evidenceLinks = createRepositoryLinks({
-  reportRepo: "openclaw/clawsweeper-state",
-  normalizeRepo,
-  targetRepo: () => "openclaw/openclaw",
-  targetProfile: () => repositoryProfileFor("openclaw/openclaw"),
-});
-const evidenceParser = createReportParser({
-  ...evidenceLinks,
-  ...createRecordMetadata({} as never),
-  ...createReportHelpers({
-    OWNED_REVIEW_SECTION_HEADINGS: new Set(),
-    parseBacktickLocation: () => null,
-  }),
-  markdownRepository: () => "openclaw/openclaw",
-  evidenceEntry: (entry) => ({
-    repo: null,
-    file: null,
-    line: null,
-    command: null,
-    sha: null,
-    ...entry,
-  }),
-} as Parameters<typeof createReportParser>[0]);
-
 function evidenceReport(
   evidence: Evidence[],
   decisionKind: DecisionKind = "close",
   nextStep?: NextStepAssessment,
   overrides: Partial<Decision> = {},
 ) {
-  const document = createReportDocumentRendering({
-    ...evidenceLinks,
-    ...createReportContextRendering({} as never),
-    ...createDashboardPresentation({} as never),
-    prSurfaceFilesFromContext: () => [],
-    compactPullFilePaths: () => [],
-    confidenceText: String,
-    fixedInText: () => "unknown",
-    formatTimestamp: String,
-    labelJustificationsMarkdown: () => "- none",
-    publicLikelyOwnerRole: String,
-    pullHeadShaFromContext: () => "c".repeat(40),
-    reviewStructuralPullStateFromContext: () => null,
-    sentence: String,
-    sha256: () => "synthetic-digest",
-  } as Parameters<typeof createReportDocumentRendering>[0]);
+  const { regressionProvenance, ...modelOverrides } = overrides;
   return document.markdownFor({
     item: item({ kind: "pull_request", url: "https://github.com/openclaw/openclaw/pull/123" }),
     decision: {
@@ -123,13 +82,19 @@ function evidenceReport(
           decision: decisionKind,
           closeReason: decisionKind === "close" ? "implemented_on_main" : "none",
           ...(nextStep === undefined ? {} : { nextStep }),
-          ...overrides,
+          ...modelOverrides,
         }),
       ),
       // The host stamps checkout access after parsing model output.
       localCheckoutAccess: "verified",
+      ...(regressionProvenance === undefined ? {} : { regressionProvenance }),
     },
-    context: { issue: {}, comments: [], timeline: [] },
+    context: {
+      issue: {},
+      comments: [],
+      timeline: [],
+      pullRequest: { head: { sha: "c".repeat(40) } },
+    },
     git: { mainSha: "a".repeat(40), latestRelease: null, releaseStateComplete: true },
     action: { actionTaken: decisionKind === "close" ? "proposed_close" : "kept_open" },
     reviewMode: "propose",
@@ -143,41 +108,44 @@ function evidenceReport(
 }
 
 function nextStepReport(
-  metadata: Record<string, string> = {},
+  overrides: Partial<Decision> = {},
+  metadata: Record<string, string | undefined> = {},
   sections = "",
-  reason = "No concrete repair remains after this review.",
 ) {
-  return `${reportFrontMatter({
-    type: "pull_request",
-    number: "123",
-    review_status: "complete",
-    local_checkout_access: "verified",
-    author_association: "MEMBER",
-    work_candidate: "none",
-    pull_head_sha: "c".repeat(40),
-    ...metadata,
-  })}
-## Summary
-
-The retry guard is ready for review.
-
-## What This Changes
-
-Keeps retry ownership bounded.
-
-${prRatingReportSection()}
-
-${realBehaviorProofReportSection()}
-
-## Work Candidate
-
-Candidate: none
-
-Reason: ${reason}
-
-${sections.includes("## Review Findings") ? "" : "## Review Findings\n\nOverall correctness: patch is correct\n\nFull review comments:\n\n- none"}
-
-${sections}`;
+  return withReviewRecord(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "123",
+      review_status: "complete",
+      local_checkout_access: "verified",
+      author_association: "MEMBER",
+      work_candidate: "none",
+      pull_head_sha: "c".repeat(40),
+      ...metadata,
+    })}\n${sections}`,
+    {
+      decision: "keep_open",
+      closeReason: "none",
+      summary: "The retry guard is ready for review.",
+      changeSummary: "Keeps retry ownership bounded.",
+      overallCorrectness: "patch is correct",
+      nextStep: { kind: "none", text: "" },
+      prRating: {
+        proofTier: "B",
+        patchTier: "B",
+        overallTier: "B",
+        summary: "Ready for review.",
+        nextSteps: [],
+      },
+      realBehaviorProof: {
+        status: "sufficient",
+        evidenceKind: "terminal",
+        needsContributorAction: false,
+        summary: "The retry guard was exercised directly.",
+      },
+      ...overrides,
+    },
+  );
 }
 
 function publicSection(comment: string, title: string): string {
@@ -189,61 +157,87 @@ function publicSection(comment: string, title: string): string {
   );
 }
 
-test("explicit next-step none removes the false repair checkbox and updates readiness", () => {
-  const legacy = nextStepReport();
-  const report = nextStepReport({ next_step: JSON.stringify({ kind: "none", text: "" }) });
+function readyNextStepReport(nextStep?: NextStepAssessment): string {
+  return evidenceReport([], "keep_open", nextStep, {
+    overallCorrectness: "patch is correct",
+    prRating: {
+      proofTier: "B",
+      patchTier: "B",
+      overallTier: "B",
+      summary: "The retry guard is ready for review.",
+      nextSteps: [],
+    },
+    realBehaviorProof: {
+      status: "sufficient",
+      evidenceKind: "terminal",
+      needsContributorAction: false,
+      summary: "The retry guard was exercised directly.",
+    },
+  });
+}
+
+test("a report without a typed next step fails closed; explicit none is ready", () => {
+  const legacy = readyNextStepReport();
+  const report = readyNextStepReport({ kind: "none", text: "" });
   const before = renderReviewCommentFromReport(legacy, "none");
   const after = renderReviewCommentFromReport(report, "none");
-  assert.match(before, /Complete next step.*No concrete repair remains after this review\./);
+  assert.match(
+    publicSection(before, "Before merge"),
+    /^- \[ \] \*\*Run a fresh ClawSweeper review\*\* - This review report has no valid next-step record\./,
+  );
+  assert.doesNotMatch(before, /Complete next step|No concrete repair remains/);
   assert.match(before, /1 item remains/);
+  assert.match(reviewAutomationMarkersFromReport(legacy), /clawsweeper-review-state:blocked/);
   assert.equal(publicSection(after, "Before merge"), "None.");
-  assert.doesNotMatch(after, /Complete next step|1 item remains/);
+  assert.doesNotMatch(after, /Run a fresh ClawSweeper review|1 item remains/);
   assert.equal(publicSection(after, "Review scores"), publicSection(before, "Review scores"));
   assert.match(reviewAutomationMarkersFromReport(report), /clawsweeper-review-state:ready/);
-  assert.match(reviewAutomationMarkersFromReport(legacy), /clawsweeper-review-state:needs-changes/);
   for (const comment of [before, after]) {
-    assert.match(comment, /clawsweeper-verdict:needs-human/);
     assert.doesNotMatch(comment, /clawsweeper-verdict:pass/);
   }
 });
 
-test("explicit required actions bypass prose heuristics even for human-owned workCandidate none", () => {
+test("a required next step is one Before-merge item without a priority, whatever its wording", () => {
   for (const text of [
     "No schema change is needed, but repair the retry guard before merge.",
     "Do not merge until the owner approves the compatibility contract.",
     "Owner approval.",
     "Wait for CI and ordinary maintainer review.",
     "A decision on ownership is still outstanding.",
+    "A data loss outage is possible.",
   ]) {
-    const report = nextStepReport({ next_step: JSON.stringify({ kind: "required", text }) });
+    const report = readyNextStepReport({ kind: "required", text });
     const comment = renderReviewCommentFromReport(report, "none");
-    assert.ok(publicSection(comment, "Before merge").includes(text), text);
-    assert.equal(
-      (publicSection(comment, "Before merge").match(/^- \[ \]/gm) ?? []).length,
-      1,
-      text,
-    );
+    const beforeMerge = publicSection(comment, "Before merge");
+    assert.ok(beforeMerge.includes(`- [ ] **Complete next step** - ${text}`), text);
+    assert.equal((beforeMerge.match(/^- \[ \]/gm) ?? []).length, 1, text);
     assert.match(comment, /1 item remains/);
-    assert.equal(
+    assert.match(
       reviewAutomationMarkersFromReport(report),
-      reviewAutomationMarkersFromReport(nextStepReport()),
+      /clawsweeper-review-state:needs-changes/,
+      text,
     );
   }
 });
 
-test("canonical next-step report round-trip preserves explicit intent and legacy absence", () => {
+test("canonical next-step report round-trip preserves explicit intent and absent intent", () => {
   for (const nextStep of [
     undefined,
     { kind: "none", text: "" },
     { kind: "required", text: "Owner approval." },
   ] as const) {
     const report = evidenceReport([], "keep_open", nextStep);
-    assert.deepEqual(nextStepFromReport(report), nextStep);
+    assert.deepEqual(readReviewRecord(report)?.decision.nextStep, nextStep);
     if (nextStep === undefined) assert.doesNotMatch(report, /^next_step:/m);
     else assert.ok(report.split("\n---")[0]!.includes(`next_step: ${JSON.stringify(nextStep)}`));
     const comment = renderReviewCommentFromReport(report, "none");
+    if (nextStep === undefined)
+      assert.match(publicSection(comment, "Before merge"), /Run a fresh ClawSweeper review/);
     if (nextStep?.kind === "none")
-      assert.doesNotMatch(publicSection(comment, "Before merge"), /Complete next step/);
+      assert.doesNotMatch(
+        publicSection(comment, "Before merge"),
+        /Complete next step|Run a fresh ClawSweeper review/,
+      );
     if (nextStep?.kind === "required")
       assert.match(publicSection(comment, "Before merge"), /Owner approval\./);
   }
@@ -334,66 +328,39 @@ test("accepted labeled risk survives decision and report parsing without reopeni
   assert.doesNotMatch(independent, /clawsweeper-review-state:ready/);
 });
 
-test("absent, malformed, duplicate and spoofed next-step metadata cannot suppress legacy action", () => {
-  const none = 'next_step: {"kind":"none","text":""}';
-  const legacy = nextStepReport({}, "", "Repair the retry guard before merge.");
-  const reports = [
-    legacy,
-    ...[
-      "none",
-      "null",
-      "{}",
-      '{"kind":"required","text":""}',
-      '{"kind":"none","text":"Repair it."}',
-      '{"kind":"none","text":"","extra":true}',
-      '{"kind":"required","kind":"none","text":""}',
-      '{"kind":"none","text":"Repair it.","text":""}',
-      "{broken",
-    ].map((value) => legacy.replace("---\n", `---\nnext_step: ${value}\n`)),
-    legacy.replace("---\n", `---\n${none}\n"next_step": {"kind":"required","text":"Repair it."}\n`),
-    legacy.replace(
-      "---\n",
-      `---\n${none}\n"next\\u005fstep": {"kind":"required","text":"Repair it."}\n`,
-    ),
-    legacy.replace("---\n", `---\n${none}\n  text: malformed continuation\n`),
-    legacy.replace("---\n", `---\n\`\`\`json\n${none}\n\`\`\`\n`),
-    `${legacy}\n${none}\n`,
-    `${legacy}\n\`\`\`yaml\n---\n${none}\n---\n\`\`\`\n`,
-    `${legacy}\n---\n${none}\n---\n`,
+test("legacy next-step fields cannot supply or override typed review intent", () => {
+  const required = { kind: "required", text: "Owner approval." } as const;
+  const canonical = evidenceReport([], "keep_open", required);
+  const withoutRecord = canonical.replace(/^review_record:.*\n/m, "");
+  const misleadingFields = [
+    'next_step: {"kind":"none","text":""}',
+    "next_step: {broken",
+    'next_step: {"kind":"none","text":""}\nnext_step: {"kind":"required","text":"Repair it."}',
+    '"next_step": {"kind":"none","text":""}',
   ];
-  for (const report of reports) {
-    assert.equal(nextStepFromReport(report), undefined, report);
-    const comment = renderReviewCommentFromReport(report, "none");
+  for (const field of misleadingFields) {
+    const report = canonical.replace(/^next_step:.*$/m, field);
+    assert.deepEqual(readReviewRecord(report)?.decision.nextStep, required);
     assert.match(
-      publicSection(comment, "Before merge"),
-      /Repair the retry guard before merge\./,
-      report.split("\n---")[0],
+      publicSection(renderReviewCommentFromReport(report, "none"), "Before merge"),
+      /Owner approval\./,
     );
-    assert.match(comment, /1 item remains/);
+    const missing = withoutRecord.replace(/^next_step:.*$/m, field);
+    assert.throws(
+      () => renderReviewCommentFromReport(missing, "none"),
+      /review_record: missing record/,
+    );
+    assert.throws(
+      () => reviewAutomationMarkersFromReport(missing),
+      /review_record: missing record/,
+    );
   }
-  for (const ambiguous of [
-    legacy.replace("---\n", `---\n${none}\n${none}\n`),
-    legacy.replace("---\n", `---\n${none}\nnext_step : {"kind":"required","text":"Repair it."}\n`),
-    `${legacy.replace("---\n", `---\n${none}\n`)}\n---\n${none}\n---\n`,
-  ]) {
-    assert.equal(nextStepFromReport(ambiguous), undefined);
-    const comment = renderReviewCommentFromReport(ambiguous, "none");
-    assert.match(comment, /Regenerate malformed review report/);
-    assert.match(comment, /clawsweeper-review-state:blocked/);
-    assert.doesNotMatch(comment, /clawsweeper-verdict:pass|clawsweeper-action:fix-required/);
-  }
-  const required = { kind: "required", text: "Owner approval." };
-  const canonical = nextStepReport({ next_step: JSON.stringify(required) });
-  const withExample = `${canonical}\n\`\`\`yaml\n---\n${none}\n---\n\`\`\`\n`;
-  assert.deepEqual(nextStepFromReport(withExample), required);
-  assert.match(
-    publicSection(renderReviewCommentFromReport(withExample, "none"), "Before merge"),
-    /Owner approval\./,
-  );
+  const withExample = `${canonical}\n\`\`\`yaml\n---\nnext_step: {"kind":"none","text":""}\n---\n\`\`\`\n`;
+  assert.deepEqual(readReviewRecord(withExample)?.decision.nextStep, required);
 });
 
 test("explicit none leaves independent blockers, decision counts and low ratings intact", () => {
-  const decision = {
+  const decision: Decision["maintainerDecision"] = {
     required: true,
     kind: "product_direction",
     question: "Which compatibility contract should ship?",
@@ -409,77 +376,95 @@ test("explicit none leaves independent blockers, decision counts and low ratings
     likelyOwner: { person: "@owner", reason: "Owns the contract.", confidence: "high" },
   };
   const cases: {
+    decision?: Partial<Decision>;
     metadata?: Record<string, string>;
     sections?: string;
     label: string;
     count?: number;
   }[] = [
     {
-      sections:
-        "## Review Findings\n\nOverall correctness: patch is incorrect\n\nFull review comments:\n\n- **[P1] Retry race:** `src/retry.ts:12`\n  - body: Repair concurrent retry handling.\n  - confidence: 0.9",
+      decision: {
+        overallCorrectness: "patch is incorrect",
+        reviewFindings: [
+          {
+            title: "Retry race",
+            body: "Repair concurrent retry handling.",
+            priority: 1,
+            confidenceScore: 0.9,
+            file: "src/retry.ts",
+            lineStart: 12,
+            lineEnd: 12,
+          },
+        ],
+      },
       label: "Retry race",
     },
     {
-      sections:
-        "## Security Review\n\nStatus: needs_attention\n\nSummary: Confirm ownership.\n\nConcerns:\n\n- **[high] Ownership boundary:** `src/retry.ts:12`\n  - body: Restore the authorization guard.\n  - confidence: 0.9",
+      decision: {
+        securityReview: {
+          status: "needs_attention",
+          summary: "Confirm ownership.",
+          concerns: [
+            {
+              title: "Ownership boundary",
+              body: "Restore the authorization guard.",
+              severity: "high",
+              confidenceScore: 0.9,
+              file: "src/retry.ts",
+              line: 12,
+            },
+          ],
+        },
+      },
       label: "Resolve security concern",
     },
     {
-      sections: "## Risks / Open Questions\n\n- [P1] Repair the compatibility break before merge.",
+      decision: { risks: ["Repair the compatibility break before merge."] },
       label: "Resolve merge risk",
     },
     {
-      metadata: {
-        real_behavior_proof_status: "missing",
-        real_behavior_proof_evidence_kind: "none",
-        real_behavior_proof_needs_contributor_action: "true",
-        author_association: "NONE",
+      decision: {
+        realBehaviorProof: {
+          status: "missing",
+          evidenceKind: "none",
+          needsContributorAction: true,
+          summary: "No real behavior proof.",
+        },
       },
+      metadata: { author_association: "NONE" },
       label: "Add real behavior proof",
     },
+    { decision: { maintainerDecision: decision }, label: "Decision needed" },
     {
-      sections: "## Live Proof\n\n<!-- clawsweeper-live-verification -->\nResult: invalid",
-      label: "Resolve historical verification",
-    },
-    { metadata: { maintainer_decision: JSON.stringify(decision) }, label: "Decision needed" },
-    {
-      metadata: { pr_rating_patch: "D", pr_rating_proof: "A", pr_rating_overall: "D" },
+      decision: {
+        prRating: {
+          patchTier: "D",
+          proofTier: "A",
+          overallTier: "D",
+          summary: "Patch needs work.",
+          nextSteps: [],
+        },
+      },
       label: "Improve patch quality",
     },
     { metadata: { review_status: "failed" }, label: "Retry ClawSweeper review", count: 0 },
   ];
   for (const scenario of cases) {
-    const legacy = nextStepReport(scenario.metadata, scenario.sections, "None.");
-    const report = legacy.replace("---\n", '---\nnext_step: {"kind":"none","text":""}\n');
-    const before = renderReviewCommentFromReport(legacy, "none");
-    const after = renderReviewCommentFromReport(report, "none");
-    assert.ok(after.includes(scenario.label), scenario.label);
-    assert.doesNotMatch(publicSection(after, "Before merge"), /Complete next step/);
-    if (scenario.count !== 0) assert.match(after, /1 item remains/, scenario.label);
-    assert.equal(
-      publicSection(after, "Before merge"),
-      publicSection(before, "Before merge"),
-      scenario.label,
+    const report = nextStepReport(scenario.decision, scenario.metadata, scenario.sections);
+    assert.deepEqual(readReviewRecord(report)?.decision.nextStep, { kind: "none", text: "" });
+    const comment = renderReviewCommentFromReport(report, "none");
+    assert.ok(comment.includes(scenario.label), scenario.label);
+    assert.doesNotMatch(
+      publicSection(comment, "Before merge"),
+      /Complete next step|Run a fresh ClawSweeper review/,
     );
-    assert.equal(
-      publicSection(after, "Review scores"),
-      publicSection(before, "Review scores"),
-      scenario.label,
-    );
-    assert.equal(
-      reviewAutomationMarkersFromReport(report),
-      reviewAutomationMarkersFromReport(legacy),
-      scenario.label,
-    );
+    if (scenario.count !== 0) assert.match(comment, /1 item remains/, scenario.label);
   }
-  const withDecision = nextStepReport({
-    maintainer_decision: JSON.stringify(decision),
-    next_step: JSON.stringify({
-      kind: "required",
-      text: "Record the owner decision in the PR body.",
-    }),
+  const report = nextStepReport({
+    maintainerDecision: decision,
+    nextStep: { kind: "required", text: "Record the owner decision in the PR body." },
   });
-  const comment = renderReviewCommentFromReport(withDecision, "none");
+  const comment = renderReviewCommentFromReport(report, "none");
   assert.match(publicSection(comment, "Before merge"), /Record the owner decision/);
   assert.match(comment, /2 items remain/);
 });
@@ -494,7 +479,7 @@ const dependencyEvidence = {
   command: "git show 78c290807ce7:codex-rs/core/config.schema.json",
 };
 
-test("repository evidence survives structured decision, report, parse and both comment paths", () => {
+test("repository evidence survives structured decisions, records and both comment paths", () => {
   const source = `https://github.com/openai/codex/blob/${dependencyEvidence.sha}/${dependencyEvidence.file}#L5668`;
   const commit = `https://github.com/openai/codex/commit/${dependencyEvidence.sha}`;
   const entries = [
@@ -546,7 +531,7 @@ test("repository evidence survives structured decision, report, parse and both c
         },
       ];
       const report = evidenceReport(withDependencyVision, kind);
-      assert.deepEqual(evidenceParser.reportEvidence(report), withDependencyVision);
+      assert.deepEqual(readReviewRecord(report)?.decision.evidence, withDependencyVision);
       const comment = renderReviewCommentFromReport(
         report,
         kind === "close" ? "implemented_on_main" : "none",
@@ -591,20 +576,9 @@ test("repository evidence survives structured decision, report, parse and both c
   }
 });
 
-test("explicit GitHub destinations preserve full identity and historical same-repo reports stay readable", () => {
+test("explicit GitHub destinations preserve full identity", () => {
   const source = `https://github.com/openai/codex/blob/${dependencyEvidence.sha}/${dependencyEvidence.file}#L5668`;
   const commit = `https://github.com/openai/codex/commit/${dependencyEvidence.sha}`;
-  const report = `${reportFrontMatter()}\n## Evidence\n\n- **dependency:** Verified source.\n  - file: [${dependencyEvidence.file}:5668](${source})\n  - sha: [78c290807ce7](${commit})\n`;
-  assert.deepEqual(evidenceParser.reportEvidence(report)[0], {
-    ...dependencyEvidence,
-    label: "dependency",
-    detail: "Verified source.",
-    command: null,
-  });
-  const legacy = `${reportFrontMatter()}\n## Evidence\n\n- **target:** Historical location.\n  - file: [src/config.ts:12](https://github.com/openclaw/openclaw/blob/${"a".repeat(40)}/src/config.ts#L12)\n  - sha: [aaaaaaaaaaaa](https://github.com/openclaw/openclaw/commit/${"a".repeat(40)})\n`;
-  assert.equal(evidenceParser.reportEvidence(legacy)[0].repo, "openclaw/openclaw");
-  const bareLegacy = `${reportFrontMatter()}\n## Evidence\n\n- **target:** Historical path without a destination.\n  - file: \`src/config.ts:12\`\n  - sha: \`${"a".repeat(40)}\`\n`;
-  assert.equal(evidenceParser.reportEvidence(bareLegacy)[0].repo, "openclaw/openclaw");
   for (const kind of ["close", "keep_open"] as const) {
     const explicit = evidenceReport(
       [{ ...dependencyEvidence, repo: null, file: source, line: null, sha: commit }],
@@ -617,12 +591,6 @@ test("explicit GitHub destinations preserve full identity and historical same-re
     const destinations = markdownLinkDestinations(comment);
     assert.ok(destinations.has(source));
     assert.ok(destinations.has(commit));
-    assert.ok(markdownLinkDestinations(renderReviewCommentFromReport(report, "none")).has(source));
-    assert.ok(
-      markdownLinkDestinations(renderReviewCommentFromReport(legacy, "none")).has(
-        `https://github.com/openclaw/openclaw/commit/${"a".repeat(40)}`,
-      ),
-    );
   }
 });
 
@@ -644,8 +612,6 @@ test("unresolved evidence and conflicting destinations never acquire target link
   for (const entry of cases) {
     for (const kind of ["close", "keep_open"] as const) {
       const report = evidenceReport([{ ...dependencyEvidence, ...entry }], kind);
-      const parsed = evidenceParser.reportEvidence(report)[0];
-      assert.equal(parsed.repo, null, JSON.stringify(entry));
       const comment = renderReviewCommentFromReport(
         report,
         kind === "close" ? "implemented_on_main" : "none",
@@ -687,7 +653,38 @@ test("unresolved evidence and conflicting destinations never acquire target link
   );
 });
 
-function implementedCloseReport(overrides = {}) {
+function typedRendererReport(report: string, overrides: Partial<Decision> = {}): string {
+  const { regressionProvenance, ...model } = overrides;
+  const typed = withReviewRecord(report, {
+    decision: "keep_open",
+    closeReason: "none",
+    nextStep: { kind: "none", text: "" },
+    overallCorrectness: "patch is correct",
+    prRating: {
+      proofTier: "B",
+      patchTier: "B",
+      overallTier: "B",
+      summary: "Ready for review.",
+      nextSteps: [],
+    },
+    realBehaviorProof: {
+      status: "sufficient",
+      evidenceKind: "terminal",
+      needsContributorAction: false,
+      summary: "The behavior was exercised directly.",
+    },
+    ...model,
+  });
+  if (regressionProvenance === undefined) return typed;
+  const record = readReviewRecord(typed)!;
+  record.decision.regressionProvenance = regressionProvenance;
+  return typed.replace(
+    /^review_record:.*$/m,
+    () => `review_record: ${JSON.stringify({ version: 1, ...record })}`,
+  );
+}
+
+function implementedCloseReport(overrides = {}, decision: Partial<Decision> = {}) {
   const frontmatter = {
     repository: "openclaw/clawsweeper",
     number: 321,
@@ -714,40 +711,150 @@ function implementedCloseReport(overrides = {}) {
     fixed_at: "2026-05-01T02:00:00Z",
     ...overrides,
   };
-  return [
-    "---",
-    ...Object.entries(frontmatter).map(([key, value]) => key + ": " + value),
-    "---",
-    "",
-    "## Evidence",
-    "",
-    "- **main fix:** git show confirms current main has the replacement implementation and it is not in the latest release yet",
-    "  - file: [src/clawsweeper.ts](https://github.com/openclaw/clawsweeper/blob/1234567890abcdef1234567890abcdef12345678/src/clawsweeper.ts)",
-    "  - sha: [1234567890ab](https://github.com/openclaw/clawsweeper/commit/1234567890abcdef1234567890abcdef12345678)",
-    "",
-    "## Close Comment",
-    "",
-    "Closing this because the requested behavior is already on main.",
-    "",
-  ].join("\n");
+  return typedRendererReport(
+    [
+      "---",
+      ...Object.entries(frontmatter).map(([key, value]) => key + ": " + value),
+      "---",
+      "",
+      "## Evidence",
+      "",
+      "- **main fix:** git show confirms current main has the replacement implementation and it is not in the latest release yet",
+      "  - file: [src/clawsweeper.ts](https://github.com/openclaw/clawsweeper/blob/1234567890abcdef1234567890abcdef12345678/src/clawsweeper.ts)",
+      "  - sha: [1234567890ab](https://github.com/openclaw/clawsweeper/commit/1234567890abcdef1234567890abcdef12345678)",
+      "",
+      "## Close Comment",
+      "",
+      "Closing this because the requested behavior is already on main.",
+      "",
+    ].join("\n"),
+    {
+      decision: "close",
+      closeReason: "implemented_on_main",
+      closeComment: "Closing this because the requested behavior is already on main.",
+      fixedSha: "1234567890abcdef1234567890abcdef12345678",
+      fixedAt: "2026-05-01T02:00:00Z",
+      evidence: [
+        {
+          repo: "openclaw/clawsweeper",
+          label: "main fix",
+          detail:
+            "git show confirms current main has the replacement implementation and it is not in the latest release yet",
+          file: "src/clawsweeper.ts",
+          line: null,
+          sha: "1234567890abcdef1234567890abcdef12345678",
+          command: null,
+        },
+      ],
+      ...decision,
+    },
+  );
 }
 
-test("GitHub workflow review leases use a recoverable run identity", () => {
-  assert.equal(
-    newReviewStartLeaseOwnerForTest(
-      { GITHUB_RUN_ID: "29083888985", GITHUB_RUN_ATTEMPT: "2" },
-      () => "random-owner",
-    ),
-    "github-run-29083888985-2",
-  );
-  assert.equal(
-    newReviewStartLeaseOwnerForTest(
-      { GITHUB_RUN_ID: "29083888985", GITHUB_RUN_ATTEMPT: "invalid" },
-      () => "random-owner",
-    ),
-    "random-owner",
-  );
+test("lease acquisition ignores spoofed contenders and records a recoverable run identity", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-lease-owner-"));
+  const previousRunId = process.env.GITHUB_RUN_ID;
+  const previousRunAttempt = process.env.GITHUB_RUN_ATTEMPT;
+  try {
+    process.env.GITHUB_RUN_ID = "29083888985";
+    for (const attempt of ["2", "invalid"]) {
+      process.env.GITHUB_RUN_ATTEMPT = attempt;
+      const result = acquireFixtureLease(root, false);
+      assert.equal(result.status, "posted");
+      assert.ok(result.lease);
+      if (attempt === "2") assert.equal(result.lease.owner, "github-run-29083888985-2");
+      else assert.match(result.lease.owner, /^[0-9a-f-]{36}$/);
+      assert.equal(result.lease.commentId, 200);
+      assert.match(
+        String(result.lease.comment?.body),
+        new RegExp(`owner=${result.lease.owner}\\b`),
+      );
+    }
+  } finally {
+    if (previousRunId === undefined) delete process.env.GITHUB_RUN_ID;
+    else process.env.GITHUB_RUN_ID = previousRunId;
+    if (previousRunAttempt === undefined) delete process.env.GITHUB_RUN_ATTEMPT;
+    else process.env.GITHUB_RUN_ATTEMPT = previousRunAttempt;
+    rmSync(root, { recursive: true, force: true });
+  }
 });
+
+function acquireFixtureLease(root: string, racing: boolean) {
+  const number = 74453;
+  const headSha = "0123456789abcdef0123456789abcdef01234567";
+  const statePath = join(root, "lease-state.json");
+  const now = Date.now();
+  const leaseBody = (owner: string, startedAt: number) =>
+    `<!-- clawsweeper-review-status:started item=${number} sha=${headSha} started_at=${new Date(startedAt).toISOString()} lease_expires_at=${new Date(now + 3_600_000).toISOString()} owner=${owner} v=1 -->\n\n<!-- clawsweeper-review-lease item=${number} -->`;
+  writeFileSync(
+    statePath,
+    JSON.stringify({
+      comments: [
+        { id: 10, user: { login: "contributor" }, body: leaseBody("spoof", now - 120_000) },
+      ],
+      contender: racing
+        ? {
+            id: 100,
+            user: { login: "clawsweeper[bot]" },
+            body: leaseBody("confirmed-worker", now - 60_000),
+          }
+        : null,
+      payloads: [],
+    }),
+  );
+  const script = `
+const { readFileSync, writeFileSync } = require("node:fs");
+const file = ${JSON.stringify(statePath)};
+const state = JSON.parse(readFileSync(file, "utf8"));
+const args = process.argv.slice(2);
+const method = args[args.indexOf("--method") + 1];
+if (args.includes("--input")) {
+  const payload = args[args.indexOf("--input") + 1];
+  state.payloads.push(payload);
+  const comment = { id: 200, user: { login: "clawsweeper[bot]" }, body: JSON.parse(readFileSync(payload, "utf8")).body };
+  if (state.contender) comment.body = comment.body.replace(/started_at=[^ ]+/, ${JSON.stringify(`started_at=${new Date(now - 120_000).toISOString()}`)});
+  state.comments.push(comment);
+  if (state.contender) state.comments.push(state.contender);
+  console.log(JSON.stringify(comment));
+} else if (method === "DELETE") {
+  state.comments = state.comments.filter(comment => comment.id !== 200);
+  console.log("");
+} else {
+  console.log(JSON.stringify([state.comments]));
+}
+writeFileSync(file, JSON.stringify(state));
+`;
+  try {
+    let result: ReviewStartStatusCommentResult | undefined;
+    withGitHubRun(() =>
+      withMockGh(root, script, () => {
+        result = postReviewStartStatusComment({
+          item: { ...item({ number }), kind: "pull_request" },
+          headSha,
+          reviewTimeoutMs: 60_000,
+          position: 1,
+          total: 1,
+          shardIndex: 0,
+          shardCount: 1,
+        });
+      }),
+    );
+    assert.ok(result);
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    if (racing)
+      assert.deepEqual(
+        state.comments.map((comment: { id: number }) => comment.id),
+        [10, 100],
+      );
+    return result;
+  } finally {
+    const state = JSON.parse(readFileSync(statePath, "utf8"));
+    for (const payload of state.payloads) {
+      rmSync(payload, { force: true });
+      rmSync(payload.replace(/\.json$/, ".md"), { force: true });
+    }
+  }
+}
 
 test("comment matcher recognizes old and new Codex review comments", () => {
   assert.equal(
@@ -777,150 +884,12 @@ test("comment matcher recognizes old and new Codex review comments", () => {
   assert.equal(isCodexReviewCommentBody("Thanks for the report, I can reproduce this."), false);
 });
 
-test("structural cache probes before hydration but acquires a lease before carrying a hit", () => {
-  const source = [
-    readFileSync("src/clawsweeper-review-command-workflow.ts", "utf8"),
-    readFileSync("src/clawsweeper-review-preparation.ts", "utf8"),
-    readFileSync("src/clawsweeper-runtime.ts", "utf8"),
-    readFileSync("src/clawsweeper-item-context.ts", "utf8"),
-  ].join("\n");
-  const reviewLoop = source.slice(
-    source.indexOf("for (const item of candidates)"),
-    source.indexOf("let decision: Decision", source.indexOf("for (const item of candidates)")),
-  );
-  const structuralEligibility = reviewLoop.indexOf("reviewStructuralCacheProbeDecision({");
-  const structuralProbe = reviewLoop.indexOf(
-    "structuralRecord = fetchReviewStructuralRecord({",
-    structuralEligibility,
-  );
-  const structuralCache = reviewLoop.indexOf("reviewStructuralCacheDecision({", structuralProbe);
-  const structuralHit = reviewLoop.indexOf("if (structuralDecision.hit)");
-  const structuralLease = reviewLoop.indexOf("postReviewStartStatusComment({", structuralHit);
-  const structuralRevalidation = reviewLoop.indexOf(
-    "structuralCacheRevalidations += 1",
-    structuralLease,
-  );
-  const structuralWrite = reviewLoop.indexOf(
-    "writeOutputReport(item, reportPath, hostReport(carried)",
-    structuralLease,
-  );
-  const contentCache = reviewLoop.indexOf("reviewContentCacheHit({");
-  const structuralPreflight = reviewLoop.indexOf("cachePreflightPasses(", structuralRevalidation);
-  const contentWrite = reviewLoop.indexOf(
-    "writeOutputReport(item, reportPath, hostReport(carried)",
-    contentCache,
-  );
-  const contentPreflight = reviewLoop.indexOf("cachePreflightPasses(", contentCache);
-  const provenancePromotions = [
-    ...reviewLoop.matchAll(
-      /carried = withRunnerPreflightProvenance\(carried, replaceFrontMatterValue\)/g,
-    ),
-  ];
-  const hydration = reviewLoop.indexOf("collectItemContext(item");
-  const mediaPrep = reviewLoop.indexOf("prepareMediaProofArtifacts(", contentCache);
-
-  assert.ok(structuralEligibility >= 0);
-  assert.ok(structuralProbe > structuralEligibility);
-  assert.ok(structuralCache >= 0);
-  assert.ok(structuralCache < hydration);
-  assert.ok(structuralHit > structuralCache);
-  assert.ok(structuralLease > structuralHit);
-  assert.ok(structuralRevalidation > structuralLease);
-  assert.ok(structuralWrite > structuralRevalidation);
-  assert.ok(structuralPreflight > structuralRevalidation);
-  assert.ok(structuralPreflight < structuralWrite);
-  assert.ok(structuralWrite < hydration);
-  assert.ok(contentCache > structuralLease);
-  assert.ok(contentPreflight > contentCache);
-  assert.ok(contentPreflight < contentWrite);
-  assert.equal(provenancePromotions.length, 2);
-  assert.ok(provenancePromotions[0]!.index > structuralPreflight);
-  assert.ok(provenancePromotions[0]!.index < structuralWrite);
-  assert.ok(provenancePromotions[1]!.index > contentPreflight);
-  assert.ok(provenancePromotions[1]!.index < contentWrite);
-  assert.ok(mediaPrep > contentCache);
-  assert.match(
-    reviewLoop.slice(structuralHit, structuralWrite),
-    /review_lease_owner[\s\S]*acquiredReviewLease\.owner/,
-  );
-  assert.match(
-    reviewLoop.slice(structuralHit, structuralWrite),
-    /review_lease_comment_id[\s\S]*acquiredReviewLease\.commentId/,
-  );
-  const hydratedAnchor = reviewLoop.indexOf(
-    "reviewStructuralRecordsDescribeSameVerdictInput(",
-    hydration,
-  );
-  assert.ok(hydratedAnchor > hydration);
-  assert.match(reviewLoop.slice(hydration, hydratedAnchor + 160), /preHydrationStructuralRecord/);
-  assert.match(
-    reviewLoop.slice(structuralRevalidation, structuralWrite),
-    /git = loadReviewGitInfo\(\)[\s\S]*fetchReviewStructuralRecord\(\{/,
-  );
-  assert.match(
-    reviewLoop.slice(structuralRevalidation, structuralWrite),
-    /liveClawSweeperReviewDigest\(item\.number\)[\s\S]*previousReviewIdentityMatches/,
-  );
-  const structuralProbeSource = source.slice(
-    source.indexOf("function fetchReviewStructuralRecord"),
-    source.indexOf("function collectItemContext"),
-  );
-  assert.match(structuralProbeSource, /pullChecksContext\(options\.item\.number, headSha\)/);
-  assert.match(
-    structuralProbeSource,
-    /pullChecksDigest = sha256\(stableJson\(reviewPullChecksDigestParts\(pullChecks\)\)\)/,
-  );
-  assert.match(structuralProbeSource, /if \(!options\.git\.releaseStateComplete\) return null/);
-  const reviewRuntime = readFileSync("src/clawsweeper-review-runtime.ts", "utf8");
-  const gitInfoBlock = reviewRuntime.slice(
-    reviewRuntime.indexOf("function gitInfo("),
-    reviewRuntime.indexOf("function reviewTargetBranch"),
-  );
-  assert.match(gitInfoBlock, /releaseStateComplete = false/);
-  assert.match(gitInfoBlock, /"release",\s+"list"/);
-  assert.match(gitInfoBlock, /"tagName,name,publishedAt,isLatest"/);
-  assert.match(gitInfoBlock, /release\.isLatest === true/);
-  assert.doesNotMatch(gitInfoBlock, /releases\[0\]/);
-  assert.match(
-    gitInfoBlock,
-    /return \{ mainSha, targetBranch, releaseStateComplete, latestRelease \}/,
-  );
-  assert.match(source, /coordination-held\.json/);
-  assert.match(source, /coordinationHeldRetryAt = startComment\.retryAt/);
-  assert.match(source, /review-cache-metrics\.json/);
-});
-
 test("review comment patching only targets ClawSweeper-owned comments", () => {
   assert.equal(canPatchReviewComment({ user: { login: "clawsweeper" } }), true);
   assert.equal(canPatchReviewComment({ user: { login: "clawsweeper[bot]" } }), true);
   assert.equal(canPatchReviewComment({ user: { login: "openclaw-clawsweeper[bot]" } }), true);
   assert.equal(canPatchReviewComment({ user: { login: "steipete" } }), false);
   assert.equal(canPatchReviewComment(undefined), false);
-});
-
-test("spoofed durable markers cannot suppress a bot-owned start lease", () => {
-  const spoofedComment = {
-    user: { login: "contributor" },
-    body: "<!-- clawsweeper-review item=74453 -->",
-  };
-  assert.equal(canPatchReviewComment(spoofedComment), false);
-
-  const source = [
-    readFileSync("src/clawsweeper-review-comments-workflow.ts", "utf8"),
-    readFileSync("src/clawsweeper-review-comment-leases.ts", "utf8"),
-    readFileSync("src/clawsweeper-runtime.ts", "utf8"),
-  ].join("\n");
-  const functionStart = source.indexOf("function postReviewStartStatusComment");
-  const postStart = source.slice(
-    functionStart,
-    source.indexOf("function closeItem", functionStart),
-  );
-  assert.match(postStart, /issueReviewCommentState\(options\.item\.number\)/);
-  assert.match(postStart, /freshDedicatedReviewStartLeases\(\{/);
-  assert.match(postStart, /reapSupersededDedicatedReviewStartLeases\(/);
-  assert.match(postStart, /heldReviewStartStatusCommentResult\(initialLease\.expiresAt, false\)/);
-  assert.match(postStart, /heldReviewStartStatusCommentResult\(winner\.expiresAt, true\)/);
-  assert.match(postStart, /issues\/\$\{options\.item\.number\}\/comments/);
 });
 
 test("review start status comment is marker-backed and crustacean-friendly", () => {
@@ -1050,48 +1019,16 @@ test("only the exact lease owner and comment can clear an active lease", () => {
   assert.equal(shouldPreserveReviewStartLease({ ...base, leaseOwner: null }), true);
 });
 
-test("concurrent review lease election uses server comment order, not client timestamps", () => {
-  const itemNumber = 74453;
-  const headSha = "0123456789abcdef0123456789abcdef01234567";
-  const leaseComment = (id: number, owner: string, startedAt: string) => ({
-    id,
-    user: { login: "clawsweeper[bot]" },
-    body: [
-      `<!-- clawsweeper-review-status:started item=${itemNumber} sha=${headSha} started_at=${startedAt} lease_expires_at=2026-07-09T22:31:47.000Z owner=${owner} v=1 -->`,
-      "",
-      `<!-- clawsweeper-review-lease item=${itemNumber} -->`,
-    ].join("\n"),
-  });
-
-  assert.equal(
-    reviewStartLeaseWinnerCommentIdForTest({
-      comments: [
-        leaseComment(200, "delayed-worker", "2026-07-09T21:00:00.000Z"),
-        leaseComment(100, "confirmed-worker", "2026-07-09T21:01:00.000Z"),
-      ],
-      itemNumber,
-      headSha,
-      nowMs: Date.parse("2026-07-09T21:02:00.000Z"),
-    }),
-    100,
-  );
-});
-
-test("apply retains its mutation lease until the item action is complete", () => {
-  const source = readFileSync("src/clawsweeper-apply-decision-workflow.ts", "utf8");
-  const acquire = source.indexOf("const mutationLeaseBlockReason = acquireApplyMutationLease");
-  const commentSync = source.indexOf("syncedComment = upsertReviewComment(", acquire);
-  const close = source.indexOf("const closeFlow = executeApplyClose(", commentSync);
-  const release = source.indexOf("releaseActiveApplyMutationLease();", close);
-  assert.ok(acquire >= 0);
-  assert.ok(commentSync > acquire);
-  assert.ok(close > commentSync);
-  assert.ok(release > close);
-  assert.match(
-    readFileSync("src/clawsweeper-apply-close-execution.ts", "utf8"),
-    /currentApplyMutationLeaseBlockReason\(\)[\s\S]*closeItem\(\{ number, kind: item\.kind/,
-  );
-  assert.doesNotMatch(source, /deleteSupersededDedicatedReviewStartLeases/);
+test("concurrent lease acquisition preserves the lowest server id despite client timestamps", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-lease-race-"));
+  try {
+    const result = acquireFixtureLease(root, true);
+    assert.equal(result.status, "held");
+    assert.equal(result.didMutate, true);
+    assert.equal(result.lease, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("review item source revision ignores advisory labels but tracks protected labels", () => {
@@ -1100,10 +1037,10 @@ test("review item source revision ignores advisory labels but tracks protected l
     body: "This was superseded by the canonical fix.",
     labels: [{ name: "bug" }],
   };
-  const revision = itemSourceRevisionSha256ForTest(item, []);
+  const revision = itemSourceRevisionSha256(item, []);
 
   assert.equal(
-    itemSourceRevisionSha256ForTest(
+    itemSourceRevisionSha256(
       {
         ...item,
         labels: [
@@ -1134,27 +1071,21 @@ test("review item source revision ignores advisory labels but tracks protected l
     revision,
   );
   assert.notEqual(
-    itemSourceRevisionSha256ForTest(
-      { ...item, labels: [...item.labels, { name: "needs-design" }] },
-      [],
-    ),
+    itemSourceRevisionSha256({ ...item, labels: [...item.labels, { name: "needs-design" }] }, []),
     revision,
   );
   assert.notEqual(
-    itemSourceRevisionSha256ForTest(
+    itemSourceRevisionSha256(
       { ...item, labels: [...item.labels, { name: "release-blocker" }] },
       [],
     ),
     revision,
   );
   const bulkFiled = { ...item, labels: [...item.labels, { name: "clawsweeper:bulk-filed" }] };
-  assert.notEqual(itemSourceRevisionSha256ForTest(bulkFiled, []), revision);
-  assert.equal(
-    itemSourceRevisionSha256ForTest(bulkFiled, []),
-    issueSourceRevisionSha256(bulkFiled, []),
-  );
+  assert.notEqual(itemSourceRevisionSha256(bulkFiled, []), revision);
+  assert.equal(itemSourceRevisionSha256(bulkFiled, []), issueSourceRevisionSha256(bulkFiled, []));
   assert.notEqual(
-    itemSourceRevisionSha256ForTest(
+    itemSourceRevisionSha256(
       { ...item, labels: [...item.labels, { name: "proof: override" }] },
       [],
     ),
@@ -1164,16 +1095,17 @@ test("review item source revision ignores advisory labels but tracks protected l
 
 test("pull request keep-open review comments label the change summary", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74265",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-      reviewed_at: "2026-05-22T04:43:12.000Z",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74265",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "none",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+        reviewed_at: "2026-05-22T04:43:12.000Z",
+      })}
 
 ## Summary
 
@@ -1202,6 +1134,16 @@ Evidence kind: terminal
 Needs contributor action: false
 
 Summary: A live session confirmed the override reaches the next request.
+
+## PR Rating
+
+Overall tier: A
+
+Proof tier: A
+
+Patch tier: A
+
+Summary: The focused test change is ready for maintainer review.
 
 ## Best Possible Solution
 
@@ -1253,13 +1195,55 @@ Full review comments:
 
 - none
 	`,
+      {
+        summary: "Keep this test-only PR open for maintainer review.",
+        changeSummary: "Adds regression coverage for session-scoped model overrides.",
+        systemContext:
+          "OpenClaw resolves a session's model override before sending the next agent request.",
+        architectureDiagram:
+          'flowchart LR\n    session["Session settings"] --> resolver["Model resolver"]\n    resolver --> request["Agent request"]',
+        realBehaviorProof: {
+          status: "sufficient",
+          evidenceKind: "terminal",
+          needsContributorAction: false,
+          summary: "A live session confirmed the override reaches the next request.",
+        },
+        prRating: {
+          proofTier: "A",
+          patchTier: "A",
+          overallTier: "A",
+          summary: "The focused test change is ready for maintainer review.",
+          nextSteps: [],
+        },
+        bestSolution: "Merge after required checks are green.",
+        reproductionAssessment:
+          "Not applicable. This is a test-only PR and the validation path is the targeted test lane.",
+        solutionAssessment:
+          "Yes. Landing the focused regression test after the targeted lane is green is the narrowest useful path.",
+        evidence: [
+          {
+            repo: null,
+            label: "targeted lane",
+            detail: "The PR is test-only and should run the matching changed-test lane.",
+            file: null,
+            line: null,
+            sha: null,
+            command: null,
+          },
+        ],
+      },
+    ),
     "none",
   );
 
+  // The verdict leads; the review time closes the visible comment, after the details.
   assert.match(
     comment,
-    /Codex review: needs maintainer review before merge\. _Reviewed May 22, 2026, 12:43 AM ET \/ 04:43 UTC\._/,
+    /^Codex review: needs maintainer review before merge\.\n\n## What this changes\n/,
   );
+  assert.doesNotMatch(comment, /^# ClawSweeper review$/m);
+  const reviewedAt = comment.indexOf("_Reviewed May 22, 2026, 12:43 AM ET / 04:43 UTC._");
+  assert.ok(reviewedAt > comment.lastIndexOf("</details>"), comment);
   assert.doesNotMatch(comment, /\*\*Latest ClawSweeper review:\*\*/);
   assert.match(
     comment,
@@ -1270,45 +1254,20 @@ Full review comments:
   assert.doesNotMatch(comment, /\| \| \|\n\|---\|---\|/);
   assert.match(comment, /## Review scores\n\n\| Measure \| Result \| What it means \|/);
   assert.match(comment, /\| \*\*Overall readiness\*\* \| .* \*\*\(5\/6\)\*\* \|/);
-  assert.match(comment, /## Verification\n\n\| Check \| Result \| Evidence \|/);
-  assert.match(comment, /\| \*\*Real behavior\*\* \| Verified \| Sufficient \(terminal\):/);
-  assert.match(comment, /\| \*\*Evidence reviewed\*\* \| 1 item \| targeted lane:/);
+  assert.doesNotMatch(comment, /## Verification/);
+  assert.match(comment, /\| \*\*Proof confidence\*\* \| [^|]+ \| Sufficient \(terminal\):/);
+  assert.match(detailsBody(comment, "Agent review details"), /- \*\*targeted lane:\*\*/);
   assert.match(
-    comment,
-    /## How this fits together\n\nOpenClaw resolves a session's model override before sending the next agent request\.\n\n```mermaid\nflowchart LR/,
+    detailsBody(comment, "Agent review details"),
+    /### How this fits together\n\nOpenClaw resolves a session's model override before sending the next agent request\.\n\n```mermaid\nflowchart LR/,
   );
-  assert.ok(comment.indexOf("## Verification") < comment.indexOf("## How this fits together"));
+  assert.doesNotMatch(comment, /^## How this fits together/m);
   assert.doesNotMatch(comment, /## Proof/);
   assert.match(comment, /\*\*Reviewed head:\*\* `abc123def456abc123def456abc123def456abcd`/);
   assert.doesNotMatch(comment, /\*\*Workflow note:\*\*/);
-  assert.match(comment, /### Workflow/);
   assert.match(
     comment,
-    /- Re-runs edit this comment so the latest verdict, findings, and automation markers stay together instead of adding duplicate bot comments\./,
-  );
-  assert.match(
-    comment,
-    /- A fresh review can be triggered by eligible `@clawsweeper re-review` comments, exact-item GitHub events, scheduled\/background review runs, or manual workflow dispatch\./,
-  );
-  assert.match(
-    comment,
-    /- PR\/issue authors and users with repository write access can comment `@clawsweeper re-review` or `@clawsweeper re-run` on an open PR or issue to request a fresh review only\./,
-  );
-  assert.match(
-    comment,
-    /- Maintainers can also comment `@clawsweeper review` to request a fresh review only\./,
-  );
-  assert.match(
-    comment,
-    /- Fresh-review commands do not start repair, autofix, rebase, CI repair, or automerge\./,
-  );
-  assert.match(
-    comment,
-    /- Maintainer-only repair and merge flows require explicit commands such as `@clawsweeper autofix`, `@clawsweeper automerge`, `@clawsweeper fix ci`, or `@clawsweeper address review`\./,
-  );
-  assert.match(
-    comment,
-    /- Maintainers can comment `@clawsweeper explain` to ask for more context, or `@clawsweeper stop` to stop active automation\./,
+    /### Workflow\n\nClawSweeper edits this one comment on every review\. Comment `@clawsweeper re-review` for a fresh review only\. Repair and merge execution lanes are retired\./,
   );
   // Ordinary maintainer review guidance collapses out of the checklist.
   assert.match(comment, /## Before merge\n\nNone\./);
@@ -1339,9 +1298,236 @@ Full review comments:
   );
 });
 
+test("ready zero-finding PR comments show verdict, product, readiness, findings and scores before details", () => {
+  const proof =
+    "A terminal transcript from a real gateway shows the Telegram reply keeps its final attachment.";
+  const report = typedRendererReport(
+    `${reportFrontMatter({
+      type: "pull_request",
+      number: "74270",
+      decision: "keep_open",
+      close_reason: "none",
+      review_status: "complete",
+      work_candidate: "none",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      reviewed_at: "2026-05-22T04:43:12.000Z",
+      labels: JSON.stringify(["P2"]),
+    })}
+
+## Summary
+
+The fix is narrow and proven on a real gateway.
+
+## What This Changes
+
+Telegram replies with several attachments now send every attachment.
+
+## Change Example
+
+Scenario: An agent replies in Telegram with three attachments
+
+Before: Telegram shows only the first two attachments.
+
+After: Telegram shows all three attachments.
+
+## System Context
+
+The Telegram channel batches outbound attachments before the gateway sends the reply.
+
+## Architecture Diagram
+
+flowchart LR
+    agent["Agent reply"] --> telegram["Telegram sendMediaGroup"]
+
+${realBehaviorProofReportSection({ summary: proof })}
+${prRatingReportSection({ nextSteps: "- Add a channel e2e scenario for three-attachment replies." })}
+## Product Review
+
+Kind: bug_fix
+
+Worth it: yes
+
+Fix scope: complete
+
+User problem: Telegram users lose the last attachment of a multi-file reply.
+
+Reason: Restores the documented media-group behavior with a narrow change.
+
+## Provenance
+
+- Area: src/telegram/media-group.ts
+  - Introduced by: https://github.com/openclaw/openclaw/pull/70001
+  - Original reason: Batch attachments to stay under the Telegram rate limit.
+  - Verdict: respects
+
+## Testing Review
+
+Proof path: shipped_entry_point
+
+Missing E2E:
+
+Low-value tests:
+
+- none
+
+## Best Possible Solution
+
+Merge after required checks are green.
+
+## Evidence
+
+- **real behavior proof:** ${proof}
+- **diff:** The batcher flushes the pending attachment before sending.
+
+## Security Review
+
+Status: cleared
+
+Summary: The change only reorders attachment flushing.
+
+Concerns:
+
+- none
+
+## Review Findings
+
+Overall correctness: patch is correct
+
+Overall confidence: 0.9
+
+Full review comments:
+
+- none
+`,
+    {
+      summary: "The fix is narrow and proven on a real gateway.",
+      changeSummary: "Telegram replies with several attachments now send every attachment.",
+      changeExample: {
+        scenario: "An agent replies in Telegram with three attachments",
+        before: "Telegram shows only the first two attachments.",
+        after: "Telegram shows all three attachments.",
+      },
+      systemContext:
+        "The Telegram channel batches outbound attachments before the gateway sends the reply.",
+      architectureDiagram:
+        'flowchart LR\n    agent["Agent reply"] --> telegram["Telegram sendMediaGroup"]',
+      realBehaviorProof: {
+        status: "sufficient",
+        evidenceKind: "terminal",
+        needsContributorAction: false,
+        summary: proof,
+      },
+      prRating: {
+        proofTier: "B",
+        patchTier: "B",
+        overallTier: "B",
+        summary: "Ready for review.",
+        nextSteps: ["Add a channel e2e scenario for three-attachment replies."],
+      },
+      productReview: {
+        kind: "bug_fix",
+        worthIt: "yes",
+        fixScope: "complete",
+        userProblem: "Telegram users lose the last attachment of a multi-file reply.",
+        reason: "Restores the documented media-group behavior with a narrow change.",
+      },
+      provenance: [
+        {
+          area: "src/telegram/media-group.ts",
+          introducedBy: "https://github.com/openclaw/openclaw/pull/70001",
+          originalReason: "Batch attachments to stay under the Telegram rate limit.",
+          verdict: "respects",
+        },
+      ],
+      testingReview: { proofPath: "shipped_entry_point", missingE2e: "", lowValueTests: [] },
+      securityReview: {
+        status: "cleared",
+        summary: "The change only reorders attachment flushing.",
+        concerns: [],
+      },
+      bestSolution: "Merge after required checks are green.",
+      evidence: [
+        {
+          repo: null,
+          label: "real behavior proof",
+          detail: proof,
+          file: null,
+          line: null,
+          sha: null,
+          command: null,
+        },
+        {
+          repo: null,
+          label: "diff",
+          detail: "The batcher flushes the pending attachment before sending.",
+          file: null,
+          line: null,
+          sha: null,
+          command: null,
+        },
+      ],
+    },
+  );
+  const comment = renderReviewCommentFromReport(report, "none", {
+    prStatusKind: "ready_for_maintainer_look",
+  });
+
+  const visible = comment.slice(0, comment.indexOf("\n<details>"));
+  assert.match(visible, /^Codex review: needs maintainer review before merge\./);
+  assert.deepEqual(
+    [...visible.matchAll(/^## (.+)$/gm)].map((match) => match[1]),
+    [
+      "What this changes",
+      "Review scores",
+      "Product",
+      "Merge readiness",
+      "Before merge",
+      "Findings",
+    ],
+  );
+  assert.equal(comment.match(/^<details>$/gm)?.length, 1);
+  assert.match(
+    comment.slice(visible.length),
+    /^\n<details>\n<summary><strong>Agent review details<\/strong><\/summary>/,
+  );
+  assert.match(
+    visible,
+    /## Product\n\n\*\*Kind:\*\* Bug fix · \*\*Worth it:\*\* Yes · \*\*Fix scope:\*\* Complete\n\*\*User problem:\*\* Telegram users lose the last attachment of a multi-file reply\.\n\*\*Reason:\*\* Restores the documented media-group behavior with a narrow change\./,
+  );
+  assert.match(
+    visible,
+    /## What this changes\n\nTelegram replies with several attachments now send every attachment\.\n\n\*\*Example:\*\* An agent replies in Telegram with three attachments\n- \*\*Before:\*\* Telegram shows only the first two attachments\.\n- \*\*After:\*\* Telegram shows all three attachments\.\n\n## Review scores/,
+  );
+  assert.match(visible, /## Before merge\n\nNone\.\n\n## Findings\n\nNone\.\n/);
+  assert.equal(comment.split(proof).length - 1, 1);
+  assert.match(visible, /\| \*\*Proof confidence\*\* \| [^|]+ \| Sufficient \(terminal\): /);
+
+  // An evidence entry that repeats the proof but carries its supporting link stays.
+  const linked = renderReviewCommentFromReport(
+    typedRendererReport(report.replace(/^review_record:.*\n/m, ""), {
+      ...readReviewRecord(report)!.decision,
+      evidence: [
+        ...readReviewRecord(report)!.decision.evidence,
+        {
+          repo: null,
+          label: "proof run",
+          detail: `${proof} https://example.com/runs/1`,
+          file: null,
+          line: null,
+          sha: null,
+          command: null,
+        },
+      ],
+    }),
+    "none",
+    { prStatusKind: "ready_for_maintainer_look" },
+  );
+  assert.match(linked, /https:\/\/example\.com\/runs\/1/);
+});
+
 test("review comments include the UTC date when ET and UTC calendar dates differ", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
+    typedRendererReport(`${reportFrontMatter({
       type: "pull_request",
       number: "74266",
       decision: "keep_open",
@@ -1373,26 +1559,24 @@ Overall confidence: 0.9
 Full review comments:
 
 - none
-`,
+`),
     "none",
   );
 
-  assert.match(
-    comment,
-    /Codex review: needs maintainer review before merge\. _Reviewed July 8, 2026, 11:00 PM ET \/ July 9, 2026, 03:00 UTC\._/,
-  );
+  assert.match(comment, /_Reviewed July 8, 2026, 11:00 PM ET \/ July 9, 2026, 03:00 UTC\._/);
 });
 
 test("issue keep-open review comments surface reproducibility in the summary", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "75877",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "queue_fix_pr",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "75877",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "queue_fix_pr",
+      })}
 
 ## Summary
 
@@ -1414,6 +1598,17 @@ Status: queued
 
 Reason: The bug is narrow and source-reproducible.
 `,
+      {
+        summary:
+          "Keep open. Slack typing callbacks are disabled in message-tool-only group replies.",
+        reproductionAssessment:
+          "Yes. A source-level reproduction is clear: set a Slack group turn to message-tool-only and inspect the dispatch typing callbacks.",
+        workCandidate: "queue_fix_pr",
+        workConfidence: "high",
+        workPriority: "medium",
+        workReason: "The bug is narrow and source-reproducible.",
+      },
+    ),
     "none",
   );
 
@@ -1432,7 +1627,7 @@ Reason: The bug is narrow and source-reproducible.
 });
 
 test("high-confidence root-cause clusters appear in keep-open review comments", () => {
-  const rootCauseCluster = {
+  const rootCauseCluster: Decision["rootCauseCluster"] = {
     confidence: "high",
     canonicalRef: "https://github.com/openclaw/openclaw/pull/75880",
     currentItemRelationship: "same_root_cause",
@@ -1446,11 +1641,12 @@ test("high-confidence root-cause clusters appear in keep-open review comments", 
     ],
   };
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "75877",
-      root_cause_cluster: JSON.stringify(rootCauseCluster),
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "75877",
+        root_cause_cluster: JSON.stringify(rootCauseCluster),
+      })}
 
 ## Summary
 
@@ -1460,6 +1656,12 @@ Keep open while maintainers evaluate the candidate fix.
 
 Review the linked candidate PR.
 `,
+      {
+        rootCauseCluster,
+        summary: "Keep open while maintainers evaluate the candidate fix.",
+        bestSolution: "Review the linked candidate PR.",
+      },
+    ),
     "none",
   );
 
@@ -1472,22 +1674,25 @@ Review the linked candidate PR.
 
 test("low-confidence root-cause clusters stay out of public comments", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "75877",
-      root_cause_cluster: JSON.stringify({
-        confidence: "low",
-        canonicalRef: null,
-        currentItemRelationship: "independent",
-        summary: "No evidence-backed root-cause cluster was established.",
-        members: [],
-      }),
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "75877",
+        root_cause_cluster: JSON.stringify({
+          confidence: "low",
+          canonicalRef: null,
+          currentItemRelationship: "independent",
+          summary: "No evidence-backed root-cause cluster was established.",
+          members: [],
+        }),
+      })}
 
 ## Summary
 
 Keep open for more evidence.
 `,
+      { summary: "Keep open for more evidence." },
+    ),
     "none",
   );
 
@@ -1497,21 +1702,24 @@ Keep open for more evidence.
 
 test("high-confidence root-cause clusters appear in close comments", () => {
   const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      root_cause_cluster: JSON.stringify({
-        confidence: "high",
-        canonicalRef: "https://github.com/openclaw/clawsweeper/issues/400",
-        currentItemRelationship: "duplicate",
-        summary: "The canonical issue tracks the remaining work.",
-        members: [
-          {
-            ref: "https://github.com/openclaw/clawsweeper/issues/400",
-            relationship: "canonical",
-            reason: "This issue has the broader accepted scope.",
-          },
-        ],
-      }),
-    }),
+    implementedCloseReport(
+      {},
+      {
+        rootCauseCluster: {
+          confidence: "high",
+          canonicalRef: "https://github.com/openclaw/clawsweeper/issues/400",
+          currentItemRelationship: "duplicate",
+          summary: "The canonical issue tracks the remaining work.",
+          members: [
+            {
+              ref: "https://github.com/openclaw/clawsweeper/issues/400",
+              relationship: "canonical",
+              reason: "This issue has the broader accepted scope.",
+            },
+          ],
+        },
+      },
+    ),
     "implemented_on_main",
   );
 
@@ -1520,407 +1728,235 @@ test("high-confidence root-cause clusters appear in close comments", () => {
   assert.match(comment, /Canonical: https:\/\/github\.com\/openclaw\/clawsweeper\/issues\/400/);
 });
 
+const verifiedPredecessor = {
+  repo: "openclaw/clawsweeper",
+  pullRequestNumber: 936,
+  pullRequestUrl: "https://github.com/openclaw/clawsweeper/pull/936",
+  mergeCommitSha: "a".repeat(40),
+  sourcePath: "src/clawsweeper-review-runtime.ts",
+  sourceLine: 42,
+  evidenceType: "blame_to_merge_commit",
+  verificationSource: "raw_parent_line_v1",
+  mergedAt: "2026-07-31T12:00:00Z",
+  reviewedCommitSha: "b".repeat(40),
+  sourceCommitSha: "a".repeat(40),
+  sourceAuthor: "Source Author",
+} satisfies NonNullable<Decision["regressionProvenance"]>;
+
+const suspectedPredecessor = {
+  sourcePath: "src/clawsweeper-review-runtime.ts",
+  sourceLine: 42,
+  sourceCommitSha: "c".repeat(40),
+  sourceAuthor: "Source Author",
+  evidenceType: "source_line",
+  verificationSource: "raw_parent_line_v1",
+  relatedPullRequestNumber: null,
+  relatedPullRequestUrl: null,
+  relatedRepo: null,
+} satisfies NonNullable<Decision["regressionProvenance"]>;
+
 test("verified regression provenance renders the predecessor PR without local source details", () => {
-  const mergeSha = "a".repeat(40);
-  const closeComment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: mergeSha,
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: mergeSha,
-      regression_provenance_source_author: "Source Author",
-    }),
-    "implemented_on_main",
-  );
-  assert.match(
-    closeComment,
-    /Regression provenance — verified: source commit `aaaaaaaaaaaa` by Source Author; canonical PR \[#936\]\(https:\/\/github\.com\/openclaw\/clawsweeper\/pull\/936\)/,
-  );
-  assert.match(closeComment, /\(blame-to-merge-commit\)/);
-  assert.doesNotMatch(closeComment, /src\/clawsweeper-review-runtime\.ts/);
-  assert.doesNotMatch(closeComment, new RegExp(mergeSha));
-
-  const keepOpenComment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "946",
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: mergeSha,
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: mergeSha,
-      regression_provenance_source_author: "Source Author",
-    })}
-
-## Summary
-
-Keep open while the regression is fixed.
-`,
-    "none",
-  );
-  assert.match(keepOpenComment, /\*\*Regression provenance\*\*/);
-  assert.match(
-    keepOpenComment,
-    /\[#936\]\(https:\/\/github\.com\/openclaw\/clawsweeper\/pull\/936\)/,
-  );
-});
-
-test("legacy structured provenance without raw-parent proof cannot name a predecessor", () => {
-  for (const evidenceType of ["blame_to_merge_commit", "source_line", "rewrite_equivalent"]) {
-    const comment = renderReviewCommentFromReport(
-      implementedCloseReport({
-        regression_assessment_confidence: "suspected",
-        regression_assessment_evidence: "reviewed_change",
-        regression_provenance_repo: "openclaw/clawsweeper",
-        regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-        regression_provenance_pr_number: "936",
-        regression_provenance_merge_sha: "a".repeat(40),
-        regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-        regression_provenance_source_line: "42",
-        regression_provenance_evidence_type: evidenceType,
-        regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-        regression_provenance_reviewed_sha: "b".repeat(40),
-        regression_provenance_source_commit_sha: "a".repeat(40),
-        regression_provenance_source_author: "Unverified Source Author",
-        regression_provenance_related_repo: "openclaw/clawsweeper",
-        regression_provenance_related_pr_number: "936",
-        regression_provenance_related_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      }),
-      "implemented_on_main",
+  for (const decision of ["close", "keep_open"] as const) {
+    const report = implementedCloseReport(
+      {},
+      {
+        decision,
+        closeReason: decision === "close" ? "implemented_on_main" : "none",
+        regressionProvenance: verifiedPredecessor,
+      },
     );
-    assert.match(comment, /Possible regression — suspected/);
-    assert.doesNotMatch(comment, /source commit `aaaaaaaaaaaa`|Unverified Source Author|pull\/936/);
+    const comment = renderReviewCommentFromReport(
+      report,
+      decision === "close" ? "implemented_on_main" : "none",
+    );
+    assert.match(comment, /source commit `aaaaaaaaaaaa` by Source Author/);
+    assert.match(
+      comment,
+      /canonical PR \[#936\]\(https:\/\/github\.com\/openclaw\/clawsweeper\/pull\/936\)/,
+    );
+    assert.match(comment, /\(blame-to-merge-commit\)/);
+    assert.doesNotMatch(comment, /src\/clawsweeper-review-runtime\.ts/);
+    assert.doesNotMatch(comment, new RegExp("a".repeat(40)));
+    if (decision === "keep_open") assert.match(comment, /\*\*Regression provenance\*\*/);
   }
 });
 
-test("unverified regression-provenance front matter cannot render a predecessor", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: "a".repeat(40),
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "model_claim",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-    }),
-    "implemented_on_main",
+test("verified provenance renders equivalent normalized source commit text", () => {
+  const report = implementedCloseReport(
+    {},
+    {
+      regressionProvenance: { ...verifiedPredecessor, sourceCommitSha: ` ${"A".repeat(40)} ` },
+    },
   );
-
-  assert.doesNotMatch(comment, /Verified regression provenance/);
-  assert.doesNotMatch(comment, /pull\/936/);
-});
-
-test("verified provenance rejects a source commit that differs from the merge commit", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: "a".repeat(40),
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "Source Author",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /Regression provenance.*verified|canonical PR \[#936\]/);
-});
-
-test("verified provenance accepts equivalent normalized source commit text", () => {
-  const sha = "a".repeat(40);
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: sha,
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: ` ${sha.toUpperCase()} `,
-      regression_provenance_source_author: "Source Author",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.match(comment, /Regression provenance.*verified/);
+  const comment = renderReviewCommentFromReport(report, "implemented_on_main");
   assert.match(comment, /source commit `aaaaaaaaaaaa`/);
+  assert.match(comment, /canonical PR \[#936\]/);
 });
 
-test("verified provenance rejects Unicode direction controls in author names", () => {
-  const sha = "a".repeat(40);
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
+test("legacy provenance fields cannot supply or override typed provenance", () => {
+  for (const evidenceType of [
+    "blame_to_merge_commit",
+    "source_line",
+    "rewrite_equivalent",
+    "model_claim",
+  ]) {
+    const metadata = {
       regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: sha,
+      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/1023",
+      regression_provenance_pr_number: "1023",
+      regression_provenance_merge_sha: "c".repeat(40),
       regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: sha,
-      regression_provenance_source_author: "safe\u202eevil",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /Regression provenance.*verified|safe/);
-});
-
-test("verified provenance rejects email-shaped author names", () => {
-  const sha = "a".repeat(40);
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_provenance_repo: "openclaw/clawsweeper",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-      regression_provenance_pr_number: "936",
-      regression_provenance_merge_sha: sha,
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_evidence_type: "blame_to_merge_commit",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_merged_at: "2026-07-31T12:00:00Z",
-      regression_provenance_reviewed_sha: "b".repeat(40),
-      regression_provenance_source_commit_sha: sha,
-      regression_provenance_source_author: "Private Author <private@localhost>",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /Regression provenance.*verified|private@/);
-});
-
-test("suspected provenance renders commit, author, status, and only a verified related PR", () => {
-  const base = {
-    regression_assessment_confidence: "suspected",
-    regression_assessment_evidence: "reviewed_change",
-    regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-    regression_provenance_source_line: "42",
-    regression_provenance_source_commit_sha: "c".repeat(40),
-    regression_provenance_source_author: "Source Author",
-    regression_provenance_evidence_type: "source_line",
-    regression_provenance_verification_source: "raw_parent_line_v1",
-  };
-  const unlinked = renderReviewCommentFromReport(
-    implementedCloseReport(base),
-    "implemented_on_main",
-  );
-  assert.match(unlinked, /suspected predecessor, not a causality claim/);
-  assert.match(unlinked, /source commit `cccccccccccc` by Source Author; no PR verified/);
-
-  const linked = renderReviewCommentFromReport(
-    implementedCloseReport({
-      ...base,
-      regression_provenance_evidence_type: "rewrite_equivalent",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_related_pr_number: "1023",
-      regression_provenance_related_pr_url: "https://github.com/openclaw/clawsweeper/pull/1023",
-      regression_provenance_related_repo: "openclaw/clawsweeper",
-    }),
-    "implemented_on_main",
-  );
-  assert.match(linked, /safely related PR \[#1023\]/);
-
-  const spoofed = renderReviewCommentFromReport(
-    implementedCloseReport({
-      ...base,
-      regression_provenance_evidence_type: "rewrite_equivalent",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_related_pr_number: "1023",
-      regression_provenance_related_pr_url: "https://example.test/not-a-pr",
-      regression_provenance_related_repo: "openclaw/clawsweeper",
-    }),
-    "implemented_on_main",
-  );
-  assert.doesNotMatch(spoofed, /example\.test|safely related PR/);
-
-  const impossibleLine = renderReviewCommentFromReport(
-    implementedCloseReport({
-      ...base,
       regression_provenance_source_line: "0",
-    }),
-    "implemented_on_main",
-  );
-  assert.doesNotMatch(impossibleLine, /suspected predecessor|source commit `cccccccccccc`/);
-});
-
-test("suspected provenance supplements rather than suppresses regression assessment", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "probable",
-      regression_assessment_evidence: "reproduction,reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "Source Author",
-      regression_provenance_evidence_type: "source_line",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.match(comment, /suspected predecessor, not a causality claim/);
-  assert.match(comment, /Possible regression \u2014 probable \(reproduction; reviewed change\)/);
-});
-
-test("rewrite-equivalent provenance and assessment do not contradict each other", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "probable",
-      regression_assessment_evidence: "reproduction,reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "Source Author",
-      regression_provenance_evidence_type: "rewrite_equivalent",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-      regression_provenance_related_pr_number: "1023",
-      regression_provenance_related_pr_url: "https://github.com/openclaw/clawsweeper/pull/1023",
-      regression_provenance_related_repo: "openclaw/clawsweeper",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.match(comment, /safely related PR \[#1023\]/);
-  assert.match(comment, /Possible regression \u2014 probable \(reproduction; reviewed change\)\./);
-  assert.doesNotMatch(comment, /No predecessor PR is attributed/);
-});
-
-test("provenance author names cannot trigger GitHub mentions", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "suspected",
-      regression_assessment_evidence: "reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "@openclaw/maintainers",
-      regression_provenance_evidence_type: "source_line",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /@openclaw\/maintainers/);
-  assert.match(comment, /@\u200bopenclaw\/maintainers/);
-});
-
-test("a provenance author literally named unknown remains visible", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "suspected",
-      regression_assessment_evidence: "reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "unknown",
-      regression_provenance_evidence_type: "source_line",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.match(comment, /source commit `cccccccccccc` by unknown; no PR verified/);
-});
-
-test("suspected provenance rejects Unicode direction controls in author names", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "suspected",
-      regression_assessment_evidence: "reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
-      regression_provenance_source_author: "safe\u202eevil",
-      regression_provenance_evidence_type: "source_line",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /suspected predecessor|safe/);
-  assert.match(comment, /Possible regression \u2014 suspected/);
-});
-
-test("suspected provenance rejects email-shaped author names", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "suspected",
-      regression_assessment_evidence: "reviewed_change",
-      regression_provenance_source_path: "src/clawsweeper-review-runtime.ts",
-      regression_provenance_source_line: "42",
-      regression_provenance_source_commit_sha: "c".repeat(40),
+      regression_provenance_evidence_type: evidenceType,
       regression_provenance_source_author: "Private Author <private@localhost>",
-      regression_provenance_evidence_type: "source_line",
-      regression_provenance_verification_source: "raw_parent_line_v1",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.doesNotMatch(comment, /suspected predecessor|private@/);
-  assert.match(comment, /Possible regression \u2014 suspected/);
+    };
+    const absent = implementedCloseReport(metadata, {
+      regressionProvenance: null,
+      regressionAssessment: { confidence: "suspected", supportingEvidence: ["reviewed_change"] },
+    });
+    const comment = renderReviewCommentFromReport(absent, "implemented_on_main");
+    assert.match(comment, /Possible regression — suspected/);
+    assert.doesNotMatch(comment, /source commit|private@|pull\/1023/);
+    const authoritative = implementedCloseReport(metadata, {
+      regressionProvenance: verifiedPredecessor,
+    });
+    assert.match(
+      renderReviewCommentFromReport(authoritative, "implemented_on_main"),
+      /canonical PR \[#936\]/,
+    );
+    const raw = absent.replace(/^review_record:.*\n/m, "");
+    assert.throws(
+      () => renderReviewCommentFromReport(raw, "implemented_on_main"),
+      /review_record: missing record/,
+    );
+  }
 });
 
-test("probable regression assessments render evidence without attributing a predecessor", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "probable",
-      regression_assessment_evidence: "reproduction,reviewed_change",
-      regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
-    }),
-    "implemented_on_main",
-  );
-
-  assert.match(
-    comment,
-    /Possible regression — probable \(reproduction; reviewed change\)\. No predecessor PR is attributed\./,
-  );
-  assert.doesNotMatch(comment, /pull\/936/);
-  assert.doesNotMatch(comment, /Verified regression provenance/);
+test("malformed typed provenance fails closed rather than falling back to legacy fields", () => {
+  for (const regressionProvenance of [verifiedPredecessor, suspectedPredecessor]) {
+    const report = implementedCloseReport(
+      {},
+      {
+        regressionProvenance,
+        regressionAssessment: { confidence: "suspected", supportingEvidence: ["reviewed_change"] },
+      },
+    );
+    const invalidValues = [
+      { sourceLine: 0 },
+      { sourceAuthor: "safe\u202eevil" },
+      { sourceAuthor: "Private Author <private@localhost>" },
+      ...(regressionProvenance === verifiedPredecessor
+        ? [{ sourceCommitSha: "c".repeat(40) }]
+        : [
+            {
+              evidenceType: "rewrite_equivalent",
+              relatedPullRequestNumber: 1023,
+              relatedPullRequestUrl: "https://example.test/not-a-pr",
+              relatedRepo: "openclaw/clawsweeper",
+            },
+          ]),
+    ];
+    for (const invalid of invalidValues) {
+      const record = readReviewRecord(report)!;
+      record.decision.regressionProvenance = {
+        ...regressionProvenance,
+        ...invalid,
+      } as Decision["regressionProvenance"];
+      const malformed = report.replace(
+        /^review_record:.*$/m,
+        () => `review_record: ${JSON.stringify({ version: 1, ...record })}`,
+      );
+      assert.throws(
+        () => renderReviewCommentFromReport(malformed, "implemented_on_main"),
+        /review_record:/,
+      );
+    }
+  }
 });
 
-test("suspected regression assessments retain their lower confidence", () => {
-  const comment = renderReviewCommentFromReport(
-    implementedCloseReport({
-      regression_assessment_confidence: "suspected",
-      regression_assessment_evidence: "failure_trace",
-    }),
-    "implemented_on_main",
-  );
+test("suspected and rewrite-equivalent provenance supplement regression assessment", () => {
+  for (const evidenceType of ["source_line", "rewrite_equivalent"] as const) {
+    const comment = renderReviewCommentFromReport(
+      implementedCloseReport(
+        {},
+        {
+          regressionAssessment: {
+            confidence: "probable",
+            supportingEvidence: ["reproduction", "reviewed_change"],
+          },
+          regressionProvenance: {
+            ...suspectedPredecessor,
+            evidenceType,
+            ...(evidenceType === "rewrite_equivalent"
+              ? {
+                  relatedPullRequestNumber: 1023,
+                  relatedPullRequestUrl: "https://github.com/openclaw/clawsweeper/pull/1023",
+                  relatedRepo: "openclaw/clawsweeper",
+                }
+              : {}),
+          },
+        },
+      ),
+      "implemented_on_main",
+    );
+    assert.match(comment, /suspected predecessor, not a causality claim/);
+    assert.match(comment, /source commit `cccccccccccc` by Source Author/);
+    assert.match(comment, /Possible regression — probable \(reproduction; reviewed change\)\./);
+    if (evidenceType === "rewrite_equivalent") {
+      assert.match(comment, /safely related PR \[#1023\]/);
+      assert.doesNotMatch(comment, /No predecessor PR is attributed/);
+    } else {
+      assert.match(comment, /no PR verified/);
+    }
+  }
+});
 
-  assert.match(
-    comment,
-    /Possible regression — suspected \(failure trace\)\. No predecessor PR is attributed\./,
-  );
-  assert.doesNotMatch(comment, /https:\/\/github\.com\/openclaw\/clawsweeper\/pull\//);
+test("provenance author names cannot trigger mentions and literal unknown remains visible", () => {
+  for (const sourceAuthor of ["@openclaw/maintainers", "unknown"]) {
+    const comment = renderReviewCommentFromReport(
+      implementedCloseReport(
+        {},
+        {
+          regressionAssessment: {
+            confidence: "suspected",
+            supportingEvidence: ["reviewed_change"],
+          },
+          regressionProvenance: { ...suspectedPredecessor, sourceAuthor },
+        },
+      ),
+      "implemented_on_main",
+    );
+    if (sourceAuthor === "unknown") {
+      assert.match(comment, /source commit `cccccccccccc` by unknown; no PR verified/);
+    } else {
+      assert.doesNotMatch(comment, /@openclaw\/maintainers/);
+      assert.match(comment, /@\u200bopenclaw\/maintainers/);
+    }
+  }
+});
+
+test("regression assessments retain confidence and evidence without attributing a predecessor", () => {
+  for (const regressionAssessment of [
+    { confidence: "probable", supportingEvidence: ["reproduction", "reviewed_change"] },
+    { confidence: "suspected", supportingEvidence: ["failure_trace"] },
+  ] satisfies NonNullable<Decision["regressionAssessment"]>[]) {
+    const comment = renderReviewCommentFromReport(
+      implementedCloseReport(
+        {
+          regression_provenance_pr_url: "https://github.com/openclaw/clawsweeper/pull/936",
+        },
+        { regressionAssessment, regressionProvenance: null },
+      ),
+      "implemented_on_main",
+    );
+    assert.match(
+      comment,
+      regressionAssessment.confidence === "probable"
+        ? /Possible regression — probable \(reproduction; reviewed change\)\. No predecessor PR is attributed\./
+        : /Possible regression — suspected \(failure trace\)\. No predecessor PR is attributed\./,
+    );
+    assert.doesNotMatch(comment, /pull\/936|Verified regression provenance/);
+  }
 });
 
 test("pull request close comments emit close-required automation markers", () => {
@@ -1936,26 +1972,27 @@ test("pull request close comments emit close-required automation markers", () =>
 
   assert.match(
     comment,
-    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-verdict:close item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.match(
     comment,
-    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef live_verification=absent action_taken=proposed_close reason=implemented_on_main -->/,
+    /<!-- clawsweeper-action:close-required item=74270 sha=abc123def456abc123def456abc123def456abcd confidence=high updated_at=2026-05-01T00:00:00Z reviewed_at=[^ ]+ lease_owner=fixture lease_comment_id=1059 source_revision=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef action_taken=proposed_close reason=implemented_on_main -->/,
   );
   assert.doesNotMatch(comment, /clawsweeper-verdict:needs-human/);
 });
 
 test("design issue reviews preserve the model's decision without inventing reproduction requests", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "1624",
-      decision: "keep_open",
-      close_reason: "none",
-      work_candidate: "manual_review",
-      reproduction_status: "not_applicable",
-      reproduction_confidence: "high",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "1624",
+        decision: "keep_open",
+        close_reason: "none",
+        work_candidate: "manual_review",
+        reproduction_status: "not_applicable",
+        reproduction_confidence: "high",
+      })}
 
 ## Summary
 
@@ -1971,6 +2008,16 @@ Candidate: manual_review
 
 Reason: Decide whether to support the external artifact contract.
 `,
+      {
+        summary: "The external artifact contract needs a maintainer design decision.",
+        reproductionStatus: "not_applicable",
+        reproductionConfidence: "high",
+        reproductionAssessment:
+          "Not applicable. This proposes a new integration contract and reports no broken existing behavior.",
+        workCandidate: "manual_review",
+        workReason: "Decide whether to support the external artifact contract.",
+      },
+    ),
     "none",
   );
 
@@ -1985,15 +2032,16 @@ Reason: Decide whether to support the external artifact contract.
 
 test("issue reviews retain specific model-authored reproduction requests", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "75878",
-      decision: "keep_open",
-      close_reason: "none",
-      work_candidate: "manual_review",
-      reproduction_status: "unclear",
-      reproduction_confidence: "low",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "75878",
+        decision: "keep_open",
+        close_reason: "none",
+        work_candidate: "manual_review",
+        reproduction_status: "unclear",
+        reproduction_confidence: "low",
+      })}
 
 ## Summary
 
@@ -2009,6 +2057,16 @@ Candidate: manual_review
 
 Reason: Provide the failing command and redacted error output.
 `,
+      {
+        summary: "Keep open. The app sometimes does the wrong thing.",
+        reproductionStatus: "unclear",
+        reproductionConfidence: "low",
+        reproductionAssessment:
+          "Unclear. The report describes an intermittent visible failure but does not include enough information to reproduce it.",
+        workCandidate: "manual_review",
+        workReason: "Provide the failing command and redacted error output.",
+      },
+    ),
     "none",
   );
 
@@ -2022,15 +2080,16 @@ Reason: Provide the failing command and redacted error output.
 
 test("pull request review comments include dedicated security review", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74265",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74265",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "none",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      })}
 
 ## Summary
 
@@ -2092,17 +2151,63 @@ Reason: Normal maintainer review is sufficient.
 
 - none
 `,
+      {
+        summary: "Keep this PR open for maintainer review.",
+        changeSummary: "Updates a workflow permission for review comments.",
+        bestSolution: "Land the workflow permission change after normal CI.",
+        securityReview: {
+          status: "needs_attention",
+          summary:
+            "The workflow now asks for issue write permission, so the permission scope needs maintainer confirmation.",
+          concerns: [
+            {
+              title: "Confirm issue write scope",
+              body: "The review shard now writes comments during review, so maintainers should confirm the app permission is intended.",
+              severity: "medium",
+              confidenceScore: 0.82,
+              file: ".github/workflows/sweep.yml",
+              line: 652,
+            },
+          ],
+        },
+        evidence: [
+          {
+            repo: null,
+            label: "workflow",
+            detail: "Review shard requests issue write permission.",
+            file: null,
+            line: null,
+            sha: null,
+            command: null,
+          },
+        ],
+        likelyOwners: [
+          {
+            person: "@alice",
+            role: "recent workflow maintainer",
+            reason: "touched the workflow recently",
+            commits: ["abc123"],
+            files: [".github/workflows/sweep.yml"],
+            confidence: "high",
+          },
+        ],
+      },
+    ),
     "none",
   );
 
-  assert.match(comment, /\| \*\*Security\*\* \| Needs attention \|/);
+  assert.match(
+    comment,
+    /## Findings\n\n- \[medium\] Confirm issue write scope — `\.github\/workflows\/sweep\.yml:652`/,
+  );
   assert.match(comment, /### Security/);
   assert.match(comment, /Needs attention:/);
   assert.match(comment, /Confirm issue write scope/);
   assert.match(comment, /Agent review details/);
-  assert.doesNotMatch(comment, /recent workflow maintainer/);
-  assert.match(comment, /unverified routing candidate/);
-  assert.doesNotMatch(comment, /touched the workflow recently/);
+  assert.doesNotMatch(
+    comment,
+    /recent workflow maintainer|alice|routing candidate|touched the workflow recently/,
+  );
   assert.match(
     comment,
     /<!-- clawsweeper-security:security-sensitive item=74265 sha=abc123def456abc123def456abc123def456abcd/,
@@ -2115,15 +2220,16 @@ Reason: Normal maintainer review is sufficient.
 
 test("pull request keep-open review comments surface Codex-style findings", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74268",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "queue_fix_pr",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74268",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "queue_fix_pr",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      })}
 
 ## Summary
 
@@ -2161,6 +2267,29 @@ Status: candidate
 
 Reason: The fix is narrow and can be made on the PR branch.
 `,
+      {
+        summary: "This PR needs one correctness fix before merge.",
+        changeSummary: "Adds a config patch command for scripted config edits.",
+        bestSolution: "Reject misspelled replacement paths before writing the updated config.",
+        overallCorrectness: "patch is incorrect",
+        overallConfidenceScore: 0.86,
+        reviewFindings: [
+          {
+            title: "Validate replace paths",
+            body: "A misspelled replace path is currently ignored, so the command can report success while leaving the intended setting unchanged.",
+            priority: 1,
+            confidenceScore: 0.9,
+            file: "src/config/apply.ts",
+            lineStart: 42,
+            lineEnd: 44,
+          },
+        ],
+        workCandidate: "queue_fix_pr",
+        workConfidence: "high",
+        workPriority: "high",
+        workReason: "The fix is narrow and can be made on the PR branch.",
+      },
+    ),
     "none",
   );
 
@@ -2175,20 +2304,21 @@ Reason: The fix is narrow and can be made on the PR branch.
   assert.match(comment, /Full review comments:/);
   assert.match(comment, /A misspelled replace path is currently ignored/);
   assert.match(comment, /Overall correctness: patch is incorrect/);
-  assert.match(comment, /<!-- clawsweeper-action:fix-required/);
+  assert.doesNotMatch(comment, /<!-- clawsweeper-action:fix-required/);
 });
 
 test("pull request keep-open review comments suppress duplicate best solution text", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74266",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74266",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "none",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      })}
 
 ## Summary
 
@@ -2212,6 +2342,8 @@ Full review comments:
 
 - none
 `,
+      { bestSolution: "Land this docs-only PR after maintainer review.", workReason: "" },
+    ),
     "none",
   );
 
@@ -2223,15 +2355,16 @@ Full review comments:
 
 test("pull request review comments do not priority-prefix routine no-op guidance", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74269",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74269",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        work_candidate: "none",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      })}
 
 ## Summary
 
@@ -2260,6 +2393,12 @@ Full review comments:
 
 - none
 `,
+      {
+        workReason: "",
+        bestSolution:
+          "No ClawSweeper repair lane is needed; the submitted PR is narrow and the remaining action is normal maintainer review and CI.",
+      },
+    ),
     "none",
   );
 
@@ -2269,51 +2408,19 @@ Full review comments:
   assert.doesNotMatch(comment, /\[P2\] No ClawSweeper repair lane is needed/);
 });
 
-test("pull request next-step priority prefixes classify fail-closed work as P1", () => {
-  const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74268",
-      decision: "keep_open",
-      close_reason: "none",
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
-
-## Summary
-
-Keep this compatibility PR open for maintainer review.
-
-## What This Changes
-
-Changes relay restart handling.
-
-## Best Possible Solution
-
-Prove the fail-closed compatibility break is handled before merge.
-`,
-    "none",
-  );
-
-  assert.match(
-    comment,
-    /- \[ \] \*\*Complete next step \(P1\)\*\* - Prove the fail-closed compatibility break is handled before merge\./,
-  );
-  assert.doesNotMatch(comment, /\*\*\[P1\]\*\*/);
-});
-
 test("pull request automerge review comments can emit pass verdicts", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "pull_request",
-      number: "74453",
-      decision: "keep_open",
-      close_reason: "none",
-      review_status: "complete",
-      labels: JSON.stringify(["clawsweeper:automerge"]),
-      work_candidate: "none",
-      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-    })}
+    typedRendererReport(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "74453",
+        decision: "keep_open",
+        close_reason: "none",
+        review_status: "complete",
+        labels: JSON.stringify(["clawsweeper:automerge"]),
+        work_candidate: "none",
+        pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+      })}
 
 ## Summary
 
@@ -2337,6 +2444,8 @@ Full review comments:
 
 - none
 `,
+      { bestSolution: "Merge after required checks are green." },
+    ),
     "none",
   );
 
@@ -2352,17 +2461,18 @@ Full review comments:
 });
 
 test("coverage-proof blocked PR reports do not emit repair pass verdicts", () => {
-  const markers = reviewAutomationMarkersFromReport(`${reportFrontMatter({
-    type: "pull_request",
-    number: "74456",
-    decision: "keep_open",
-    close_reason: "none",
-    action_taken: "skipped_pr_close_coverage_proof",
-    review_status: "complete",
-    labels: JSON.stringify(["clawsweeper:automerge"]),
-    work_candidate: "none",
-    pull_head_sha: "abc123def456abc123def456abc123def456abcd",
-  })}
+  const markers = reviewAutomationMarkersFromReport(
+    typedRendererReport(`${reportFrontMatter({
+      type: "pull_request",
+      number: "74456",
+      decision: "keep_open",
+      close_reason: "none",
+      action_taken: "skipped_pr_close_coverage_proof",
+      review_status: "complete",
+      labels: JSON.stringify(["clawsweeper:automerge"]),
+      work_candidate: "none",
+      pull_head_sha: "abc123def456abc123def456abc123def456abcd",
+    })}
 
 ## Summary
 
@@ -2377,36 +2487,13 @@ Overall confidence: 0.9
 Full review comments:
 
 - none
-`);
+`),
+  );
 
   assert.match(markers, /clawsweeper-verdict:needs-human/);
   assert.doesNotMatch(markers, /clawsweeper-verdict:pass/);
 });
 
-test("recovery cleanup preserves durable-review ordering and exact publication batching", () => {
-  const source = readFileSync("src/clawsweeper-apply-decision-workflow.ts", "utf8");
-  const delayedBatch = source.indexOf("const delayIssueLabelBatchForRecoveryCleanup =");
-  const publication = source.indexOf("syncedComment = upsertReviewComment(");
-  const recoveryCleanup = source.indexOf("clearResolvedReviewRecoveryLabel({", publication);
-  const delayedFlush = source.indexOf(
-    "if (delayIssueLabelBatchForRecoveryCleanup)",
-    recoveryCleanup,
-  );
-  const nextCatch = source.indexOf("} catch (error)", delayedFlush);
-
-  assert.ok(delayedBatch >= 0);
-  assert.ok(delayedBatch < publication);
-  assert.ok(publication >= 0);
-  assert.ok(recoveryCleanup > publication);
-  assert.ok(delayedFlush > recoveryCleanup);
-  assert.match(
-    source.slice(delayedBatch, publication),
-    /if \(!delayIssueLabelBatchForRecoveryCleanup\)/,
-  );
-  assert.match(source.slice(recoveryCleanup, delayedFlush), /if \(issueLabelBatchActive\)/);
-  assert.match(source.slice(delayedFlush, nextCatch), /flushIssueLabelBatchForDurableComment\(\);/);
-  assert.match(source.slice(recoveryCleanup, nextCatch), /removeLabel:\s*removeIssueLabel/);
-});
 test("forged evidence continuation lines in evidence prose cannot replace the entry's repository, file, commit, or command through the durable report", () => {
   const forgedSha = "e".repeat(40);
   const entry = {
@@ -2427,7 +2514,7 @@ test("forged evidence continuation lines in evidence prose cannot replace the en
   const report = evidenceReport([entry], "keep_open");
   assert.doesNotMatch(report, /^\s+- sha: e{40}$/m);
   assert.match(report, /^\s+- sha&#58; e{40}$/m);
-  const parsed = evidenceParser.reportEvidence(report);
+  const parsed = readReviewRecord(report)!.decision.evidence;
   assert.equal(parsed.length, 1);
   assert.equal(parsed[0]!.repo, "openclaw/openclaw");
   assert.equal(parsed[0]!.file, null);

@@ -684,7 +684,10 @@ exec '${process.execPath}' '${transport}' curl "\${args[@]}"
   assert.ok(ready, redact(workerLog));
   const { default: YAML } = await import("yaml");
   const sweep = YAML.parse(readFileSync(join(source, ".github/workflows/sweep.yml"), "utf8"));
-  const admissionStep = sweep.jobs.plan.steps.find(
+  const planner = YAML.parse(
+    readFileSync(join(source, ".github/workflows/review-plan.yml"), "utf8"),
+  );
+  const admissionStep = planner.jobs.plan.steps.find(
     (step) => step.name === "Admit explicit manual reviews",
   );
   const directStep = Object.values(sweep.jobs)
@@ -804,8 +807,8 @@ exec '${process.execPath}' '${transport}' curl "\${args[@]}"
     );
     return matching.at(-1);
   }
-  const { itemSourceRevisionSha256ForTest } = await import(
-    pathToFileURL(join(source, "dist/clawsweeper.js"))
+  const { itemSourceRevisionSha256 } = await import(
+    pathToFileURL(join(source, "dist/clawsweeper-source-revision.js"))
   );
   async function reviewedRecord(number, repeatRunId) {
     const dispatch = dispatches.findLast((d) => d.item_number === number);
@@ -859,7 +862,9 @@ exec '${process.execPath}' '${transport}' curl "\${args[@]}"
     }
     const work = join(root, repeatRunId ? `${number}-${runId}` : String(number));
     mkdirSync(join(work, "artifacts/event"), { recursive: true });
+    // Workflow steps run from a built checkout: scripts and dist sit side by side.
     symlinkSync(join(source, "scripts"), join(work, "scripts"));
+    symlinkSync(join(source, "dist"), join(work, "dist"));
     const env = {
       GITHUB_RUN_ID: runId,
       EXACT_REVIEW_ITEM_KEY: tuple.item_key,
@@ -895,7 +900,7 @@ exec '${process.execPath}' '${transport}' curl "\${args[@]}"
     const lease = JSON.parse(reserved.stdout.trim());
     assert.equal(lease.status, "posted");
     const reviewedAt = new Date().toISOString();
-    const sourceRevision = itemSourceRevisionSha256ForTest(items.get(number), comments.get(number));
+    const sourceRevision = itemSourceRevisionSha256(items.get(number), comments.get(number));
     let reviewActivityCursor;
     if (number === 76) {
       const { reviewedPrActivityCursorV2Query, reviewedPrActivityCursorsV2FromGraphql } =
@@ -1668,69 +1673,6 @@ exec '${process.execPath}' '${transport}' curl "\${args[@]}"
     assert.ok(canonical.content.includes(`reviewed_at: ${reviewedAt}`));
     writeFileSync(join(reportDir, `${number}.md`), canonical.content);
   }
-  const discovery = await command(
-    process.execPath,
-    [
-      join(source, "dist/repair/issue-implementation-intake.js"),
-      "candidates",
-      "--enabled",
-      "true",
-      "--candidate-kind",
-      "strict_bug",
-      "--target-repo",
-      repo,
-      "--artifact-dir",
-      reportDir,
-      "--report-dir",
-      reportDir,
-    ],
-    {},
-    workspace,
-  );
-  assert.equal(JSON.parse(discovery.stdout).count, 0);
-  observations.push({ scenario: "restricted implementation discovery", count: 0 });
-  const controlDir = join(workspace, "ordinary-control");
-  mkdirSync(controlDir);
-  const restricted = readFileSync(join(reportDir, "71.md"), "utf8");
-  for (const [scenario, content, count] of [
-    [
-      "ordinary implementation discovery",
-      restricted.replace(/^publication_policy: record_comment_only\n/m, ""),
-      1,
-    ],
-    [
-      "ambiguous implementation provenance",
-      restricted.replace(
-        /^publication_policy: record_comment_only/m,
-        "publication_policy: record_comment_only\npublication_policy: record_comment_only",
-      ),
-      0,
-    ],
-  ]) {
-    writeFileSync(join(controlDir, "71.md"), content);
-    const result = await command(
-      process.execPath,
-      [
-        join(source, "dist/repair/issue-implementation-intake.js"),
-        "candidates",
-        "--enabled",
-        "true",
-        "--candidate-kind",
-        "strict_bug",
-        "--target-repo",
-        repo,
-        "--artifact-dir",
-        controlDir,
-        "--report-dir",
-        controlDir,
-      ],
-      {},
-      workspace,
-    );
-    assert.equal(JSON.parse(result.stdout).count, count, result.stdout);
-    observations.push({ scenario, count });
-  }
-
   const lifecycle = await post("exact-review/lifecycle-audit/inventory", { page_size: 100 });
   const inventory = lifecycle.exact_review_lifecycle_audit_inventory;
   assert.equal(inventory.collection.state, "complete", JSON.stringify(lifecycle));

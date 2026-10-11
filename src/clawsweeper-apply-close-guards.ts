@@ -1,5 +1,9 @@
 import { readFileSync } from "node:fs";
 import type { CreateApplyDecisionWorkflowDependencies } from "./clawsweeper-apply-dependencies.js";
+import {
+  unreadableReviewRecordReason,
+  validateReportClose,
+} from "./clawsweeper-apply-close-decision.js";
 import { liveApplyCloseReasonPolicyBlock } from "./clawsweeper-apply-close-policies.js";
 import type {
   ActionTaken,
@@ -11,7 +15,20 @@ import type {
   PrCloseCoverageProofGateBlock,
   ReportEntry,
 } from "./clawsweeper-types.js";
-import { maintainerDecisionBlocksClose, type MaintainerDecision } from "./decision-packets.js";
+import type { MaintainerDecision } from "./decision-packets.js";
+import { frontMatterValue } from "./report-front-matter.js";
+import {
+  hasAutoCloseAllowedMetadata,
+  hasVerifiedLocalCheckoutAccess,
+  isApplyCloseCandidateReport,
+  isRetryableCloseSkipReport,
+  reportCloseReason,
+  reportItemKind,
+  shouldSyncReviewComment,
+} from "./clawsweeper-record-metadata.js";
+import { lockedConversationApplyReason } from "./clawsweeper-item-policy.js";
+import { markdownRepository } from "./clawsweeper-repository-paths.js";
+import { reportReviewDecision } from "./report-review-decision.js";
 
 export function markLockedConversationApplySkipped(
   reason: string | null,
@@ -48,18 +65,14 @@ export function requiresLockedReviewCommentMutation(
   {
     commentBody,
     commentBodyMatches,
-    frontMatterValue,
     markedReviewCommentBody,
     renderReviewCommentFromReport,
-    shouldSyncReviewComment,
   }: Pick<
     CreateApplyDecisionWorkflowDependencies,
     | "commentBody"
     | "commentBodyMatches"
-    | "frontMatterValue"
     | "markedReviewCommentBody"
     | "renderReviewCommentFromReport"
-    | "shouldSyncReviewComment"
   >,
   options: {
     action: string | undefined;
@@ -188,30 +201,17 @@ export function createApplyCloseGuards(
     commentUpdatedAt,
     duplicateCanonicalPullRequestBlockReason,
     fetchItem,
-    frontMatterValue,
-    hasAutoCloseAllowedMetadata,
-    hasVerifiedLocalCheckoutAccess,
-    isApplyCloseCandidateReport,
     isMaintainerAuthorAssociation,
-    isRetryableCloseSkipReport,
     issueReviewCommentState,
-    lockedConversationApplyReason,
     isVerifiedFixedCloseReason,
     itemSnapshotHash,
-    markdownRepository,
     markedReviewCommentBody,
     normalizeAuthorAssociation,
     openClosingPullRequestApplyReason,
     renderReviewCommentFromReport,
-    reportCloseReason,
-    reportDecision,
-    reportItemKind,
     reviewCommentBodyDigest,
     reviewCommentHashMatches,
-    reviewSectionValue,
     sameAuthorCounterpartApplyReason,
-    shouldSyncReviewComment,
-    validateCloseDecision,
   } = dependencies;
 
   const currentCloseGatesPassed = (): boolean => {
@@ -225,17 +225,17 @@ export function createApplyCloseGuards(
     if (!closeReason || !closeReasonEnabled(closeReason, applyCloseReasons)) return false;
     if (needsReviewCommentSync) return false;
     if (
-      !validateCloseDecision(
+      !validateReportClose(
+        dependencies,
         {
           repo,
           kind: item.kind,
           labels: item.labels,
           authorAssociation: item.authorAssociation,
         },
-        reportDecision(markdown, closeReason),
-        {
-          requireCloseComment: !isRetryableSkippedClose,
-        },
+        markdown,
+        closeReason,
+        { requireCloseComment: !isRetryableSkippedClose },
       ).ok
     ) {
       return false;
@@ -292,8 +292,10 @@ export function createApplyCloseGuards(
       const counterpartEntry = openReportEntry(counterpartNumber);
       if (counterpartEntry) {
         const counterpartMarkdown = readFileSync(counterpartEntry.path, "utf8");
+        if (unreadableReviewRecordReason(counterpartMarkdown)) return false;
+        const counterpartReview = reportReviewDecision(counterpartMarkdown);
         const counterpartMaintainerDecisionBlocked =
-          maintainerDecisionBlocksClose(counterpartMarkdown);
+          counterpartReview.maintainerDecision?.required === true;
         const counterpartRepo = markdownRepository(counterpartMarkdown, counterpartEntry.path);
         const counterpartReason = reportCloseReason(counterpartMarkdown);
         if (
@@ -328,7 +330,7 @@ export function createApplyCloseGuards(
           );
           const counterpartReviewState = issueReviewCommentState(
             counterpartNumber,
-            [counterpartReviewCommentBody, reviewSectionValue(counterpartMarkdown, "closeComment")],
+            [counterpartReviewCommentBody, counterpartReview.publishedCloseComment],
             { bypassGenerationCache: true },
           );
           const counterpartReviewComment = counterpartReviewState.reviewComment;
@@ -430,14 +432,16 @@ export function createApplyCloseGuards(
             (!counterpartUpdatedSinceReview || counterpartReviewCommentOnlyUpdate) &&
             !counterpartSnapshotChanged &&
             !counterpartNeedsReviewCommentSync &&
-            validateCloseDecision(
+            validateReportClose(
+              dependencies,
               {
                 repo: counterpartRepo,
                 kind: counterpartItem.kind,
                 labels: counterpartItem.labels,
                 authorAssociation: counterpartItem.authorAssociation,
               },
-              reportDecision(counterpartMarkdown, counterpartReason),
+              counterpartMarkdown,
+              counterpartReason,
               { requireCloseComment: !isRetryableCloseSkipReport(counterpartMarkdown) },
             ).ok &&
             closeReasonApplyAgeSkipReason(counterpartItem, counterpartReason, {

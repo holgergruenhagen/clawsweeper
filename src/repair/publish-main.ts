@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { sha256 } from "../content-hash.js";
 import { requiredCliValue } from "../clawsweeper-args.js";
-import { createHash } from "node:crypto";
 import {
   appendFileSync,
   existsSync,
@@ -49,6 +48,8 @@ type PublishMainRuntime = {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: () => Date;
+  sleep?: (milliseconds: number) => Promise<void>;
+  random?: () => number;
   publishGit?: (options: GitPublishOptions) => PublishResult;
   root?: string;
 };
@@ -93,11 +94,16 @@ export async function publishMainWithStateAppend(
           stateRoot: canonicalBaselineRoot!,
           env,
           ...(runtime.fetchImpl ? { fetchImpl: runtime.fetchImpl } : {}),
+          ...(runtime.now ? { now: runtime.now } : {}),
+          ...(runtime.sleep ? { sleep: runtime.sleep } : {}),
+          ...(runtime.random ? { random: runtime.random } : {}),
         });
         if (outcome === "skipped") canonicalSkippedCount += 1;
         else canonicalResolvedCount += 1;
       } catch (error) {
-        if (!isolateFailures || isCanonicalInfrastructureError(error)) throw error;
+        if (!isolateFailures || isCanonicalInfrastructureError(error)) {
+          throw error;
+        }
         canonicalFailedCount += 1;
         console.error(`[canonical reconcile] ${item.key} failed: ${publishErrorMessage(error)}`);
       }
@@ -222,19 +228,21 @@ function planCanonicalRecordTuples(
     const match = RECORD_TUPLE_PATH.exec(path);
     return Boolean(match?.[1] && match[3] && capturedKeys.has(`${match[1]}/${match[3]}`));
   };
-  const localFiles = new Map(
-    [...collectRequestedRecordFiles(root, recordRequests)].filter(([path]) => includeFile(path)),
-  );
-  const stateFiles = new Map(
-    [...collectRequestedRecordFiles(stateRoot, recordRequests)].filter(([path]) =>
-      includeFile(path),
-    ),
-  );
-  const changedPaths = new Set(
-    [...new Set([...localFiles.keys(), ...stateFiles.keys()])].filter(
-      (path) => localFiles.get(path) !== stateFiles.get(path),
-    ),
-  );
+  // Compare one file pair at a time and keep only changed paths: a whole
+  // records/<repo> request spans the repository, too large to hold twice.
+  const localPaths = collectRequestedRecordPaths(root, recordRequests);
+  const statePaths = collectRequestedRecordPaths(stateRoot, recordRequests);
+  const changedPaths = new Set<string>();
+  for (const path of new Set([...localPaths, ...statePaths])) {
+    if (!includeFile(path)) continue;
+    if (
+      !localPaths.has(path) ||
+      !statePaths.has(path) ||
+      readContainedRegularFile(root, path) !== readContainedRegularFile(stateRoot, path)
+    ) {
+      changedPaths.add(path);
+    }
+  }
   const changedTupleKeys = new Set<string>();
   for (const path of changedPaths) {
     const match = RECORD_TUPLE_PATH.exec(path);
@@ -249,10 +257,8 @@ function planCanonicalRecordTuples(
       const [repository, number] = key.split("/");
       if (!repository || !number) throw new Error(`invalid canonical tuple key: ${key}`);
       const paths = recordTuplePaths({ repository, number });
-      const localContent = (path: string) =>
-        localFiles.has(path) ? localFiles.get(path)! : readOptionalRecordFile(root, path);
-      const stateContent = (path: string) =>
-        stateFiles.has(path) ? stateFiles.get(path)! : readOptionalRecordFile(stateRoot, path);
+      const localContent = (path: string) => readOptionalRecordFile(root, path);
+      const stateContent = (path: string) => readOptionalRecordFile(stateRoot, path);
       const tuple: RecordTupleContents = {
         paths,
         item: localContent(paths.item),
@@ -271,9 +277,7 @@ function planCanonicalRecordTuples(
           ...(content === null ? {} : { contentBase64: Buffer.from(content).toString("base64") }),
         };
       });
-      const contentHash = createHash("sha256")
-        .update(JSON.stringify({ key, operations }))
-        .digest("hex");
+      const contentHash = sha256(JSON.stringify({ key, operations }));
       const deliveryPrefix =
         env.CLAWSWEEPER_CANONICAL_PUBLICATION_KIND === "reconcile"
           ? `record-reconcile:${repository}:${number}`
@@ -322,13 +326,58 @@ type CanonicalPublicationOptions = {
   stateRoot: string;
   env: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  now?: () => Date;
+  sleep?: (milliseconds: number) => Promise<void>;
+  random?: () => number;
 };
+
+// Each unchanged mutation gets at most five POSTs and 120 seconds of backoff.
+// Keep the payload (especially deliveryId) intact: the Worker checks its durable
+// receipt before CAS, so even a lost response after a commit is safe to retry.
+async function postCanonicalRecordTupleWithTransientRetries(
+  options: CanonicalPublicationOptions,
+): Promise<void> {
+  const sleep =
+    options.sleep ??
+    ((milliseconds) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds)));
+  let waited = 0;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await postCanonicalRecordTuple(options);
+      return;
+    } catch (error) {
+      const transient =
+        error instanceof CanonicalRecordTupleRequestError
+          ? error.status === 429 || (error.status >= 500 && error.status <= 599)
+          : error instanceof Error &&
+            /(?:\bECONNRESET\b|\bETIMEDOUT\b|fetch failed)/i.test(error.message);
+      if (!transient || attempt === 4) throw error;
+      const backoff =
+        Math.min(10_000 * 2 ** attempt, 50_000) * (0.8 + 0.2 * (options.random ?? Math.random)());
+      const retryAfter =
+        error instanceof CanonicalRecordTupleRequestError ? error.retryAfter : null;
+      let retryAfterMs = 0;
+      if (retryAfter !== null) {
+        const seconds = Number(retryAfter);
+        retryAfterMs = Number.isFinite(seconds)
+          ? Math.max(0, seconds * 1_000)
+          : Math.max(0, Date.parse(retryAfter) - (options.now?.() ?? new Date()).getTime());
+        if (!Number.isFinite(retryAfterMs)) retryAfterMs = 0;
+      }
+      const delay = Math.max(backoff, retryAfterMs);
+      // Never retry earlier than Retry-After, or exceed the bounded wait budget.
+      if (waited + delay > 120_000) throw error;
+      await sleep(delay);
+      waited += delay;
+    }
+  }
+}
 
 async function postCanonicalRecordTupleWithRecovery(
   options: CanonicalPublicationOptions,
 ): Promise<CanonicalPublicationOutcome> {
   try {
-    await postCanonicalRecordTuple(options);
+    await postCanonicalRecordTupleWithTransientRetries(options);
     return "published";
   } catch (error) {
     if (!(error instanceof CanonicalRecordTupleConflictError)) throw error;
@@ -373,20 +422,16 @@ async function postCanonicalRecordTupleWithRecovery(
         ...(content === null ? {} : { contentBase64: Buffer.from(content).toString("base64") }),
       };
     });
-    const contentHash = createHash("sha256")
-      .update(JSON.stringify({ key: options.mutation.key, operations }))
-      .digest("hex");
+    const contentHash = sha256(JSON.stringify({ key: options.mutation.key, operations }));
     const retryMutation: CanonicalRecordTupleMutation = {
       ...options.mutation,
       deliveryId: `record-reconcile:${repoSlug}:${itemNumber}:${contentHash}`,
       operations,
     };
     try {
-      await postCanonicalRecordTuple({
-        queueUrl: options.queueUrl,
-        webhookSecret: options.webhookSecret,
+      await postCanonicalRecordTupleWithTransientRetries({
+        ...options,
         mutation: retryMutation,
-        ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
       });
     } catch (retryError) {
       if (!(retryError instanceof CanonicalRecordTupleConflictError)) throw retryError;
@@ -503,20 +548,16 @@ async function recoverNonReconcilePublicationConflict(
       ...(content === null ? {} : { contentBase64: Buffer.from(content).toString("base64") }),
     };
   });
-  const contentHash = createHash("sha256")
-    .update(JSON.stringify({ key: options.mutation.key, operations }))
-    .digest("hex");
+  const contentHash = sha256(JSON.stringify({ key: options.mutation.key, operations }));
   const retryMutation: CanonicalRecordTupleMutation = {
     ...options.mutation,
     deliveryId: `record-tuple-rebase:${deliveryPart(options.env.GITHUB_RUN_ID, "local")}:${deliveryPart(options.env.GITHUB_RUN_ATTEMPT, "1")}:${contentHash}`,
     operations,
   };
   try {
-    await postCanonicalRecordTuple({
-      queueUrl: options.queueUrl,
-      webhookSecret: options.webhookSecret,
+    await postCanonicalRecordTupleWithTransientRetries({
+      ...options,
       mutation: retryMutation,
-      ...(options.fetchImpl ? { fetchImpl: options.fetchImpl } : {}),
     });
   } catch (retryError) {
     if (!(retryError instanceof CanonicalRecordTupleConflictError)) throw retryError;
@@ -773,6 +814,14 @@ function readOptionalRecordFile(root: string, path: string): string | null {
   return readContainedRegularFile(root, path);
 }
 
+function collectRequestedRecordPaths(root: string, requestedPaths: readonly string[]) {
+  const paths = new Set<string>();
+  for (const requestedPath of requestedPaths) {
+    visitRecordFiles(root, normalizedPath(requestedPath), (path) => paths.add(path));
+  }
+  return paths;
+}
+
 function collectRequestedRecordFiles(root: string, requestedPaths: readonly string[]) {
   const files = new Map<string, string>();
   for (const requestedPath of requestedPaths) {
@@ -782,19 +831,25 @@ function collectRequestedRecordFiles(root: string, requestedPaths: readonly stri
 }
 
 function collectRecordFiles(root: string, relativePath: string, files: Map<string, string>): void {
+  visitRecordFiles(root, relativePath, (path) =>
+    files.set(path, readContainedRegularFile(root, path)),
+  );
+}
+
+function visitRecordFiles(root: string, relativePath: string, visit: (path: string) => void) {
   const absolute = resolve(root, relativePath);
   if (!existsSync(absolute)) return;
   const stat = lstatSync(absolute);
   if (stat.isSymbolicLink())
     throw new Error(`record publication path is symbolic: ${relativePath}`);
   if (stat.isFile()) {
-    files.set(relativePath, readContainedRegularFile(root, relativePath));
+    visit(relativePath);
     return;
   }
   if (!stat.isDirectory())
     throw new Error(`record publication path is not regular: ${relativePath}`);
   for (const entry of readdirSync(absolute, { withFileTypes: true })) {
-    collectRecordFiles(root, `${relativePath}/${entry.name}`, files);
+    visitRecordFiles(root, `${relativePath}/${entry.name}`, visit);
   }
 }
 

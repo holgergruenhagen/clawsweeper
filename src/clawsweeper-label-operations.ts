@@ -1,6 +1,5 @@
 import { nextPrRatingLabels } from "./clawsweeper-rating.js";
 import {
-  BULK_FILED_LABEL,
   FEATURE_SHOWCASE_LABEL,
   GOOD_FIRST_ISSUE_LABEL,
   IMPACT_LABEL_NAMES,
@@ -16,13 +15,13 @@ import {
   PR_STATUS_LABEL_NAMES,
   STALE_LABEL,
   TELEGRAM_VISIBLE_PROOF_LABEL,
+  type MergeRiskLabelName,
 } from "./clawsweeper-policy.js";
 import type {
   FeatureShowcase,
   ImpactLabelName,
   IssueAdvisoryLabelState,
   MaturityLabelName,
-  MergeRiskLabelName,
   OverallCorrectness,
   PrRating,
   PrStatusLabelKind,
@@ -31,31 +30,30 @@ import type {
   TelegramVisibleProof,
   TriagePriority,
 } from "./clawsweeper-types.js";
-import type { LabelSynchronizationDependencies } from "./clawsweeper-label-dependencies.js";
-import type { createLabelSelectionPolicy } from "./clawsweeper-label-selection.js";
-import type { createLabelMutationOperations } from "./clawsweeper-label-mutations.js";
+import { BULK_FILED_LABEL } from "./repair/exact-review-guard-labels.js";
+import {
+  hasNormalizedLabel,
+  isBulkFilerExemptAuthorAssociation,
+  isBulkFilerExemptRepositoryPermission,
+  normalizeLabelName,
+} from "./clawsweeper-item-policy.js";
+import { nextFeatureShowcaseLabels, nextPrStatusLabels } from "./clawsweeper-label-policy.js";
+import {
+  isIssueAdvisoryLabel,
+  nextImpactLabels,
+  nextIssueAdvisoryLabels,
+  nextMaturityLabels,
+  nextMergeRiskLabels,
+  nextPriorityLabels,
+  nextRealBehaviorProofMediaLabels,
+  nextRealBehaviorProofSufficientLabels,
+  nextTelegramVisibleProofLabels,
+} from "./clawsweeper-label-selection.js";
+import { missingLabelError, type LabelMutations } from "./clawsweeper-label-mutations.js";
 
-export function createLabelSyncOperations(
-  dependencies: LabelSynchronizationDependencies &
-    ReturnType<typeof createLabelSelectionPolicy> &
-    ReturnType<typeof createLabelMutationOperations>,
-) {
+// Sync operations write through one label mutation instance, so they share its batch.
+export function createLabelSyncOperations(mutations: LabelMutations) {
   const {
-    hasNormalizedLabel,
-    normalizeLabelName,
-    isBulkFilerExemptAuthorAssociation,
-    isBulkFilerExemptRepositoryPermission,
-    nextFeatureShowcaseLabels,
-    nextPrStatusLabels,
-    nextRealBehaviorProofSufficientLabels,
-    nextRealBehaviorProofMediaLabels,
-    nextTelegramVisibleProofLabels,
-    nextPriorityLabels,
-    nextImpactLabels,
-    nextMaturityLabels,
-    nextMergeRiskLabels,
-    isIssueAdvisoryLabel,
-    nextIssueAdvisoryLabels,
     removeIssueLabel,
     ensurePriorityLabel,
     ensureImpactLabel,
@@ -67,16 +65,16 @@ export function createLabelSyncOperations(
     ensureFeatureShowcaseLabel,
     ensurePrStatusLabel,
     ensureTelegramVisibleProofLabel,
-    missingLabelError,
     tryAddOptionalLabel,
     ensureRealBehaviorProofSufficientLabel,
     ensureRealBehaviorProofMediaLabel,
-  } = dependencies;
+  } = mutations;
 
   function syncBulkFilerLabel(options: {
     number: number;
     labels: readonly string[];
     bulkFilerDetected: boolean;
+    bulkFilerBelowThreshold?: boolean;
     authorAssociation: string;
     repositoryPermission?: string | null;
     dryRun: boolean;
@@ -97,6 +95,16 @@ export function createLabelSyncOperations(
       removeIssueLabel(options.number, BULK_FILED_LABEL, options.onMutation);
       return { labels: nextLabels, changed: true };
     }
+    if (!options.bulkFilerDetected && hasBulkFilerLabel && options.bulkFilerBelowThreshold) {
+      // A confirmed below-threshold count means an earlier review-time count labeled
+      // this issue; a failed search never sets the flag and keeps the label.
+      const nextLabels = options.labels.filter(
+        (label) => normalizeLabelName(label) !== normalizeLabelName(BULK_FILED_LABEL),
+      );
+      if (options.dryRun) return { labels: nextLabels, changed: true };
+      removeIssueLabel(options.number, BULK_FILED_LABEL, options.onMutation);
+      return { labels: nextLabels, changed: true };
+    }
     if (!options.bulkFilerDetected || hasBulkFilerLabel) {
       return { labels: [...options.labels], changed: false };
     }
@@ -110,16 +118,6 @@ export function createLabelSyncOperations(
       onMutation: options.onMutation,
     });
     return { labels: applied ? nextLabels : [...options.labels], changed: applied };
-  }
-  function syncBulkFilerLabelForTest(options: {
-    number: number;
-    labels: readonly string[];
-    bulkFilerDetected: boolean;
-    authorAssociation: string;
-    repositoryPermission?: string | null;
-    dryRun: boolean;
-  }): { labels: string[]; changed: boolean } {
-    return syncBulkFilerLabel(options);
   }
   function syncPriorityLabel(options: {
     number: number;
@@ -526,7 +524,6 @@ export function createLabelSyncOperations(
 
   return {
     syncBulkFilerLabel,
-    syncBulkFilerLabelForTest,
     syncPriorityLabel,
     syncImpactLabels,
     syncMaturityLabels,

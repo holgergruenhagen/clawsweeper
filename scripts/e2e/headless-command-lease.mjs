@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { MAX_MEDIA_PROOF_TIMEOUT_MS } from "../../src/media-proof-budget.ts";
 
 // Reuse the publication harness's real Worker and stock gh transports.
 export async function proveHeadlessCommandLease({
@@ -92,6 +93,7 @@ export async function proveHeadlessCommandLease({
     RUN_URL: `https://github.com/${producerRepo}/actions/runs/${tuple.run_id}`,
     CODEX_TIMEOUT_MS: "60000",
     MEDIA_PROOF_TIMEOUT_MS: "0",
+    MEDIA_PREPROCESSING_RESERVE_SECONDS: String(MAX_MEDIA_PROOF_TIMEOUT_MS / 1000),
   };
   await command("bash", ["-eu", "-c", step("live-item").run], {
     ...env,
@@ -154,14 +156,10 @@ export async function proveHeadlessCommandLease({
     (await command("gh", ["api", `repos/${repo}/issues/${number}/comments`])).stdout,
   );
   assert.equal(readback.length, 1, "both steps must rewrite the same acknowledgement");
-  const { createReviewCommentLeases } = await import(
+  const { freshDedicatedReviewStartLeases } = await import(
     pathToFileURL(join(source, "dist/clawsweeper-review-comment-leases.js"))
   );
-  const leases = createReviewCommentLeases({
-    PATCHABLE_REVIEW_COMMENT_AUTHORS: new Set(["clawsweeper[bot]"]),
-    commentId: (comment) => comment?.id ?? null,
-  });
-  const candidates = leases.freshDedicatedReviewStartLeases({
+  const candidates = freshDedicatedReviewStartLeases({
     comments: readback,
     itemNumber: number,
     headSha: liveHead,
@@ -171,7 +169,7 @@ export async function proveHeadlessCommandLease({
   assert.equal(candidates[0].commentId, acknowledgement.id);
   assert.equal(candidates[0].owner, `github-run-${tuple.run_id}-1`);
   assert.equal(
-    leases.freshDedicatedReviewStartLeases({
+    freshDedicatedReviewStartLeases({
       comments: readback,
       itemNumber: number,
       headSha: staleHead,

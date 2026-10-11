@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHash, generateKeyPairSync } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -114,6 +114,9 @@ const FILES = [
   "dashboard/exact-review-queue.ts",
   "dashboard/wrangler.toml",
   ".github/workflows/sweep.yml",
+  ".github/workflows/review-plan.yml",
+  ".github/workflows/target-fanout.yml",
+  ".github/workflows/audit.yml",
 ];
 
 function mulberry32(seed) {
@@ -356,7 +359,20 @@ try {
     }
     const read = (file) => readFileSync(path.join(dir, file), "utf8");
     const vars = wranglerVars(read("dashboard/wrangler.toml"));
-    const cadence = sweepCadence(read(".github/workflows/sweep.yml"));
+    // Historical baselines predate the planner, fanout and audit workflow splits.
+    const optionalWorkflowPaths = [
+      ".github/workflows/review-plan.yml",
+      ".github/workflows/target-fanout.yml",
+      ".github/workflows/audit.yml",
+    ];
+    const cadence = sweepCadence(
+      [
+        read(".github/workflows/sweep.yml"),
+        ...optionalWorkflowPaths.map((file) =>
+          existsSync(path.join(dir, file)) ? read(file) : "",
+        ),
+      ].join("\n"),
+    );
     const entry = path.join(out, `${variant}-proof-worker.ts`);
     writeFileSync(
       entry,
@@ -423,7 +439,10 @@ export default { fetch(request, env) { return env.QUEUE.get(env.QUEUE.idFromName
     runtimeFactories[variant] = startMiniflare;
     const result = {
       source_sha256: Object.fromEntries(
-        FILES.map((file) => [file, createHash("sha256").update(read(file)).digest("hex")]),
+        FILES.filter((file) => existsSync(path.join(dir, file))).map((file) => [
+          file,
+          createHash("sha256").update(read(file)).digest("hex"),
+        ]),
       ),
       config: Object.fromEntries(
         [

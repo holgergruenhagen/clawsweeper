@@ -36,24 +36,33 @@ const maintainerDecision = {
 };
 
 function unsponsoredCloseReport(overrides = {}) {
-  return `${workPlanCandidateReport({
-    repository: "openclaw/openclaw",
-    type: "issue",
-    decision: "close",
-    action_taken: "proposed_close",
-    close_reason: "unsponsored_feature_request",
-    confidence: "high",
-    work_candidate: "none",
-    work_status: "none",
-    item_snapshot_hash: "reviewed-snapshot",
-    item_created_at: "2026-01-01T00:00:00Z",
-    item_updated_at: "2026-01-01T00:00:00Z",
-    author_association: "CONTRIBUTOR",
-    item_category: "feature",
-    requires_product_decision: "true",
-    maintainer_decision: JSON.stringify(maintainerDecision),
-    ...overrides,
-  })}
+  return `${workPlanCandidateReport(
+    {
+      repository: "openclaw/openclaw",
+      type: "issue",
+      decision: "close",
+      action_taken: "proposed_close",
+      close_reason: "unsponsored_feature_request",
+      confidence: "high",
+      work_candidate: "none",
+      work_status: "none",
+      item_snapshot_hash: "reviewed-snapshot",
+      item_created_at: "2026-01-01T00:00:00Z",
+      item_updated_at: "2026-01-01T00:00:00Z",
+      author_association: "CONTRIBUTOR",
+      item_category: "feature",
+      requires_product_decision: "true",
+      maintainer_decision: JSON.stringify(maintainerDecision),
+      ...overrides,
+    },
+    {
+      itemCategory: "feature",
+      requiresProductDecision: true,
+      maintainerDecision,
+      closeComment:
+        "This is not planned unless a maintainer sponsors the direction. Reopening is welcome if that changes.",
+    },
+  )}
 
 ## Evidence
 
@@ -66,22 +75,29 @@ This is not planned unless a maintainer sponsors the direction. Reopening is wel
 }
 
 function staleInsufficientInfoCloseReport(overrides = {}) {
-  return `${workPlanCandidateReport({
-    repository: "openclaw/openclaw",
-    type: "issue",
-    decision: "close",
-    action_taken: "proposed_close",
-    close_reason: "stale_insufficient_info",
-    confidence: "high",
-    work_candidate: "none",
-    work_status: "none",
-    item_snapshot_hash: "reviewed-snapshot",
-    item_created_at: "2026-01-01T00:00:00Z",
-    item_updated_at: "2026-01-01T00:00:00Z",
-    author_association: "CONTRIBUTOR",
-    item_category: "bug",
-    ...overrides,
-  })}
+  return `${workPlanCandidateReport(
+    {
+      repository: "openclaw/openclaw",
+      type: "issue",
+      decision: "close",
+      action_taken: "proposed_close",
+      close_reason: "stale_insufficient_info",
+      confidence: "high",
+      work_candidate: "none",
+      work_status: "none",
+      item_snapshot_hash: "reviewed-snapshot",
+      item_created_at: "2026-01-01T00:00:00Z",
+      item_updated_at: "2026-01-01T00:00:00Z",
+      author_association: "CONTRIBUTOR",
+      item_category: "bug",
+      ...overrides,
+    },
+    {
+      itemCategory: "bug",
+      closeComment:
+        "Please open a new issue with current reproduction details if this still occurs.",
+    },
+  )}
 
 ## Evidence
 
@@ -310,10 +326,10 @@ test("unsponsored feature apply blocks a recent human comment", () => {
   assert.equal(result.closedExists, false);
 });
 
-test("unsponsored feature apply blocks any live security-ish label", () => {
+test("unsponsored feature apply blocks a live security label", () => {
   const result = runUnsponsoredApply({
     gateEnabled: true,
-    labels: ["topic:security-assessment"],
+    labels: ["impact:security"],
   });
   assert.deepEqual(result.entries, [
     {
@@ -325,7 +341,7 @@ test("unsponsored feature apply blocks any live security-ish label", () => {
   assert.equal(result.closedExists, false);
 });
 
-test("unsponsored feature apply blocks issues already at the revival reaction threshold", () => {
+test("unsponsored feature apply blocks issues with positive community traction", () => {
   const result = runUnsponsoredApply({
     gateEnabled: true,
     reactions: { total_count: 5, "+1": 3, heart: 1, hooray: 1 },
@@ -334,13 +350,13 @@ test("unsponsored feature apply blocks issues already at the revival reaction th
     {
       number: 321,
       action: "kept_open",
-      reason: "issue already meets the idea-revival reaction threshold",
+      reason: "issue has enough positive reactions for maintainer consideration",
     },
   ]);
   assert.equal(result.closedExists, false);
 });
 
-test("unsponsored feature close parks the issue with archive label and revival contract", () => {
+test("unsponsored feature close parks the issue for a maintainer decision", () => {
   const result = runUnsponsoredApply({ dryRun: false, gateEnabled: true });
   assert.equal(result.entries[0]?.action, "closed");
   assert.equal(result.closedExists, true);
@@ -360,8 +376,8 @@ test("unsponsored feature close parks the issue with archive label and revival c
     ),
   );
   assert.match(result.reviewComment, /This idea is parked, not rejected\./);
-  assert.match(result.reviewComment, /comment `@clawsweeper revive`/);
-  assert.match(result.reviewComment, /at least 5 positive reactions/);
+  assert.match(result.reviewComment, /A maintainer can reopen this issue/);
+  assert.doesNotMatch(result.reviewComment, /automatically|@clawsweeper revive/);
 });
 
 test("unsponsored feature close keeps the archive label after an uncertain close", () => {

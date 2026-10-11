@@ -1,6 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
-import YAML from "yaml";
 import {
   assert,
   createHash,
@@ -29,16 +27,9 @@ import {
   leasedExactReviewPublicationItem,
   type ExactReviewQueueItem,
 } from "./dashboard-worker-harness.ts";
+import { ExactReviewReviewLoopStore } from "../dashboard/exact-review-review-loop.ts";
 
 test("early policy no-op workflow completion finishes the queue and Bay lifecycle without publication", async () => {
-  const workflow: {
-    jobs: Record<string, { steps: { id: string; run?: string; env?: Record<string, string> }[] }>;
-  } = YAML.parse(readFileSync(".github/workflows/sweep.yml", "utf8"));
-  const step = workflow.jobs["event-review-apply"]!.steps.find(
-    (step) => step.id === "complete-exact-review-queue",
-  )!;
-  const payloadScript = step.run?.match(/payload="\$\(node -e '([\s\S]*?)'\)"/)?.[1];
-  assert.ok(payloadScript);
   const storage = new MemoryDurableStorage();
   const leased = leasedExactReviewQueueItem(42, "420");
   const lifecycle = new ExactReviewLifecycleProjectionStore(storage);
@@ -58,21 +49,25 @@ test("early policy no-op workflow completion finishes the queue and Bay lifecycl
     observedAt: Date.now(),
   });
   const payload = (overrides: Record<string, string> = {}) =>
-    execFileSync(process.execPath, ["-e", payloadScript], {
-      encoding: "utf8",
-      env: {
-        PROTOCOL_VERSION: "2",
-        QUEUE_LEASE_ID: leased.leaseId,
-        ITEM_KEY: leased.key,
-        QUEUE_LEASE_REVISION: "1",
-        CLAIM_GENERATION: "1",
-        GITHUB_RUN_ID: "420",
-        RUN_ATTEMPT: "1",
-        PRIMARY_OUTCOME: "success",
-        SCHEDULED_SEMANTIC_NOOP: "true",
-        ...overrides,
+    execFileSync(
+      process.execPath,
+      ["dist/repair/exact-review-queue-request.js", "complete", "body"],
+      {
+        encoding: "utf8",
+        env: {
+          PROTOCOL_VERSION: "2",
+          QUEUE_LEASE_ID: leased.leaseId,
+          ITEM_KEY: leased.key,
+          QUEUE_LEASE_REVISION: "1",
+          CLAIM_GENERATION: "1",
+          GITHUB_RUN_ID: "420",
+          GITHUB_RUN_ATTEMPT: "1",
+          PRIMARY_OUTCOME: "success",
+          SCHEDULED_SEMANTIC_NOOP: "true",
+          ...overrides,
+        },
       },
-    });
+    );
   for (const overrides of [
     { SCHEDULED_SEMANTIC_NOOP: "false" },
     { PRIMARY_OUTCOME: "failure" },
@@ -551,7 +546,7 @@ function lifecycleRouterOrderingFixture({
     kind: terminalKind,
     observedAt: terminalObservedAt,
   });
-  const post = () =>
+  const post = (outcome: "durable" | "not_required" = "durable") =>
     queue.fetch(
       new Request("https://clawsweeper-exact-review-queue/lifecycle/router-receipt", {
         method: "POST",
@@ -559,7 +554,7 @@ function lifecycleRouterOrderingFixture({
           canonical_target_key: identity.canonicalTargetKey,
           fence_key: identity.fenceKey,
           revision: identity.revision,
-          outcome: "durable",
+          outcome,
           receipt_id: "router:706:1",
         }),
       }),
@@ -569,6 +564,17 @@ function lifecycleRouterOrderingFixture({
   const driverKey = `terminal-finalization:${identity.fenceKey}:${identity.revision}`;
   return { storage, post, projection, driverKey };
 }
+
+test("an incomplete durable router receipt cannot satisfy a not-required handoff", async () => {
+  const { storage, post, projection } = lifecycleRouterOrderingFixture({
+    terminalKind: "requeue",
+    receiptObservedAt: 3,
+    terminalObservedAt: 5,
+  });
+  const before = { projection: projection(), queue: storage.sql.readNormalizedQueue() };
+  assert.equal((await post("not_required")).status, 409);
+  assert.deepEqual({ projection: projection(), queue: storage.sql.readNormalizedQueue() }, before);
+});
 
 test("router receipt repair preserves matching later or equal terminal outcomes", async (t) => {
   for (const terminalKind of NON_ROUTED_TERMINAL_KINDS) {
@@ -655,11 +661,19 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
     "rollback",
     "derived-replay",
     ...(route === "router-receipt"
-      ? ["rollback-requeue", "legacy", "legacy-terminal", "legacy-requeue", "legacy-requeue-tied"]
+      ? [
+          "not-required",
+          "rollback-requeue",
+          "legacy",
+          "legacy-terminal",
+          "legacy-requeue",
+          "legacy-requeue-tied",
+        ]
       : ["conflict"]),
   ]) {
     const legacy = scenario.startsWith("legacy");
     const requeue = scenario.includes("requeue");
+    const routerOutcome = scenario === "not-required" ? "not_required" : "durable";
     const description = legacy
       ? `${scenario} repairs only incomplete effects and marks completion`
       : scenario === "conflict"
@@ -688,7 +702,7 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
         ...identity,
         deliveryId: "lifecycle-post-effect-replay",
         sourceAction: "legacy_dispatch",
-        commandOriginated: true,
+        commandOriginated: scenario !== "not-required",
         statusMarker:
           "<!-- clawsweeper-command-status:706:re_review:0123456789abcdef0123456789abcdef01234567 -->",
         statusCommentId: 7061,
@@ -708,7 +722,7 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
       const payload = JSON.stringify({
         ...wireIdentity,
         ...(route === "router-receipt"
-          ? { outcome: "durable", receipt_id: "router-batch:706:1:fence" }
+          ? { outcome: routerOutcome, receipt_id: "router-batch:706:1:fence" }
           : { kind: "policy_noop", operation_id: "terminal-batch:706:1:fence" }),
       });
       const post = (target: string, body: string) =>
@@ -775,7 +789,10 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
           (await post(route, payload)).status,
           scenario === "derived-replay" ? 409 : 200,
         );
-        assert.ok(storage.sql.readNormalizedQueue().items[driverKey]);
+        assert.equal(
+          Boolean(storage.sql.readNormalizedQueue().items[driverKey]),
+          scenario !== "not-required",
+        );
       }
       if (requeue && scenario !== "rollback-requeue") {
         if (scenario !== "legacy-requeue-tied") t.mock.timers.tick(1_000);
@@ -798,6 +815,10 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
       const replay = await post(route, payload);
       assert.equal(replay.status, 200);
       assert.equal((await replay.json()).ok, true);
+      if (scenario === "not-required") {
+        assert.equal(lifecycleState(projection()), "completed");
+        assert.equal(projection().routerReceipt?.outcome, "not_required");
+      }
       if (scenario === "rollback-requeue") {
         assert.equal(projection().routerReceipts.length, 1);
         assert.equal(projection().routerReceipts[0].operationComplete, true);
@@ -850,11 +871,18 @@ for (const route of ["router-receipt", "terminal-disposition"] as const) {
         );
       }
       if (route === "router-receipt") {
-        const conflicting = await post(
+        const handoff = await post(
           route,
-          JSON.stringify({ ...JSON.parse(payload), outcome: "not_required" }),
+          JSON.stringify({
+            ...JSON.parse(payload),
+            outcome: routerOutcome === "durable" ? "not_required" : "durable",
+          }),
         );
-        assert.equal(conflicting.status, 409);
+        assert.equal(
+          handoff.status,
+          routerOutcome === "durable" ? 200 : 409,
+          "a completed durable receipt covers not_required, never the reverse",
+        );
         assert.deepEqual(
           { projection: projection(), queue: storage.sql.readNormalizedQueue() },
           before,
@@ -1195,14 +1223,16 @@ test("direct publication endpoint authenticates, dedupes, and returns a structur
       ?.canonicalReceipts.map((receipt) => receipt.receiptId),
     ["direct-v2:openclaw/openclaw#701:4:accepted", "direct-v2:openclaw/openclaw#701:4:deduped"],
   );
-  const directTelemetry = new ExactReviewLifecycleTelemetryStore(storage).summary(Date.now());
-  assert.deepEqual(directTelemetry.publication.direct, {
-    accepted: 1,
-    deduped: 1,
-    superseded: 0,
-    fallback: 1,
-    unknown: 0,
-  });
+  assert.deepEqual(
+    Object.fromEntries(
+      Array.from(
+        storage.sql.exec(
+          "SELECT outcome, COUNT(*) AS count FROM exact_review_lifecycle_telemetry_direct_v1 GROUP BY outcome",
+        ),
+      ).map((row) => [row.outcome, row.count]),
+    ),
+    { accepted: 1, deduped: 1, fallback: 1 },
+  );
   const directState = (await storage.get("exact-review-queue")) as {
     items: Record<
       string,
@@ -1496,8 +1526,8 @@ test("direct publication endpoint authenticates, dedupes, and returns a structur
     state_commit_sha: null,
   });
   assert.deepEqual(
-    new ExactReviewLifecycleTelemetryStore(storage).summary(Date.now()).publication.batch,
-    { accepted: 1, deduped: 1, superseded: 0, retryable: 0, permanent: 0 },
+    Array.from(storage.sql.exec("SELECT outcome FROM exact_review_lifecycle_telemetry_batch_v1")),
+    [],
   );
   const afterBatch = (await storage.get("exact-review-queue")) as typeof queueState;
   assert.equal(afterBatch.items[batchLeased.key]?.state, "pending");
@@ -1521,8 +1551,10 @@ test("direct publication endpoint authenticates, dedupes, and returns a structur
   assert.equal(staleBatchCompletion.status, 200);
   assert.equal((await staleBatchCompletion.json()).accepted, 1);
   assert.deepEqual(
-    new ExactReviewLifecycleTelemetryStore(storage).summary(Date.now()).publication.batch,
-    { accepted: 1, deduped: 1, superseded: 1, retryable: 0, permanent: 0 },
+    Array.from(
+      storage.sql.exec("SELECT outcome FROM exact_review_lifecycle_telemetry_batch_v1"),
+    ).map((row) => row.outcome),
+    ["superseded"],
   );
 
   const recordUrl =
@@ -1962,8 +1994,10 @@ test("fetching a stale publication batch records a durable superseded telemetry 
   assert.equal(fetchedBody.superseded, 1);
   assert.deepEqual(fetchedBody.items, []);
   assert.deepEqual(
-    new ExactReviewLifecycleTelemetryStore(storage).summary(Date.now()).publication.batch,
-    { accepted: 0, deduped: 0, superseded: 1, retryable: 0, permanent: 0 },
+    Array.from(
+      storage.sql.exec("SELECT outcome FROM exact_review_lifecycle_telemetry_batch_v1"),
+    ).map((row) => row.outcome),
+    ["superseded"],
   );
 });
 
@@ -2010,8 +2044,12 @@ test("non-batch publication completions record durable terminal outcomes without
   await complete(published, "success", "published", "publication_applied");
 
   assert.deepEqual(
-    new ExactReviewLifecycleTelemetryStore(storage).summary(Date.now()).publication.batch,
-    { accepted: 0, deduped: 0, superseded: 1, retryable: 1, permanent: 1 },
+    Array.from(
+      storage.sql.exec(
+        "SELECT outcome FROM exact_review_lifecycle_telemetry_batch_v1 ORDER BY outcome",
+      ),
+    ).map((row) => row.outcome),
+    ["permanent", "retryable", "superseded"],
   );
 });
 
@@ -2237,6 +2275,50 @@ async function savedDirectRequeueFixture(
   return { storage, queue, leased, post, readState, projection, counters, complete, terminalRun };
 }
 
+test("direct lifecycle requeues count toward and trip the source-drift loop breaker", async () => {
+  for (const priorGenerations of [2, 3]) {
+    const { storage, queue, leased, readState, complete } = await savedDirectRequeueFixture();
+    const loops = new ExactReviewReviewLoopStore(storage);
+    for (let generation = 0; generation < priorGenerations; generation += 1) {
+      loops.recordSourceDriftGenerationSync(leased.key, Date.now());
+    }
+    const completed = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/complete", {
+        method: "POST",
+        body: JSON.stringify(complete),
+      }),
+    );
+    assert.deepEqual(await completed.json(), { ok: true, requeued: true });
+    const successor = (await readState()).items[leased.key]!;
+    assert.equal(successor.revision, 5);
+    assert.equal(successor.decision.sourceAction, "source_drift_requeue");
+    if (priorGenerations < 3) {
+      assert.equal(successor.state, "pending", "below the limit the successor is reviewed");
+      assert.equal(loops.sourceDriftLoopSync(leased.key, Date.now())?.consecutive, 3);
+      continue;
+    }
+    assert.equal(successor.state, "parked", "at the limit the successor spends no review");
+    assert.equal(successor.parkedReason, "source_drift_loop");
+    assert.equal(loops.sourceDriftLoopSync(leased.key, Date.now())?.consecutive, 3);
+
+    const organic = await queue.fetch(
+      new Request("https://clawsweeper-exact-review-queue/enqueue", {
+        method: "POST",
+        body: JSON.stringify({
+          delivery_id: "organic-edit-705",
+          decision: { ...leased.decision, sourceAction: "edited" },
+        }),
+      }),
+    );
+    assert.equal(organic.status, 202);
+    assert.equal((await organic.json()).queued, true);
+    const released = (await readState()).items[leased.key]!;
+    assert.equal(released.state, "pending");
+    assert.equal(released.parkedReason, undefined);
+    assert.equal(loops.sourceDriftLoopSync(leased.key, Date.now()), null);
+  }
+});
+
 test("active pull request supersession preserves the command without its publication receipt", async () => {
   const marker =
     "<!-- clawsweeper-command-status:705:automerge:0123456789abcdef0123456789abcdef01234567 -->";
@@ -2291,13 +2373,8 @@ test("active pull request supersession preserves the command without its publica
   });
 });
 
-test("all exact-review recovery paths preserve proof authority and the complete producer context", async (t) => {
-  for (const sourceAction of [
-    "command_proof_result",
-    "failed_review_shard_recovery",
-    "opened",
-    "command_proof_result_extra",
-  ]) {
+test("all exact-review recovery paths preserve the complete producer context", async (t) => {
+  for (const sourceAction of ["failed_review_shard_recovery", "opened"]) {
     const producerDecision: ExactReviewQueueItem["decision"] = {
       targetRepo: "openclaw/openclaw",
       targetBranch: "main",
@@ -2308,29 +2385,17 @@ test("all exact-review recovery paths preserve proof authority and the complete 
       supersedesInProgress: false,
       sourceHeadSha: "a".repeat(40),
       sourceBaseSha: "c".repeat(40),
-      sourceDeliveryId: "command-proof-request",
+      sourceDeliveryId: "review-command-request",
       sourceCommentId: 200,
       sourceCommentUpdatedAt: "2026-09-04T10:00:00Z",
       commandBodyDigest: "e".repeat(64),
       commandOrigin: "comment_router",
       sourceCommentVerified: true,
       commandStatusMarker:
-        "<!-- clawsweeper-command-status:705:request_proof:" + "d".repeat(64) + " -->",
-      additionalPrompt:
-        "<!-- command-proof-assessment-v1 head=" +
-        "a".repeat(40) +
-        " body=" +
-        "b".repeat(64) +
-        " base=" +
-        createHash("sha256").update("main").digest("hex") +
-        " base_sha=" +
-        "c".repeat(40) +
-        " request=" +
-        "d".repeat(64) +
-        " scenario=web-ui-chat-proof -->\nVerified request-bound observer evidence; preserve this entire context.",
+        "<!-- clawsweeper-command-status:705:re_review:" + "d".repeat(64) + " -->",
+      additionalPrompt: "Inspect the reported regression using the preserved reviewer context.",
     };
-    const preserved =
-      sourceAction === "command_proof_result" || sourceAction === "failed_review_shard_recovery";
+    const preserved = sourceAction === "failed_review_shard_recovery";
     const direct = await savedDirectRequeueFixture("accepted", true, producerDecision);
     t.after(() => direct.storage.sql.close());
     assert.deepEqual(await (await direct.post("complete", direct.complete)).json(), {

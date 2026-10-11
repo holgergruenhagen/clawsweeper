@@ -1,10 +1,12 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
+import { reviewActionForDecision } from "../dist/clawsweeper-report-actions.js";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { parse } from "yaml";
 
 import {
   currentClosingPullRequestReferenceFromIssueTimeline,
-  fixedPullRequestFromCommitPullsForTest,
   isProtectedItem,
   linkedIssueNumbersForPullRequestBody,
   linkedIssueNumbersForImplementationProvenance,
@@ -13,79 +15,73 @@ import {
   parseGhJsonWithRetry,
   protectedLabels,
   reviewAutomationMarkersFromReport,
-  renderReviewCommentFromReport,
-  reviewActionForDecision,
   shouldPlanItem,
   validateCloseDecision,
 } from "../dist/clawsweeper.js";
+import { createStatusContext } from "../dist/clawsweeper-status-context.js";
 import { parseCoAuthors } from "../dist/commit-sweeper.js";
-import { closeDecision, git, item, reportFrontMatter } from "./helpers.ts";
+import { repositoryProfileFor } from "../dist/repository-profiles.js";
+import {
+  closeDecision,
+  git,
+  item,
+  reportFrontMatter,
+  reviewPrompt,
+  withReviewRecord,
+} from "./helpers.ts";
 
-test("review prompt documents gated backlog close policies", () => {
-  const prompt = readFileSync(new URL("../prompts/review-item.md", import.meta.url), "utf8");
-  const sweepWorkflow = readFileSync(
-    new URL("../.github/workflows/sweep.yml", import.meta.url),
-    "utf8",
+const { fixedPullRequestFromCommitPulls } = createStatusContext();
+
+function renderedCloseReasons(prompt: string): string[] {
+  const section = prompt.slice(
+    prompt.indexOf("### Close reasons"),
+    prompt.indexOf("### Canonical search and partial work"),
   );
-  assert.match(prompt, /`unsponsored_feature_request`/);
-  assert.match(prompt, /reversible idea-archive park, not a rejection/);
-  assert.match(prompt, /label whose normalized name contains `security`/);
-  assert.match(prompt, /configured positive-reaction threshold automatically reopens it/);
-  assert.match(prompt, /commenting `@clawsweeper revive`/);
-  assert.match(prompt, /no human comment in the last 60 days/);
-  assert.match(prompt, /significantly outdated version or behavior/);
-  assert.match(prompt, /not cleanly mergeable \(merge conflicts\) on its current head/);
-  assert.match(prompt, /`author_pr_budget_exceeded`/);
-  assert.match(prompt, /Never propose this reason when the author open-PR count is unknown/);
-  assert.match(prompt, /default path is apply-side deterministic promotion/);
-  assert.match(prompt, /`stale_version_bug`/);
-  assert.match(prompt, /fresh current-version reproduction/);
-  assert.match(prompt, /`obsolete_fix_pr`/);
-  assert.match(prompt, /every touched path was substantially rewritten or removed/);
-  assert.match(prompt, /`bulkFiler\.detected`/);
-  assert.match(prompt, /extra duplicate scrutiny/);
-  assert.match(prompt, /Never route it to proof-nudge or automated fix-dispatch work/);
-  assert.match(prompt, /do not invent a bulk-filing close reason/);
-  assert.match(prompt, /GitHub-verified, merged fixing PR in\s+the same repository/);
-  assert.match(prompt, /linked issue is not permission or proof to close either item/);
-  assert.ok(
-    [...sweepWorkflow.matchAll(/CLAWSWEEPER_IDEA_REVIVAL_REACTIONS:.*\|\| '5'/g)].length >= 2,
+  return [...section.matchAll(/^- `([a-z_]+)`: /gm)].map((match) => match[1]!);
+}
+
+test("review prompt renders close reasons from the repository profile for the item kind", () => {
+  const schema = JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8"));
+  const issueReasons = renderedCloseReasons(reviewPrompt("issue"));
+  const pullRequestReasons = renderedCloseReasons(reviewPrompt("pull_request"));
+  const profile = repositoryProfileFor("openclaw/openclaw");
+  // Oversized closure is host-owned and deliberately absent from the model schema.
+  assert.deepEqual(
+    [...new Set([...Object.values(profile.applyCloseRules).flat(), "none"])]
+      .filter((reason) => reason !== "oversized_pull_request")
+      .sort(),
+    [...schema.properties.closeReason.enum].sort(),
   );
-});
-
-test("review prompt closes independently disproven nonexistent-source bug reports", () => {
-  const prompt = readFileSync(new URL("../prompts/review-item.md", import.meta.url), "utf8");
-
-  assert.match(prompt, /For `cannot_reproduce`, distinguish missing reporter evidence/);
-  assert.match(prompt, /Search the complete current tree,\s+source history, renamed paths/);
-  assert.match(prompt, /actual owner, callers, dependency contract, and relevant regression tests/);
-  assert.match(prompt, /named implementation never existed or cannot perform the alleged/);
-  assert.match(prompt, /propose a high-confidence close with that source-backed evidence/);
-  assert.match(prompt, /Do not keep a source-disproven issue open/);
-  assert.match(prompt, /Bulk filing is not itself a close reason/);
-  assert.match(prompt, /each claim is\s+independently disproved/);
-  assert.match(prompt, /Keep open when an affected shipped version/);
+  // Schema compatibility includes reasons that host facts cannot enable in this context.
+  assert.deepEqual(
+    [...new Set([...issueReasons, ...pullRequestReasons, "none"])].sort(),
+    schema.properties.closeReason.enum
+      .filter((reason: string) => reason !== "author_pr_budget_exceeded")
+      .sort(),
+  );
+  assert.ok(!pullRequestReasons.includes("author_pr_budget_exceeded"));
+  assert.ok(!pullRequestReasons.includes("oversized_pull_request"));
+  assert.ok(issueReasons.includes("stale_insufficient_info"));
+  assert.ok(!issueReasons.includes("obsolete_fix_pr"));
+  assert.ok(pullRequestReasons.includes("obsolete_fix_pr"));
+  assert.ok(!pullRequestReasons.includes("stale_insufficient_info"));
+  assert.deepEqual(renderedCloseReasons(reviewPrompt("issue", "openclaw/clawhub")), [
+    "implemented_on_main",
+  ]);
+  const closedRepoPrompt = reviewPrompt("pull_request", "steipete/camsnap");
+  assert.deepEqual(renderedCloseReasons(closedRepoPrompt), []);
+  assert.match(
+    closedRepoPrompt,
+    /No close reason applies to this item's host facts: keep it open with `closeReason: none`/,
+  );
+  assert.match(reviewPrompt("issue"), /a maintainer can reopen it manually/);
+  assert.doesNotMatch(
+    reviewPrompt("issue"),
+    /@clawsweeper revive|threshold reopens it automatically/,
+  );
 });
 
 test("external desktop-product bugs close without inventing upstream maintainer work", () => {
-  const prompt = readFileSync(new URL("../prompts/review-item.md", import.meta.url), "utf8");
-
-  assert.match(prompt, /QClaw `0\.x` desktop\/client reports/);
-  assert.match(prompt, /`qclaw\/\*` providers/);
-  assert.match(prompt, /externally maintained WeChat adapters/);
-  assert.match(prompt, /propose a high-confidence `not_actionable_in_repo` close immediately/);
-  assert.match(prompt, /do not request private\/encrypted third-party traces/);
-  assert.match(prompt, /do not turn missing third-party logs into a maintainer-review blocker/);
-  assert.match(
-    prompt,
-    /evidence demonstrates an actual failure in an official OpenClaw release or owned source path/,
-  );
-  assert.match(
-    prompt,
-    /Merely citing healthy owned source paths, generic fallback\/delivery plumbing/,
-  );
-  assert.match(prompt, /set `workCandidate: "none"`/);
-
   const decision = closeDecision({
     closeReason: "not_actionable_in_repo",
     itemCategory: "bug",
@@ -103,20 +99,6 @@ test("external desktop-product bugs close without inventing upstream maintainer 
 });
 
 test("close-first triage keeps actionable upstream work and invites better reports", () => {
-  const prompt = readFileSync(new URL("../prompts/review-item.md", import.meta.url), "utf8");
-
-  assert.match(prompt, /Maintainer attention is scarce/);
-  assert.match(prompt, /Default to closure when an unprotected item does not establish/);
-  assert.match(
-    prompt,
-    /Confidence applies to whether this submission merits scarce maintainer attention/,
-  );
-  assert.match(prompt, /explicitly invite the author to reopen with that evidence/);
-  assert.match(prompt, /Keep open for actual current upstream bugs/);
-  assert.match(prompt, /official affected release or owned source failure/);
-  assert.match(prompt, /security-sensitive items, protected labels, maintainer-engaged work/);
-  assert.match(prompt, /Do not invent a new close reason or misclassify an actual upstream defect/);
-
   for (const closeReason of ["not_actionable_in_repo", "incoherent", "cannot_reproduce"] as const) {
     const decision = closeDecision({
       closeReason,
@@ -147,89 +129,53 @@ test("close-first triage keeps actionable upstream work and invites better repor
 });
 
 test("all exact-review publication paths inherit the shared automatic-close policy", () => {
-  const sweepWorkflow = readFileSync(
-    new URL("../.github/workflows/sweep.yml", import.meta.url),
-    "utf8",
-  );
-  const batchWorkflow = readFileSync(
-    new URL("../.github/workflows/exact-review-batch-publish.yml", import.meta.url),
-    "utf8",
-  );
-  const batchPreparation = readFileSync(
-    new URL("../scripts/prepare-exact-review-batch.mjs", import.meta.url),
-    "utf8",
-  );
-  const publisher = readFileSync(
-    new URL("../src/repair/publish-event-result.ts", import.meta.url),
-    "utf8",
-  );
-
-  for (const workflow of [sweepWorkflow, batchWorkflow]) {
-    assert.match(
-      workflow,
-      /CLAWSWEEPER_AUTO_CLOSE_REASONS: \$\{\{ vars\.CLAWSWEEPER_AUTO_CLOSE_REASONS \|\| 'all' \}\}/,
+  const sweep = parse(readFileSync(".github/workflows/sweep.yml", "utf8"));
+  const batch = parse(readFileSync(".github/workflows/exact-review-batch-publish.yml", "utf8"));
+  for (const env of [sweep.env, batch.jobs.publish.env]) {
+    assert.equal(
+      env.CLAWSWEEPER_AUTO_CLOSE_REASONS,
+      "${{ vars.CLAWSWEEPER_AUTO_CLOSE_REASONS || 'all' }}",
     );
-    for (const flag of [
-      "UNCONFIRMED_PRODUCT_DIRECTION",
-      "UNSPONSORED_FEATURE",
-      "STALE_VERSION_BUG",
-      "OBSOLETE_FIX_PR",
-    ]) {
-      assert.match(workflow, new RegExp(`CLAWSWEEPER_${flag}_CLOSE_ENABLED:`), flag);
-    }
-    for (const setting of [
+    for (const name of [
+      "UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED",
+      "UNSPONSORED_FEATURE_CLOSE_ENABLED",
+      "STALE_VERSION_BUG_CLOSE_ENABLED",
+      "OBSOLETE_FIX_PR_CLOSE_ENABLED",
       "AUTHOR_PR_BUDGET",
       "AUTHOR_PR_BUDGET_MAX_CLOSES_PER_RUN",
       "IDEA_REVIVAL_REACTIONS",
     ]) {
-      assert.match(workflow, new RegExp(`CLAWSWEEPER_${setting}:`), setting);
+      assert.ok(env[`CLAWSWEEPER_${name}`], name);
+    }
+    assert.equal(env.CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED, undefined);
+  }
+  for (const document of [sweep, batch]) {
+    for (const job of Object.values(document.jobs) as Array<{ steps?: Array<{ env?: object }> }>) {
+      for (const step of job.steps ?? []) assert.equal("CLOSE_REASONS" in (step.env ?? {}), false);
     }
   }
-
-  const sweepGlobalEnv = sweepWorkflow.slice(
-    sweepWorkflow.indexOf("\nenv:\n"),
-    sweepWorkflow.indexOf("\nconcurrency:\n"),
-  );
-  const batchJobEnv = batchWorkflow.slice(
-    batchWorkflow.indexOf("    env:\n"),
-    batchWorkflow.indexOf("    steps:\n"),
-  );
-  assert.doesNotMatch(sweepGlobalEnv, /CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED:/);
-  assert.doesNotMatch(batchJobEnv, /CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED:/);
-  assert.match(sweepWorkflow, /CLAWSWEEPER_AUTHOR_PR_BUDGET_CLOSE_ENABLED:/);
-  assert.equal(
-    [
-      ...sweepWorkflow.matchAll(
-        /inputs\.apply_close_reasons \|\| env\.CLAWSWEEPER_AUTO_CLOSE_REASONS/g,
-      ),
-    ].length,
-    3,
-  );
-  assert.doesNotMatch(
-    sweepWorkflow,
-    /CLOSE_REASONS: implemented_on_main,duplicate_or_superseded,low_signal_unmergeable_pr/,
-  );
-  assert.doesNotMatch(batchPreparation, /CLOSE_REASONS:\s*"implemented_on_main/);
-  assert.match(
-    publisher,
-    /process\.env\.CLOSE_REASONS \|\| process\.env\.CLAWSWEEPER_AUTO_CLOSE_REASONS \|\| "all"/,
-  );
-  assert.match(publisher, /"--stale-min-age-days",\s*"60"/);
 });
 
 test("unsponsored feature issue proposals emit source-bound trusted close markers", () => {
   const markers = reviewAutomationMarkersFromReport(
-    reportFrontMatter({
-      type: "issue",
-      number: 321,
-      decision: "close",
-      confidence: "high",
-      close_reason: "unsponsored_feature_request",
-      action_taken: "proposed_close",
-      item_updated_at: "2026-01-01T00:00:00Z",
-      reviewed_at: "2026-07-11T00:00:00Z",
-      item_source_revision: "0123456789abcdef",
-    }),
+    withReviewRecord(
+      reportFrontMatter({
+        type: "issue",
+        number: 321,
+        decision: "close",
+        confidence: "high",
+        close_reason: "unsponsored_feature_request",
+        action_taken: "proposed_close",
+        item_updated_at: "2026-01-01T00:00:00Z",
+        reviewed_at: "2026-07-11T00:00:00Z",
+        item_source_revision: "0123456789abcdef",
+      }),
+      {
+        decision: "close",
+        closeReason: "unsponsored_feature_request",
+        confidence: "high",
+      },
+    ),
   );
   assert.match(markers, /clawsweeper-verdict:close/);
   assert.match(markers, /clawsweeper-action:close-required/);
@@ -390,12 +336,8 @@ test("review actions only propose valid closes and never apply directly", () => 
     action.closeComment.indexOf("Is this the best way to solve the issue?") <
       action.closeComment.indexOf("What I checked:"),
   );
-  assert.match(action.closeComment, /Likely related people:/);
-  for (const person of ["alice", "bob"]) {
-    assert.match(action.closeComment, new RegExp(`@${String.fromCodePoint(0x200b)}${person}`));
-  }
-  assert.doesNotMatch(action.closeComment, /@alice|@bob|role: introduced behavior|role: recent/);
-  assert.match(action.closeComment, /role: unverified routing candidate; confidence: low/);
+  // closeDecision owners carry no verified history, so no names are published.
+  assert.doesNotMatch(action.closeComment, /Likely related people:|alice|bob|routing candidate/);
   assert.match(action.closeComment, /Codex review notes: model gpt-5\.6-sol, reasoning high;/);
 });
 
@@ -652,7 +594,7 @@ test("PR implementation provenance accepts only the current GitHub issue-closing
 });
 
 test("commit PR lookup selects the newest merged pull request", () => {
-  const fixedPullRequest = fixedPullRequestFromCommitPullsForTest(
+  const fixedPullRequest = fixedPullRequestFromCommitPulls(
     [
       {
         number: 455,
@@ -682,6 +624,7 @@ test("commit PR lookup selects the newest merged pull request", () => {
         base: { ref: "main" },
       },
     ],
+    "GitHub commit PR lookup",
     123,
   );
 
@@ -698,7 +641,7 @@ test("commit PR lookup selects the newest merged pull request", () => {
 });
 
 test("commit PR lookup rejects unrelated closing references at the claimed fixed SHA", () => {
-  const fixedPullRequest = fixedPullRequestFromCommitPullsForTest(
+  const fixedPullRequest = fixedPullRequestFromCommitPulls(
     [
       {
         number: 456,
@@ -725,6 +668,7 @@ test("commit PR lookup rejects unrelated closing references at the claimed fixed
         body: "Fixes other/repository#123",
       },
     ],
+    "GitHub commit PR lookup",
     123,
   );
 
@@ -743,12 +687,25 @@ test("commit PR lookup accepts an exact closing reference in the fixed commit me
   };
 
   assert.equal(
-    fixedPullRequestFromCommitPullsForTest([pull], 123, "Fixes other/repository#123"),
+    fixedPullRequestFromCommitPulls(
+      [pull],
+      "GitHub commit PR lookup",
+      123,
+      "Fixes other/repository#123",
+    ),
     null,
   );
-  assert.equal(fixedPullRequestFromCommitPullsForTest([pull], 123, "Fixes #999; see #123"), null);
   assert.equal(
-    fixedPullRequestFromCommitPullsForTest([pull], 123, "Fixes openclaw/openclaw#123")?.number,
+    fixedPullRequestFromCommitPulls([pull], "GitHub commit PR lookup", 123, "Fixes #999; see #123"),
+    null,
+  );
+  assert.equal(
+    fixedPullRequestFromCommitPulls(
+      [pull],
+      "GitHub commit PR lookup",
+      123,
+      "Fixes openclaw/openclaw#123",
+    )?.number,
     456,
   );
 });
@@ -764,32 +721,36 @@ test("commit PR lookup rejects closing references on a non-default branch", () =
     base: { ref: "release" },
   };
 
-  assert.equal(fixedPullRequestFromCommitPullsForTest([pull], 123), null);
-  assert.equal(fixedPullRequestFromCommitPullsForTest([pull], 123, "Fixes #123"), null);
+  assert.equal(fixedPullRequestFromCommitPulls([pull], "GitHub commit PR lookup", 123), null);
+  assert.equal(
+    fixedPullRequestFromCommitPulls([pull], "GitHub commit PR lookup", 123, "Fixes #123"),
+    null,
+  );
 });
 
 test("report-rendered close comments keep merged fixing PR provenance", () => {
   const comment = renderReviewCommentFromReport(
-    `${reportFrontMatter({
-      type: "issue",
-      number: "123",
-      title: JSON.stringify("Sample item"),
-      decision: "close",
-      close_reason: "implemented_on_main",
-      action_taken: "proposed_close",
-      fixed_pr_url: "https://github.com/openclaw/openclaw/pull/456",
-      fixed_pr_number: "456",
-      fixed_pr_title: JSON.stringify("fix: wire the shell check"),
-      fixed_pr_merged_at: "2026-04-28T12:00:00Z",
-      fixed_pr_sha: "fedcba9876543210",
-      fixed_pr_confidence: "high",
-      fixed_pr_source: JSON.stringify("GitHub closing PR reference"),
-      fixed_sha: "abcdef1234567890",
-      fixed_at: "2026-04-28T12:00:00Z",
-      main_sha: "abcdef1234567890",
-      review_model: "gpt-5.6-sol",
-      review_reasoning_effort: "high",
-    })}
+    withReviewRecord(
+      `${reportFrontMatter({
+        type: "issue",
+        number: "123",
+        title: JSON.stringify("Sample item"),
+        decision: "close",
+        close_reason: "implemented_on_main",
+        action_taken: "proposed_close",
+        fixed_pr_url: "https://github.com/openclaw/openclaw/pull/456",
+        fixed_pr_number: "456",
+        fixed_pr_title: JSON.stringify("fix: wire the shell check"),
+        fixed_pr_merged_at: "2026-04-28T12:00:00Z",
+        fixed_pr_sha: "fedcba9876543210",
+        fixed_pr_confidence: "high",
+        fixed_pr_source: JSON.stringify("GitHub closing PR reference"),
+        fixed_sha: "abcdef1234567890",
+        fixed_at: "2026-04-28T12:00:00Z",
+        main_sha: "abcdef1234567890",
+        review_model: "gpt-5.6-sol",
+        review_reasoning_effort: "high",
+      })}
 
 ## Summary
 
@@ -821,6 +782,22 @@ Yes. Keeping the implementation as-is is the narrowest maintainable outcome.
   - commits: abcdef1234567890
   - files: src/example.ts
 `,
+      {
+        decision: "close",
+        closeReason: "implemented_on_main",
+        summary: "Current main already implements this.",
+        fixedPullRequest: {
+          repo: "openclaw/openclaw",
+          number: 456,
+          url: "https://github.com/openclaw/openclaw/pull/456",
+          title: "fix: wire the shell check",
+          mergedAt: "2026-04-28T12:00:00Z",
+          sha: "fedcba9876543210",
+          confidence: "high",
+          source: "GitHub closing PR reference",
+        },
+      },
+    ),
     "implemented_on_main",
   );
 

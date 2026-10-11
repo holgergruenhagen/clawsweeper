@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { normalizedOutputFileBytes, normalizedTailBytes } from "./codex-output-capture.js";
 import { codexProcessCommand } from "./codex-spawn.js";
+import type { DecisionRepairOptions } from "./review-decision-repair.js";
 import type { ReviewProofCapability } from "./review-proof-client.js";
 
 export { codexProcessCommand, codexSpawnInvocation } from "./codex-spawn.js";
@@ -22,6 +23,8 @@ export interface CodexProcessResult {
   signal: NodeJS.Signals | null;
   error?: Error;
   processError?: boolean;
+  // Validator error of the first final message when the worker ran one decision repair turn.
+  decisionRepairError?: string;
   stdout: string;
   stderr: string;
 }
@@ -34,6 +37,7 @@ interface SerializedCodexProcessResult {
     code?: string;
   };
   processError?: boolean;
+  decisionRepairError?: string;
   stdout: string;
   stderr: string;
 }
@@ -48,33 +52,6 @@ const CODEX_APP_SERVER_WORKER_PATH = fileURLToPath(
 export interface CodexAppServerProcessOptions {
   statePath: string;
   reviewProof?: ReviewProofCapability;
-  label?: string;
-  runnerPtyUrl?: string;
-  workStateUrl?: string;
-  agentToken?: string;
-}
-
-export function codexAppServerProcessOptionsFromEnv(
-  label: string,
-  env: NodeJS.ProcessEnv = process.env,
-): CodexAppServerProcessOptions | undefined {
-  if (env.CLAWSWEEPER_STEERABLE_CODEX !== "1") return undefined;
-  const statePath =
-    env.CLAWSWEEPER_CODEX_THREAD_STATE?.trim() ||
-    join(env.CODEX_HOME?.trim() || tmpdir(), "clawsweeper-thread-state.json");
-  return {
-    statePath,
-    label,
-    ...(env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL?.trim()
-      ? { runnerPtyUrl: env.CLAWSWEEPER_CRABFLEET_RUNNER_PTY_URL.trim() }
-      : {}),
-    ...(env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL?.trim()
-      ? { workStateUrl: env.CLAWSWEEPER_CRABFLEET_WORK_STATE_URL.trim() }
-      : {}),
-    ...(env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN?.trim()
-      ? { agentToken: env.CLAWSWEEPER_CRABFLEET_AGENT_TOKEN.trim() }
-      : {}),
-  };
 }
 
 export function runCodexProcess(options: {
@@ -90,6 +67,7 @@ export function runCodexProcess(options: {
   stdoutPath?: string;
   stderrPath?: string;
   appServer?: CodexAppServerProcessOptions;
+  decisionRepair?: DecisionRepairOptions;
 }): CodexProcessResult {
   const workDir = mkdtempSync(join(tmpdir(), "clawsweeper-codex-process-"));
   const optionsPath = join(workDir, "options.json");
@@ -119,6 +97,7 @@ export function runCodexProcess(options: {
               outputLastMessagePath: options.outputLastMessagePath,
             }),
         ...(options.appServer ? { appServer: options.appServer } : {}),
+        ...(options.decisionRepair ? { decisionRepair: options.decisionRepair } : {}),
       }),
       { encoding: "utf8", mode: 0o600 },
     );
@@ -220,6 +199,9 @@ function deserializeProcessResult(value: SerializedCodexProcessResult): CodexPro
     signal: value.signal,
     ...(value.error ? { error: deserializeError(value.error) } : {}),
     ...(value.processError === undefined ? {} : { processError: value.processError }),
+    ...(value.decisionRepairError === undefined
+      ? {}
+      : { decisionRepairError: value.decisionRepairError }),
     stdout: value.stdout,
     stderr: value.stderr,
   };

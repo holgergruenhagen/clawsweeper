@@ -5,10 +5,13 @@ import type { ApplyKind, ReportEntry } from "./clawsweeper-types.js";
 import { syncDecisionPacketRecord, type DecisionPacketSubjectState } from "./decision-packets.js";
 import { captureCanonicalRecordBaseline } from "./repair/canonical-record-baseline.js";
 import type { RepositoryProfile } from "./repository-profiles.js";
+import { applyQueueSortFields } from "./clawsweeper-record-metadata.js";
+import { numberForMarkdownFile } from "./clawsweeper-repository-paths.js";
+import { ReviewRecordFormatError } from "./review-record.js";
 
 type ApplyRecordDependencies = Pick<
   CreateApplyDecisionWorkflowDependencies,
-  "applyQueueSortFields" | "numberForMarkdownFile" | "reportEntriesForDir" | "targetRepo"
+  "reportEntriesForDir" | "targetRepo"
 > & {
   applyKind: ApplyKind;
   canonicalBaselineDir: string;
@@ -25,13 +28,11 @@ type ApplyRecordDependencies = Pick<
 
 export function createApplyRecordOperations({
   applyKind,
-  applyQueueSortFields,
   canonicalBaselineDir,
   closedDir,
   decisionPacketsDir,
   dryRun,
   itemsDir,
-  numberForMarkdownFile,
   plansDir,
   profile,
   recordRoot,
@@ -56,11 +57,21 @@ export function createApplyRecordOperations({
           entry.repo === targetRepo() &&
           (requestedItemNumberSet.size === 0 || requestedItemNumberSet.has(entry.number)),
       )
-      .map((entry) => ({
-        ...entry,
-        location,
-        ...applyQueueSortFields(entry.markdown, syncCommentsOnly, applyKind),
-      }));
+      .map((entry) => {
+        let sortFields;
+        try {
+          sortFields = applyQueueSortFields(entry.markdown, syncCommentsOnly, applyKind);
+        } catch (error) {
+          if (!(error instanceof ReviewRecordFormatError)) throw error;
+          // Keep unreadable records in the queue for the per-item fresh-review skip.
+          // Only host scheduling metadata is safe to read; never rank their decision.
+          sortFields = {
+            ...applyQueueSortFields(entry.markdown, true, applyKind),
+            priority: syncCommentsOnly ? 0 : 2,
+          };
+        }
+        return { ...entry, location, ...sortFields };
+      });
 
   const createOpenReportLookup = (entries: readonly ReportEntry[], selectedOnly: boolean) => {
     const byNumber = new Map<number, ReportEntry | undefined>(

@@ -1,38 +1,37 @@
-import { ideaRevivalReactionThreshold, positiveReactionCount } from "./idea-archive-revival.js";
 import {
   PR_AUTO_CLOSE_EXEMPT_LABELS,
   STALE_VERSION_BUG_MIN_INACTIVE_DAYS,
   UNSPONSORED_FEATURE_MIN_INACTIVE_DAYS,
 } from "./clawsweeper-policy.js";
 import type { GitHubUser, Item } from "./clawsweeper-types.js";
-import type { ApplyGuardDependencies } from "./clawsweeper-apply-guard-dependencies.js";
-import type { createApplyGuardActivity } from "./clawsweeper-apply-guard-activity.js";
+import {
+  issueRecentHumanCommentBlockReasonFromComments,
+  lowSignalUnmergeablePrAuthorActivityBlockReason,
+  lowSignalUnmergeablePrConflictBlockReason,
+  maintainerAssociatedEntries,
+  prAutoCloseExemptLabel,
+  type ApplyGuardActivity,
+  type GuardReads,
+} from "./clawsweeper-apply-guard-activity.js";
+import {
+  labelNames,
+  normalizeLabelName,
+  protectedLabels,
+  staleVersionBugAgeSkipReason,
+  unconfirmedProductDirectionAgeSkipReason,
+  unsponsoredFeatureAgeSkipReason,
+} from "./clawsweeper-item-policy.js";
+import {
+  staleVersionBugCloseEnabled,
+  unconfirmedProductDirectionCloseEnabled,
+  unsponsoredFeatureCloseEnabled,
+} from "./policy-flags.js";
+import { asRecord } from "./value-coerce.js";
 
 export function createApplyGuardPolicy(
-  dependencies: ApplyGuardDependencies & ReturnType<typeof createApplyGuardActivity>,
+  { ghJson, ghPaged, targetRepo }: GuardReads,
+  { pullRequestHeadActivity }: ApplyGuardActivity,
 ) {
-  const {
-    asRecord,
-    ghJson,
-    ghPaged,
-    labelNames,
-    normalizeLabelName,
-    protectedLabels,
-    staleVersionBugAgeSkipReason,
-    staleVersionBugCloseEnabled,
-    targetRepo,
-    unconfirmedProductDirectionAgeSkipReason,
-    unconfirmedProductDirectionCloseEnabled,
-    unsponsoredFeatureAgeSkipReason,
-    unsponsoredFeatureCloseEnabled,
-    maintainerAssociatedEntries,
-    lowSignalUnmergeablePrConflictBlockReason,
-    lowSignalUnmergeablePrAuthorActivityBlockReason,
-    issueRecentHumanCommentBlockReasonFromComments,
-    pullRequestHeadActivity,
-    prAutoCloseExemptLabel,
-  } = dependencies;
-
   function lowSignalUnmergeablePrApplyBlockReason(
     number: number,
     staleMinAgeDays: number,
@@ -186,17 +185,13 @@ export function createApplyGuardPolicy(
       state?: string;
     }>(["api", `repos/${targetRepo()}/issues/${number}`]);
     if (issue.state !== "open") return "live issue is not open";
-    if (
-      labelNames(issue.labels)
-        .map(normalizeLabelName)
-        .some((label) => label.includes("security"))
-    ) {
+    if (protectedLabels(labelNames(issue.labels)).length > 0) {
       return "security-labeled issue requires human triage";
     }
     if ((issue.assignees ?? []).length > 0) return "assigned issue has maintainer engagement";
     if (issue.milestone) return "milestoned issue has maintainer engagement";
-    if (positiveReactionCount(issue.reactions) >= ideaRevivalReactionThreshold()) {
-      return "issue already meets the idea-revival reaction threshold";
+    if (positiveReactionCount(issue.reactions) >= positiveReactionThreshold()) {
+      return "issue has enough positive reactions for maintainer consideration";
     }
     const totalReactions = asRecord(issue.reactions).total_count;
     if (typeof totalReactions === "number" && totalReactions >= 20) {
@@ -255,9 +250,6 @@ export function createApplyGuardPolicy(
       protectedLabels(labelNames(issue.labels))[0] ??
       prAutoCloseExemptLabel(labelNames(issue.labels));
     if (protectedLabel) return `protected label: ${protectedLabel}`;
-    if (labels.some((label) => label.includes("security"))) {
-      return "security-labeled issue requires human triage";
-    }
     if ((issue.assignees ?? []).length > 0) return "assigned issue has maintainer engagement";
     if (issue.milestone) return "milestoned issue has maintainer engagement";
     const totalReactions = asRecord(issue.reactions).total_count;
@@ -302,4 +294,18 @@ export function createApplyGuardPolicy(
     staleVersionBugApplyBlockReason,
     staleVersionBugApplyBlockReasonSafe,
   };
+}
+
+function positiveReactionThreshold(): number {
+  const configured = Number(process.env.CLAWSWEEPER_IDEA_REVIVAL_REACTIONS);
+  return Number.isInteger(configured) && configured > 0 && configured <= 1_000 ? configured : 5;
+}
+
+function positiveReactionCount(reactions: unknown): number {
+  if (!reactions || typeof reactions !== "object" || Array.isArray(reactions)) return 0;
+  const record = reactions as Record<string, unknown>;
+  return ["+1", "heart", "hooray"].reduce((total, name) => {
+    const value = record[name];
+    return total + (typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0);
+  }, 0);
 }

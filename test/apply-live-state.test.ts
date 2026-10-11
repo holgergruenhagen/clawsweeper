@@ -1,3 +1,4 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -6,11 +7,10 @@ import test from "node:test";
 
 import {
   guardedOpenApplyProofFields,
-  itemSourceRevisionSha256ForTest,
-  renderReviewCommentFromReport,
   renderReviewStartStatusComment,
-  shouldSyncReviewComment,
 } from "../dist/clawsweeper.js";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
+import { shouldSyncReviewComment } from "../dist/clawsweeper-record-metadata.js";
 import { capturedCanonicalRecordBaselineKeys } from "../dist/repair/canonical-record-baseline.js";
 import { createReviewedPrActivityCursor } from "../dist/review-activity-cursor.js";
 import { shouldReviewItem } from "../dist/scheduler-policy.js";
@@ -677,6 +677,17 @@ if (args[0] === "api" && /\\/issues\\/321$/.test(path)) {
 test("event apply emits proof only while a captured protected-label guard remains live", () => {
   for (const labels of [
     ["security"],
+    ["security-sensitive"],
+    ["security sensitive"],
+    ["type: security"],
+    ["type:security"],
+    ["kind: security"],
+    ["kind:security"],
+    ["area: security"],
+    ["impact:security"],
+    ["security-review-required"],
+    ["security-sensitive-changed"],
+    ["merge-risk: 🚨 security-boundary"],
     ["clawsweeper:needs-security-review"],
     ["clawsweeper:needs-maintainer-review"],
     ["clawsweeper:needs-product-decision"],
@@ -906,7 +917,7 @@ test("comment-only apply skips a locked issue before acquiring its mutation leas
         action_taken: "kept_open",
         author_association: "CONTRIBUTOR",
         labels: "[]",
-        item_source_revision: itemSourceRevisionSha256ForTest(issue, []),
+        item_source_revision: itemSourceRevisionSha256(issue, []),
         review_lease_owner: "review-owner",
         review_lease_comment_id: "77",
       }),
@@ -1004,7 +1015,7 @@ test("exact-event source drift wins over a locked conversation guard", () => {
         repository: "openclaw/openclaw",
         action_taken: "skipped_locked_conversation",
         labels: "[]",
-        item_source_revision: itemSourceRevisionSha256ForTest(reviewedIssue, []),
+        item_source_revision: itemSourceRevisionSha256(reviewedIssue, []),
         review_lease_owner: "review-owner",
         review_lease_comment_id: "77",
       }),
@@ -1150,7 +1161,7 @@ test("locked issue timestamp drift persists the observed current revision eviden
       implementedCloseReport({
         repository: "openclaw/openclaw",
         item_updated_at: "2026-05-01T00:00:00Z",
-        item_source_revision: itemSourceRevisionSha256ForTest(issue, []),
+        item_source_revision: itemSourceRevisionSha256(issue, []),
         review_lease_owner: "review-owner",
         review_lease_comment_id: "77",
         labels: "[]",
@@ -1224,7 +1235,7 @@ test("locked issue snapshot drift wins over its lock when updated_at is absent",
       join(itemsDir, "321.md"),
       implementedCloseReport({
         repository: "openclaw/openclaw",
-        item_source_revision: itemSourceRevisionSha256ForTest(issue, []),
+        item_source_revision: itemSourceRevisionSha256(issue, []),
         review_lease_owner: "review-owner",
         review_lease_comment_id: "77",
         labels: "[]",
@@ -1535,7 +1546,7 @@ test("protected source drift preserves its original guard after lock or label re
           action_taken: "skipped_protected_label",
           labels: JSON.stringify(["security"]),
           item_updated_at: "2026-05-01T00:00:00Z",
-          item_source_revision: itemSourceRevisionSha256ForTest(issue, []),
+          item_source_revision: itemSourceRevisionSha256(issue, []),
           ...(scenario.locked
             ? { review_lease_owner: "review-owner", review_lease_comment_id: "77" }
             : {}),
@@ -1709,7 +1720,7 @@ test("locked failed reviews honor the comment-sync cooldown and release their le
       comments: 2,
       pull_request: null,
     };
-    const revision = itemSourceRevisionSha256ForTest(issue, []);
+    const revision = itemSourceRevisionSha256(issue, []);
     const reviewed = reportWithSyncedReviewComment(
       implementedCloseReport({
         repository: "openclaw/openclaw",
@@ -1810,7 +1821,7 @@ if (args[0] === "api" && /\\/issues\\/321\\/comments(?:\\?|$)/.test(path)) {
   }
 });
 
-test("closed legacy reports archive without hydrating their irrelevant source snapshot", () => {
+test("closed typed reports archive without hydrating their incomplete source snapshot", () => {
   const root = mkdtempSync(tmpPrefix);
   try {
     const itemsDir = join(root, "items");
@@ -1907,7 +1918,7 @@ test("locked issues preserve already-synchronized linked-PR review comments", ()
       comments: 2,
       pull_request: null,
     };
-    const revision = itemSourceRevisionSha256ForTest(issue, []);
+    const revision = itemSourceRevisionSha256(issue, []);
     let report = implementedCloseReport({
       repository: "openclaw/openclaw",
       title: issue.title,
@@ -2424,7 +2435,7 @@ test("locked, already-synchronized maintainer and invalid reports refresh local 
           confidence: action === "skipped_invalid_decision" ? "low" : "high",
           labels: "[]",
           reviewed_at: reviewedAt,
-          item_source_revision: itemSourceRevisionSha256ForTest(issue, []),
+          item_source_revision: itemSourceRevisionSha256(issue, []),
           review_lease_owner: "review-owner",
           review_lease_comment_id: "77",
         }),
@@ -2539,7 +2550,7 @@ test("locked metadata synchronization adopts and releases its existing review le
       comments: 2,
       pull_request: null,
     };
-    const sourceRevision = itemSourceRevisionSha256ForTest(issue, []);
+    const sourceRevision = itemSourceRevisionSha256(issue, []);
     const reviewed = reportWithSyncedReviewComment(
       implementedCloseReport({
         repository: "openclaw/openclaw",

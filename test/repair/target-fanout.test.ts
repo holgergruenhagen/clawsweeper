@@ -78,6 +78,92 @@ test("target fanout defaults match the scheduled cursor batch sizes", () => {
   assert.equal(defaultLimit("audit"), "12");
 });
 
+test("audit fanout plans standalone audit dispatches with only the target input", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-audit-dispatch-"));
+  const ghPath = join(root, "gh.js");
+  const preloadPath = join(root, "fetch-preload.cjs");
+  try {
+    writeFileSync(
+      ghPath,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args[0] === "api" && args.includes("/installation/repositories?per_page=100")) {
+  console.log(JSON.stringify({full_name:"openclaw/clawhub",archived:false,disabled:false,fork:false,has_issues:true,visibility:"public",default_branch:"main"}));
+} else {
+  throw new Error("unexpected gh command " + JSON.stringify(args));
+}
+`,
+    );
+    chmodSync(ghPath, 0o755);
+    writeFileSync(
+      preloadPath,
+      `globalThis.fetch = async (input) => {
+  const url = new URL(String(input));
+  if (url.hostname === "api.github.com" && url.pathname === "/repos/openclaw/clawhub") {
+    return Response.json({full_name:"openclaw/clawhub",private:false,visibility:"public"});
+  }
+  if (url.hostname === "cursor.invalid") {
+    return Response.json({ok:true,mode:"audit",next_cursor:0,revision:0,updated_at:null,audit_batch:null});
+  }
+  throw new Error("unexpected fetch " + String(input));
+};
+`,
+    );
+    for (const workflowArgs of [[], ["--workflow", "audit.yml"]]) {
+      const output = execFileSync(
+        process.execPath,
+        [
+          "--require",
+          preloadPath,
+          "dist/repair/target-fanout.js",
+          "plan",
+          "--mode",
+          "audit",
+          "--owners",
+          "openclaw",
+          "--repo",
+          "openclaw/clawsweeper",
+          "--ref",
+          "audit-ref",
+          "--cursor-store-url",
+          "https://cursor.invalid",
+          ...workflowArgs,
+        ],
+        {
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            ...mockGhBinEnv(ghPath),
+            GITHUB_ACTIONS: "true",
+            CLAWSWEEPER_INVENTORY_TOKEN_OPENCLAW: "inventory-openclaw",
+            CLAWSWEEPER_HOSTED_TARGET_METADATA_TOKEN: "central-metadata",
+            CLAWSWEEPER_WEBHOOK_SECRET: "cursor-secret",
+          },
+        },
+      );
+      const plan = JSON.parse(output) as { commands: string[][] };
+      assert.deepEqual(plan.commands, [
+        [
+          "api",
+          "repos/openclaw/clawsweeper/actions/workflows/audit.yml/dispatches",
+          "--method",
+          "POST",
+          "-H",
+          "X-GitHub-Api-Version: 2022-11-28",
+          "-f",
+          "ref=audit-ref",
+          "-F",
+          "return_run_details=true",
+          "-f",
+          "inputs[target_repo]=openclaw/clawhub",
+        ],
+      ]);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("audit waves retain queued slots and drain failures before dispatching all twelve targets", async () => {
   let dispatched = 0;
   let polls = 0;
@@ -354,6 +440,38 @@ test("target fanout summarizes trailing weekly coverage from canonical open reco
     });
     assert.match(renderFleetReviewCoverage(coverage), /Items scanned in trailing 7 days \| 1/);
     assert.match(renderFleetReviewCoverage(coverage), /Trailing coverage \| 25\.0%/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("target fanout coverage ignores review metadata inside a fenced report sample", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-coverage-"));
+  try {
+    const items = join(root, "openclaw-a", "items");
+    mkdirSync(items, { recursive: true });
+    writeFileSync(
+      join(items, "1.md"),
+      [
+        "---",
+        "number: 1",
+        "---",
+        "",
+        "```yaml",
+        "review_status: complete",
+        "reviewed_at: 2026-07-28T12:00:00Z",
+        "```",
+        "",
+      ].join("\n"),
+    );
+    const coverage = summarizeFleetReviewCoverage({
+      repositories: [{ targetRepo: "openclaw/a", defaultBranch: "main", visibility: "PUBLIC" }],
+      openCounts: new Map([["openclaw/a", { issues: 1, pullRequests: 0 }]]),
+      windowDays: 7,
+      recordsRoot: root,
+      now: Date.parse("2026-07-29T12:00:00Z"),
+    });
+    assert.equal(coverage.scannedOpenRecords, 0);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -790,29 +908,43 @@ globalThis.fetch = async (input, init) => {
   );
 });
 
-test("target fanout uses explicit inventory and central metadata tokens in Actions", () => {
-  const source = readFileSync("src/repair/target-fanout.ts", "utf8");
-  const inventoryStart = source.indexOf("function inventoryAccess(");
-  const inventoryEnd = source.indexOf("function publicInventoryEnv(", inventoryStart);
-  const metadataStart = source.indexOf("function hostedTargetMetadataToken(");
-  const metadataEnd = source.indexOf("function dispatchEnv(", metadataStart);
-
-  assert.notEqual(inventoryStart, -1);
-  assert.notEqual(inventoryEnd, -1);
-  assert.notEqual(metadataStart, -1);
-  assert.notEqual(metadataEnd, -1);
-  const inventoryHelper = source.slice(inventoryStart, inventoryEnd);
-  assert.match(inventoryHelper, /CLAWSWEEPER_INVENTORY_TOKEN_/);
-  assert.match(inventoryHelper, /if \(process\.env\.GITHUB_ACTIONS === "true"\) return null;/);
-  assert.match(inventoryHelper, /kind: "installation"/);
-  assert.match(inventoryHelper, /kind: "public"/);
-  const metadataHelper = source.slice(metadataStart, metadataEnd);
-  assert.match(metadataHelper, /CLAWSWEEPER_HOSTED_TARGET_METADATA_TOKEN/);
-  assert.match(
-    metadataHelper,
-    /if \(explicit \|\| process\.env\.GITHUB_ACTIONS === "true"\) return explicit;/,
-  );
-  assert.doesNotMatch(source, /CLAWSWEEPER_TARGET_METADATA_TOKEN/);
+test("target fanout never probes with the dispatch token in Actions", async () => {
+  const names = [
+    "GITHUB_ACTIONS",
+    "CLAWSWEEPER_DISPATCH_TOKEN",
+    "CLAWSWEEPER_HOSTED_TARGET_METADATA_TOKEN",
+    "CLAWSWEEPER_PUBLIC_INVENTORY_TOKEN",
+    "CLAWSWEEPER_TARGET_METADATA_TOKEN",
+  ];
+  const previous = names.map((name) => process.env[name]);
+  // Only the explicit metadata token may probe; the retired variable name grants nothing.
+  const values = ["true", "dispatch-token", undefined, undefined, "retired-metadata"];
+  names.forEach((name, index) => {
+    if (values[index] === undefined) delete process.env[name];
+    else process.env[name] = values[index];
+  });
+  let probes = 0;
+  try {
+    await assert.rejects(
+      admitSelectedRepositories(
+        [{ targetRepo: "openclaw/clawhub", defaultBranch: "main", visibility: "PUBLIC" }],
+        {
+          policy: config.hostedTargetPolicy,
+          reader: async () => {
+            probes += 1;
+            return Response.json({ full_name: "openclaw/clawhub", visibility: "public" });
+          },
+        },
+      ),
+      /retryable for openclaw\/clawhub/,
+    );
+  } finally {
+    names.forEach((name, index) => {
+      if (previous[index] === undefined) delete process.env[name];
+      else process.env[name] = previous[index];
+    });
+  }
+  assert.equal(probes, 0);
 });
 
 test("target fanout selection advances cursor with wraparound", () => {
@@ -1370,14 +1502,19 @@ test("audit fanout requires batch-aware storage before advancing the cursor", as
 test("scheduled inventory forwards default and configured GitHub CLI budgets", async (t) => {
   const original = process.env;
   const timeouts: unknown[] = [];
-  t.mock.method(childProcess, "execFileSync", (_file, _args, options) => {
+  t.mock.method(childProcess, "spawnSync", (_file, _args, options) => {
     timeouts.push(options.timeout);
-    return JSON.stringify({
-      full_name: "openclaw/clawhub",
-      has_issues: true,
-      visibility: "public",
-      default_branch: "main",
-    });
+    return {
+      status: 0,
+      signal: null,
+      stderr: "",
+      stdout: JSON.stringify({
+        full_name: "openclaw/clawhub",
+        has_issues: true,
+        visibility: "public",
+        default_branch: "main",
+      }),
+    };
   });
   syncBuiltinESMExports();
   t.after(() => {

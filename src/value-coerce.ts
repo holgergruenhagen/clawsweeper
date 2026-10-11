@@ -2,12 +2,28 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-export function recordOrEmpty(value: unknown): Record<string, unknown> {
+/** Return the value when it is a plain object (not an array), else an empty record. */
+export function asRecord(value: unknown): Record<string, unknown> {
   return isRecord(value) ? value : {};
+}
+
+/** Return the `login` string of a GitHub user object, if it has one. */
+export function login(value: unknown): string | undefined {
+  const name = asRecord(value).login;
+  return typeof name === "string" ? name : undefined;
 }
 
 export function stringOrEmpty(value: unknown): string {
   return typeof value === "string" ? value : "";
+}
+
+export function stringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" ? value : undefined;
+}
+
+/** Returns the string unchanged when it has text that is not whitespace. */
+export function nonBlankStringOrUndefined(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
 }
 
 export function requireRecord(value: unknown, label: string): Record<string, unknown> {
@@ -36,6 +52,15 @@ export function rejectUnexpectedKeys(
   if (unexpected.length) throw new Error(`${label} has unexpected keys: ${unexpected.join(", ")}`);
 }
 
+export function isDigitsOnly(value: string): boolean {
+  if (!value) return false;
+  for (const char of value) {
+    const code = char.charCodeAt(0);
+    if (code < 48 || code > 57) return false;
+  }
+  return true;
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -44,4 +69,9 @@ export function errorSummary(error: unknown): string {
   return errorMessage(error)
     .replace(/[\r\n]+/g, " ")
     .slice(0, 300);
+}
+
+export function numberOrUndefined(value: unknown): number | undefined {
+  const number = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(number) ? number : undefined;
 }

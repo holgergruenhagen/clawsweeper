@@ -332,8 +332,8 @@ jobs:
                       "stale",
                     ].includes(label)) return false;
                     return !label.startsWith("clawsweeper:") || [
-                      "clawsweeper:automerge",
                       "clawsweeper:autofix",
+                      "clawsweeper:automerge",
                       "clawsweeper:human-review",
                       "clawsweeper:manual-only",
                       "clawsweeper:bulk-filed",
@@ -405,17 +405,26 @@ jobs:
             oidc_token="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 15 \
               --header "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               --get --data-urlencode "audience=$TARGET_DISPATCH_URL" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -er '.value | strings | select(length > 0)')"; then
+              "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -er '.value | strings | select(length > 0)')" &&
+            # jq 1.6 exits 0 on empty input, and the step runs without pipefail.
+            [ -n "$oidc_token" ]; then
             echo "::add-mask::$oidc_token"
-            if direct_response="$(curl --fail --silent --show-error --connect-timeout 5 --max-time 20 \
+            direct_body="$RUNNER_TEMP/clawsweeper-direct-intake.json"
+            # Only a 2xx answer means the queue took the item; --fail would also
+            # accept a 3xx and drop the event without reaching the relay.
+            if direct_status="$(curl --silent --show-error --connect-timeout 5 --max-time 20 \
               --request POST \
               --header "authorization: Bearer $oidc_token" \
               --header "content-type: application/json" \
               --data "$client_payload" \
-              "$TARGET_DISPATCH_URL")"; then
-              echo "Queued exact ClawSweeper review directly: $(jq -c . <<< "$direct_response" 2>/dev/null || echo '{}')"
+              --output "$direct_body" \
+              --write-out '%{http_code}' \
+              "$TARGET_DISPATCH_URL")" &&
+              [[ "$direct_status" == 2[0-9][0-9] ]]; then
+              echo "Queued exact ClawSweeper review directly: $(jq -c . "$direct_body" 2>/dev/null || echo '{}')"
               exit 0
             fi
+            echo "Direct ClawSweeper queue intake answered HTTP ${direct_status:-none}."
           fi
           echo "::notice::Direct ClawSweeper queue intake was unavailable; dispatching through repository_dispatch."
           payload="$(jq -nc --argjson client_payload "$client_payload" '{event_type:"clawsweeper_item",client_payload:$client_payload}')"
@@ -582,10 +591,8 @@ such as issue edits and PR synchronizes update the desired review revision. The
 receiver coalesces by repository and item number, then dispatches only a leased
 executor for the newest revision.
 
-For sub-5s acknowledgement, use the GitHub App webhook receiver instead of
-waiting for GitHub Actions to start the target dispatcher. The hosted Worker
-endpoint is `/github/webhook`; the local equivalent is
-the `build:repair` package script followed by `repair:comment-webhook`. It verifies
+For sub-5s acknowledgement, use the hosted GitHub App webhook at
+`/github/webhook` instead of waiting for GitHub Actions. The Worker verifies
 `CLAWSWEEPER_WEBHOOK_SECRET`, accepts `issue_comment`, `issues`, and
 `pull_request` events for explicitly configured public repositories plus the
 eligible `openclaw/*` and `steipete/*` fallbacks, mints a target installation
@@ -599,10 +606,13 @@ dispatcher installed as a compatibility fallback; it enqueues through
 [direct queue intake](#direct-queue-intake) and its legacy dispatch is bridged
 into the same queue before Codex starts.
 
-The standalone Node listener limits raw request bodies to 2 MiB before verifying
-their signature. Declared-length and chunked deliveries are supported. Oversized
-bodies receive HTTP 400 and a closed connection; Node owns HTTP framing and
-connection teardown.
+For a local receiver, run `pnpm run build:repair` followed by
+`pnpm run repair:comment-webhook`. It preserves the same signed review-command
+admission boundary as the hosted webhook.
+The Node listener limits raw request bodies to 2 MiB before signature validation.
+Declared-length and chunked deliveries are supported; oversized bodies receive
+HTTP 400 and a closed connection.
+
 
 The receiver keeps the review lane proposal-only, then runs exact apply for the
 selected item with only immediate-safe close reasons enabled:
@@ -676,9 +686,9 @@ An ordinary comment should produce no ClawSweeper comment dispatch and no
 target-token step. If the target app secret is absent, the workflow should
 finish with a notice rather than fall back to a maintainer PAT.
 
-The ClawSweeper `github-activity` workflow performs spam-candidate
-classification in-process and only dispatches the scanner for an accepted
-candidate. This keeps ordinary comments to one activity run instead of an
-activity run plus a second intake workflow. Preserve the source delivery or
+The ClawSweeper `github-activity` workflow runs the fact-only spam admission
+in-process and dispatches the scanner only for an admitted comment (an
+unprotected author with a body of at least 12 characters, a link, or a GitHub
+minimization). Protected authors stay at one activity run. Preserve the source delivery or
 comment id in every payload so receiver-side deduplication can collapse
 redeliveries.

@@ -176,17 +176,21 @@ test("Codex decision schema avoids unsupported strict-output keywords recursivel
 
 test("Codex failure logs distinguish provider throttling from content output failures", () => {
   assert.equal(
-    codexFailureLogKindForTest(
-      "Codex review failed: retryable codex transport failure (capacity).",
-    ),
+    codexFailureLogKindForTest(1, "Codex failed", "", "", {
+      diagnostic: "Rate limit reached for model-test on tokens per min (TPM).",
+    }),
     "provider_throttle",
   );
+  assert.equal(codexFailureLogKindForTest(1, "Codex wrote invalid JSON"), "content_or_output");
+  assert.equal(codexFailureLogKindForTest(null, "Codex review timed out."), "timeout");
+  // Captured model output is evidence only. It does not change the log kind.
   assert.equal(
-    codexFailureLogKindForTest("Codex review failed: invalid structured output."),
-    "content_or_output",
-  );
-  assert.equal(
-    codexFailureLogKindForTest("Codex review failed: codex execution failed."),
+    codexFailureLogKindForTest(
+      1,
+      "Codex failed",
+      "Codex review failed: invalid structured output.",
+      "retryable codex transport failure (capacity)",
+    ),
     "codex_execution",
   );
 });
@@ -1024,6 +1028,139 @@ ${fakeManagedDecision}
   }
 });
 
+for (const scenario of [
+  "repaired",
+  "invalid-twice",
+  "repair-rate-limited",
+  "valid-first",
+] as const) {
+  test(`runCodex decision repair turn: ${scenario}`, () => {
+    const root = mkdtempSync(tmpPrefix);
+    const openclawDir = join(root, "openclaw");
+    const workDir = join(root, "codex-work");
+    const binDir = join(root, "bin");
+    const callsPath = join(root, "codex-calls.jsonl");
+    const sessionId = "019f0560-0000-7000-8000-0000000000a1";
+    const validDecision = JSON.stringify(
+      closeDecision({
+        decision: "keep_open",
+        closeReason: "none",
+        confidence: "medium",
+        summary: "Repaired decision.",
+        bestSolution: "Keep the validator.",
+        closeComment: "",
+        workReason: "Maintainer review is required.",
+      }),
+    );
+    mkdirSync(openclawDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    initTrackedRepo(openclawDir);
+    const codexPath = join(binDir, "codex");
+    writeFileSync(
+      codexPath,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+if (process.argv[2] === "sandbox") {
+  process.stdout.write(${JSON.stringify(trackedCheckoutFingerprint)} + "\\n");
+  process.exit(0);
+}
+const stdin = fs.readFileSync(0, "utf8");
+const args = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(callsPath)}, JSON.stringify({ args, stdin }) + "\\n");
+process.stderr.write("OpenAI Codex v0.0.0\\n--------\\nsandbox: read-only\\nsession id: ${sessionId}\\n--------\\nuser\\n" + stdin + "\\n");
+const resumed = args.includes("resume");
+const scenario = ${JSON.stringify(scenario)};
+if (resumed && scenario === "repair-rate-limited") {
+  process.stderr.write("ERROR: stream disconnected: Rate limit reached for model-test on tokens per min (TPM). Please try again in 1ms.\\n");
+  process.exit(1);
+}
+const output = resumed
+  ? scenario === "invalid-twice" ? "not json" : ${JSON.stringify(validDecision)}
+  : scenario === "valid-first" ? ${JSON.stringify(validDecision)} : '{"decision":"keep_open"}';
+process.stdout.write(output + "\\n");
+`,
+    );
+    chmodSync(codexPath, 0o755);
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${binDir}${delimiter}${process.env.PATH ?? ""}`;
+    const review = () =>
+      runBoundedCodexForTest({
+        item: item({ number: 83396 }),
+        context: { issue: {}, comments: [], timeline: [] },
+        git: { mainSha: "abc123", latestRelease: null },
+        model: "model-test",
+        openclawDir,
+        reasoningEffort: "high",
+        sandboxMode: "read-only",
+        serviceTier: "",
+        timeoutMs: 10_000,
+        workDir,
+        prompt: "Return a review decision.",
+      });
+    const calls = () =>
+      readFileSync(callsPath, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as { args: string[]; stdin: string });
+    try {
+      if (scenario === "repair-rate-limited") {
+        // The repair turn's own failure, not the first turn's output, classifies the retry.
+        assert.throws(review, (error: Error & { retryable?: boolean }) => {
+          assert.equal(error.retryable, true);
+          assert.match(error.message, /Rate limit reached/);
+          assert.match(
+            error.message,
+            /first final message failed validation: decision\.evidence must be an array/,
+          );
+          return true;
+        });
+      } else if (scenario === "invalid-twice") {
+        assert.throws(review, (error: Error) => {
+          assert.equal(error.name, "CodexReviewError");
+          assert.match(error.message, /schema-invalid output to .*: Unexpected token/);
+          assert.match(
+            error.message,
+            /first final message failed validation: decision\.evidence must be an array/,
+          );
+          return true;
+        });
+      } else {
+        assert.equal(review().summary, "Repaired decision.");
+      }
+      const [first, repair, ...rest] = calls();
+      assert.deepEqual(rest, []);
+      assert.ok(first);
+      assert.equal(first.stdin, "Return a review decision.");
+      if (scenario === "valid-first") {
+        assert.equal(repair, undefined);
+        return;
+      }
+      assert.ok(repair);
+      // Same exec args (sandbox, cwd, schema, writable dirs); only the thread resume is added.
+      assert.deepEqual(repair.args, [...first.args.slice(0, -1), "resume", sessionId, "-"]);
+      assert.deepEqual(first.args.slice(first.args.indexOf("-C"), first.args.indexOf("-C") + 2), [
+        "-C",
+        openclawDir,
+      ]);
+      assert.ok(first.args.includes("--output-schema"));
+      assert.deepEqual(
+        first.args.slice(first.args.indexOf("--sandbox"), first.args.indexOf("--sandbox") + 2),
+        ["--sandbox", "read-only"],
+      );
+      assert.match(repair.stdin, /decision\.evidence must be an array/);
+      assert.match(repair.stdin, /Return the corrected full JSON object/);
+      assert.match(
+        readFileSync(join(workDir, "83396.1.codex.stderr.log"), "utf8"),
+        /\[clawsweeper\] decision repair turn/,
+      );
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+}
+
 test("codex failure decisions expose stderr and stdout separately", () => {
   const errorMessage =
     "Rate limit reached for model-test on tokens per min (TPM). Please try again in 1ms.";
@@ -1045,18 +1182,6 @@ test("codex failure decisions expose stderr and stdout separately", () => {
     "user\nThe reviewed prompt discusses rate limits.",
   );
   assert.equal(decision.regressionAssessment, null);
-  assert.deepEqual(decision.liveProofPlan, {
-    status: "not_applicable",
-    surface: "none",
-    terminalCompletion: "not_applicable",
-    reason: "Live proof was not assessed because the Codex review failed.",
-    payoff: {
-      kind: "static_text",
-      justification: "No recording payoff was assessed because the Codex review failed.",
-    },
-    entry: "",
-    steps: [],
-  });
   assert.match(
     decision.evidence.find((entry) => entry.label === "codex stdout")?.detail ?? "",
     /"type":"turn.failed"/,

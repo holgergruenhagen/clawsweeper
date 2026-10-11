@@ -4,9 +4,13 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { join } from "node:path";
 import test from "node:test";
 
-import { renderWorkPlanFromReport } from "../dist/clawsweeper.js";
+import {
+  renderWorkPlanFromReport,
+  syncWorkPlanFromReport,
+} from "../dist/clawsweeper-report-context.js";
 import { capturedCanonicalRecordBaselineKeys } from "../dist/repair/canonical-record-baseline.js";
-import { tmpPrefix, workPlanCandidateReport } from "./helpers.ts";
+import { readText, tmpPrefix, withReviewRecord, workPlanCandidateReport } from "./helpers.ts";
+import { ReviewRecordFormatError } from "../dist/review-record.js";
 
 test("renderWorkPlanFromReport renders dashboard plan artifacts for fresh queue_fix_pr candidates", () => {
   const plan = renderWorkPlanFromReport(workPlanCandidateReport(), {
@@ -31,6 +35,86 @@ test("renderWorkPlanFromReport returns null for stale, reclassified, or non-cand
     renderWorkPlanFromReport(workPlanCandidateReport({ reviewed_at: "2026-01-01T00:00:00.000Z" })),
     null,
   );
+});
+
+test("work plans use the recorded decision and retain host publication gates", () => {
+  const typed = withReviewRecord(workPlanCandidateReport({ work_candidate: "none" }), {
+    decision: "keep_open",
+    closeReason: "none",
+    workCandidate: "queue_fix_pr",
+    workPriority: "high",
+    workConfidence: "high",
+    workPrompt: "Implement the recorded repair.",
+    workLikelyFiles: ["src/recorded.ts"],
+    workValidation: ["recorded validation"],
+    workClusterRefs: ["recorded cluster"],
+    summary: "Recorded plan summary.",
+  });
+  const plan = renderWorkPlanFromReport(typed);
+  assert.ok(plan);
+  assert.match(plan, /Recorded plan summary\./);
+  assert.match(plan, /Implement the recorded repair\./);
+  assert.match(plan, /work_priority: high/);
+  assert.match(plan, /src\/recorded\.ts/);
+  assert.match(plan, /recorded validation/);
+  assert.match(plan, /recorded cluster/);
+  assert.doesNotMatch(plan, /existing report fields|src\/clawsweeper\.ts/);
+  assert.equal(
+    renderWorkPlanFromReport(typed.replace("work_status: candidate", "work_status: none")),
+    null,
+  );
+  assert.equal(
+    renderWorkPlanFromReport(typed.replace("action_taken: kept_open", "action_taken: closed")),
+    null,
+  );
+  assert.equal(
+    renderWorkPlanFromReport(
+      withReviewRecord(workPlanCandidateReport(), {
+        decision: "keep_open",
+        closeReason: "none",
+        workCandidate: "none",
+      }),
+    ),
+    null,
+  );
+  assert.throws(
+    () => renderWorkPlanFromReport(typed.replace(/^review_record: \{/m, "review_record: {broken")),
+    ReviewRecordFormatError,
+  );
+});
+
+test("work plan sync removes a corrupt record's stale plan and continues with valid reports", () => {
+  const root = mkdtempSync(tmpPrefix);
+  try {
+    const plansDir = join(root, "plans");
+    const reportPath = join(root, "321.md");
+    const markdown = withReviewRecord(workPlanCandidateReport(), {
+      decision: "keep_open",
+      closeReason: "none",
+      workCandidate: "queue_fix_pr",
+      workPrompt: "Implement the recorded repair.",
+    }).replace(/^review_record: \{/m, "review_record: {broken");
+    mkdirSync(plansDir);
+    writeFileSync(reportPath, markdown);
+    const planPath = join(plansDir, "321.md");
+    writeFileSync(planPath, "Stale runnable plan");
+    assert.equal(syncWorkPlanFromReport({ markdown, reportPath, plansDir, dryRun: true }), false);
+    assert.equal(readFileSync(planPath, "utf8"), "Stale runnable plan");
+    assert.equal(syncWorkPlanFromReport({ markdown, reportPath, plansDir }), false);
+    assert.equal(existsSync(planPath), false);
+    assert.equal(readFileSync(reportPath, "utf8"), markdown);
+    assert.equal(
+      syncWorkPlanFromReport({
+        markdown: workPlanCandidateReport({ number: 322 }),
+        reportPath: join(root, "322.md"),
+        plansDir,
+      }),
+      true,
+    );
+    assert.match(readFileSync(join(plansDir, "322.md"), "utf8"), /Render generated plan markdown/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("apply-artifacts writes and removes generated work plans", () => {
@@ -218,4 +302,12 @@ if (args.includes("/comments")) {
     rmSync(root, { recursive: true, force: true });
     rmSync(defaultPlanPath, { force: true });
   }
+});
+
+test("apply-artifacts records an interrupted publication before it rethrows", () => {
+  // A failed publication must leave a terminal ledger receipt for the item in flight.
+  assert.match(
+    readText("src/clawsweeper-command-operations.ts"),
+    /if \(activePublication\) \{\s*recordPublication\(\{[^]*?finishPublication\(error, interruptedMutation\);\s*throw error;/,
+  );
 });

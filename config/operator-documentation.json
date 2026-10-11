@@ -13,7 +13,6 @@
     { "path": "/api/review-coverage", "method": "GET" },
     { "path": "/api/apply-observability", "method": "GET" },
     { "path": "/api/health-history", "method": "GET" },
-    { "path": "/api/automerge-metrics", "method": "GET" },
     { "path": "/api/status", "method": "ANY" },
     { "path": "/api/triage", "method": "ANY" },
     { "path": "/api/pr-proof-triage", "method": "ANY" }
@@ -26,7 +25,6 @@
     "WORKER_JOB_CACHE_TTL_SECONDS",
     "WORKER_HEALTH_CACHE_TTL_SECONDS",
     "WORKER_HEALTH_FETCH_CONCURRENCY",
-    "AUTOMERGE_CACHE_TTL_SECONDS",
     "RECENT_CLOSED_CACHE_TTL_SECONDS",
     "INCLUDE_CI_STATUS",
     "REVIEW_OBSERVABILITY_REQUIRED",
@@ -39,9 +37,6 @@
     "OPENROUTER_API_KEY",
     "CLOUDFLARE_ACCESS_CLIENT_ID",
     "CLOUDFLARE_ACCESS_CLIENT_SECRET",
-    "OPENCLAW_CLOUDFLARE_ACCESS_API_TOKEN",
-    "OPENCLAW_CLOUDFLARE_CONFIG_API_TOKEN",
-    "OPENCLAW_CLOUDFLARE_PAGES_API_TOKEN",
     "OPENCLAW_REPORTS_ACCESS_CLIENT_ID",
     "OPENCLAW_REPORTS_ACCESS_CLIENT_SECRET"
   ]

@@ -32,7 +32,8 @@ import {
   githubReadModelRequestSync,
   usableGithubReadModelResponse,
 } from "./github-webhook-read-model-client.js";
-import { recordOrEmpty as jsonRecord } from "./value-coerce.js";
+import { asRecord as jsonRecord } from "./value-coerce.js";
+import { indexedExistingReview } from "./clawsweeper-record-metadata.js";
 
 export {
   PR_ACTIVITY_REVISION_CONNECTION_LIMIT,
@@ -46,20 +47,19 @@ export interface PlannedPrActivityRevisions {
   connectionLimit: number;
 }
 
+export function isFresh(
+  review: { reviewedAt: string | undefined; reviewStatus: string | undefined } | null,
+): boolean {
+  if (review?.reviewStatus !== "complete") return false;
+  if (!review?.reviewedAt) return false;
+  const reviewedAt = Date.parse(review.reviewedAt);
+  if (!Number.isFinite(reviewedAt)) return false;
+  return Date.now() - reviewedAt < FRESH_DAYS * DAY_MS;
+}
 export function createReviewPlanningInventory(dependencies: ReviewPlanningDependencies) {
-  const { targetRepo, ghJson, ghJsonLines, normalizeAuthorAssociation, indexedExistingReview } =
-    dependencies;
+  const { targetRepo, ghJson, ghJsonLines, normalizeAuthorAssociation } = dependencies;
   const readModelRequest = dependencies.githubReadModelRequestSync ?? githubReadModelRequestSync;
 
-  function isFresh(
-    review: { reviewedAt: string | undefined; reviewStatus: string | undefined } | null,
-  ): boolean {
-    if (review?.reviewStatus !== "complete") return false;
-    if (!review?.reviewedAt) return false;
-    const reviewedAt = Date.parse(review.reviewedAt);
-    if (!Number.isFinite(reviewedAt)) return false;
-    return Date.now() - reviewedAt < FRESH_DAYS * DAY_MS;
-  }
   function isCurrentForCadence(options: {
     reviewedAt: string | undefined;
     reviewStatus: string | undefined;

@@ -16,15 +16,14 @@ import { fileURLToPath } from "node:url";
 
 import {
   defaultReviewArtifactDirForTest,
-  exactEventReviewLeaseDispositionForTest,
-  itemSourceRevisionSha256ForTest,
   isSuppliedReviewStartLeaseForTest,
   localExactReviewHistoryPathForTest,
   prepareManagedLocalReviewCheckoutForTest,
-  reviewPolicyHashForTest,
   reviewLeaseStillMatchesContextForTest,
 } from "../dist/clawsweeper.js";
-import { runText, UserFacingCommandError } from "../dist/command.js";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
+import { exactEventReviewLeaseDisposition } from "../dist/clawsweeper-record-metadata.js";
+import { runText, runTextConcurrently, UserFacingCommandError } from "../dist/command.js";
 import { reviewMergeBase } from "../dist/pr-review-evidence.js";
 import { reviewStructuralPullStateDigest } from "../dist/review-structural-cache.js";
 import { mockGhBinEnv, workPlanCandidateReport } from "./helpers.ts";
@@ -122,6 +121,112 @@ test("runText explains missing executables", () => {
       return true;
     },
   );
+});
+
+test("runTextConcurrently runs commands together and reports each result as runText would", () => {
+  const root = mkdtempSync(join(tmpdir(), "cmd-concurrent-"));
+  // Each command waits until all three have started, so they finish only if
+  // they run at the same time; the timeout turns a serial run into a failure.
+  const rendezvous = (name: string) => [
+    "-e",
+    `const fs = require("node:fs");
+     fs.writeFileSync(${JSON.stringify(join(root, name))}, "");
+     const poll = setInterval(() => {
+       if (fs.readdirSync(${JSON.stringify(root)}).length >= 3) {
+         clearInterval(poll);
+         process.stdout.write(${JSON.stringify(`${name}\n`)});
+       }
+     }, 5);`,
+  ];
+  const failing = ["-e", "process.stderr.write('HTTP 404: Not Found'); process.exit(1)"];
+  const slow = ["-e", "setTimeout(() => {}, 10_000)"];
+  try {
+    const startedAt = Date.now();
+    const results = runTextConcurrently(
+      [
+        ...["a", "b", "c"].map((name) => ({
+          command: process.execPath,
+          args: rendezvous(name),
+          options: { deadlineAt: startedAt + 10_000 },
+        })),
+        { command: process.execPath, args: failing },
+        { command: process.execPath, args: slow, options: { deadlineAt: startedAt + 500 } },
+        {
+          command: "clawsweeper-missing-command-for-test",
+          args: [],
+          options: { env: { PATH: "" } },
+        },
+      ],
+      6,
+    );
+
+    assert.deepEqual(results.slice(0, 3), [{ output: "a" }, { output: "b" }, { output: "c" }]);
+    const sameFailure = (
+      result: (typeof results)[number] | undefined,
+      sequential: () => string,
+    ) => {
+      assert.ok(result && "error" in result);
+      const concurrentError = result.error as Error & Record<string, unknown>;
+      assert.throws(sequential, (error: Error & Record<string, unknown>) => {
+        assert.equal(concurrentError.constructor, error.constructor);
+        assert.equal(concurrentError.message, error.message);
+        for (const field of ["code", "status", "stdout", "stderr"]) {
+          assert.equal(concurrentError[field], error[field], field);
+        }
+        return true;
+      });
+    };
+    sameFailure(results[3], () => runText(process.execPath, failing));
+    sameFailure(results[4], () => runText(process.execPath, slow, { timeoutMs: 50 }));
+    sameFailure(results[5], () =>
+      runText("clawsweeper-missing-command-for-test", [], { env: { PATH: "" } }),
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("runTextConcurrently does not start a queued command whose deadline has passed", () => {
+  const startedAt = Date.now();
+  // A real 300 ms command holds the only slot past the second command's deadline.
+  const results = runTextConcurrently(
+    [
+      {
+        command: process.execPath,
+        args: ["-e", "setTimeout(() => process.stdout.write('first'), 300)"],
+        options: { deadlineAt: startedAt + 10_000 },
+      },
+      {
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('late')"],
+        options: { deadlineAt: startedAt + 150 },
+      },
+    ],
+    1,
+  );
+
+  assert.deepEqual(results, [{ output: "first" }, { expired: true }]);
+});
+
+test("runTextConcurrently keeps a live command when an earlier one has already expired", () => {
+  const startedAt = Date.now();
+  const results = runTextConcurrently(
+    [
+      {
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('never')"],
+        options: { deadlineAt: startedAt - 1 },
+      },
+      {
+        command: process.execPath,
+        args: ["-e", "process.stdout.write('live')"],
+        options: { deadlineAt: startedAt + 10_000 },
+      },
+    ],
+    2,
+  );
+
+  assert.deepEqual(results, [{ expired: true }, { output: "live" }]);
 });
 
 test("review CLI suppresses stack traces for missing local target checkout", () => {
@@ -237,7 +342,7 @@ test("CSW-088 scheduled hot planning suppresses #117063, observes an in-flight u
     labels: issue.labels,
     pull_request: {},
   };
-  const sourceRevision = itemSourceRevisionSha256ForTest(pull, []);
+  const sourceRevision = itemSourceRevisionSha256(pull, []);
   const pullStateDigest = reviewStructuralPullStateDigest({
     headSha,
     baseSha: pull.base.sha,
@@ -262,7 +367,13 @@ test("CSW-088 scheduled hot planning suppresses #117063, observes an in-flight u
         number,
         title: pull.title,
         reviewed_at: reviewedAt,
-        review_policy: reviewPolicyHashForTest(),
+        review_policy: JSON.parse(
+          execFileSync(
+            process.execPath,
+            [CLI, "plan", "--target-repo", "openclaw/openclaw", "--item-numbers", "none"],
+            { encoding: "utf8" },
+          ),
+        ).reviewPolicy,
         item_updated_at: reviewedAt,
         item_source_revision: sourceRevision,
         pull_head_sha: headSha,
@@ -479,17 +590,17 @@ process.exit(1);
 test("exact event publication requeues legacy tuples and source drift before mutation", () => {
   const revision = "0123456789abcdef0123456789abcdef01234567";
   const base = `---\nitem_source_revision: ${revision}\n---\n`;
-  assert.deepEqual(exactEventReviewLeaseDispositionForTest(base, revision), {
+  assert.deepEqual(exactEventReviewLeaseDisposition(base, revision), {
     status: "legacy_tupleless",
     reason: "local report has no durable lease identity",
   });
-  assert.deepEqual(exactEventReviewLeaseDispositionForTest(base, "f".repeat(40)), {
+  assert.deepEqual(exactEventReviewLeaseDisposition(base, "f".repeat(40)), {
     status: "source_drift",
     reportRevision: revision,
     liveRevision: "f".repeat(40),
   });
   assert.deepEqual(
-    exactEventReviewLeaseDispositionForTest(
+    exactEventReviewLeaseDisposition(
       `---\nitem_source_revision: ${revision}\nreview_lease_owner: run-123\nreview_lease_comment_id: 99\n---\n`,
       revision,
     ),

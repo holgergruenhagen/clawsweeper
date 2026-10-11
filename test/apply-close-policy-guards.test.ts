@@ -11,7 +11,13 @@ import {
 } from "../dist/clawsweeper-apply-close-policies.js";
 import { LiveReadGeneration } from "../dist/live-read-generation.js";
 import type { ReportEntry } from "../src/clawsweeper-types.ts";
-import { implementedCloseReport, item, tmpPrefix } from "./helpers.ts";
+import {
+  implementedCloseReport,
+  item,
+  reviewReportFrontMatter,
+  tmpPrefix,
+  withReviewRecord,
+} from "./helpers.ts";
 
 const currentItem = {
   ...item(),
@@ -20,6 +26,15 @@ const currentItem = {
   author: "reporter",
   authorAssociation: "CONTRIBUTOR",
 };
+const currentMarkdown = withReviewRecord(
+  reviewReportFrontMatter({
+    repository: currentItem.repo,
+    number: currentItem.number,
+    type: currentItem.kind,
+    item_updated_at: currentItem.updatedAt,
+  }),
+  { decision: "close", closeReason: "implemented_on_main" },
+);
 function counterpartAdmission(
   closeReason: "implemented_on_main" | "stale_version_bug" | "stale_insufficient_info",
   changeAfterAdmission: "locked" | "closed" | "unknown" | null = null,
@@ -37,6 +52,8 @@ function counterpartAdmission(
       item_category: "bug",
       item_created_at: "2026-01-01T00:00:00Z",
       item_updated_at: "2026-01-01T00:00:00Z",
+      review_comment_id: "320",
+      review_comment_url: "https://github.com/openclaw/openclaw/issues/320#issuecomment-320",
     });
     writeFileSync(path, markdown, "utf8");
     const counterpartItem = { ...currentItem, number: 320, kind: "issue" as const };
@@ -44,8 +61,6 @@ function counterpartAdmission(
     let liveLocked = false;
     let liveState = changeAfterAdmission === "closed" ? "closed" : "open";
     let reviewStateReads = 0;
-    const frontMatterValue = (source: string, key: string) =>
-      new RegExp(`^${key}: (.*)$`, "m").exec(source)?.[1];
     const guards = createApplyCloseGuards(
       {
         resetGuardReadCache: () => {},
@@ -59,40 +74,27 @@ function counterpartAdmission(
         commentBodyMatches: () => true,
         commentUpdatedAt: () => counterpartItem.updatedAt,
         duplicateCanonicalPullRequestBlockReason: () => null,
-        fetchItem: () => ({ item: counterpartItem, state: liveState }),
-        frontMatterValue,
-        hasAutoCloseAllowedMetadata: () => true,
-        hasVerifiedLocalCheckoutAccess: () => true,
-        isApplyCloseCandidateReport: () => true,
+        fetchItem: () => ({ item: { ...counterpartItem, locked: liveLocked }, state: liveState }),
         isMaintainerAuthorAssociation: () => false,
-        isRetryableCloseSkipReport: () => false,
-        issueRecentHumanCommentBlockReasonFromComments: () =>
-          closeReason === "stale_insufficient_info"
-            ? "issue has a non-bot comment within the last 60 days"
-            : null,
         issueRecentHumanCommentBlockReasonSafe: () => {
           throw new Error("counterpart policy must reuse the complete comment read");
         },
         issueReviewCommentState: () => {
           reviewStateReads += 1;
-          return { comments: [{}], reviewComment: { updated_at: counterpartItem.updatedAt } };
+          return {
+            comments: [{ user: { type: "User" }, created_at: new Date().toISOString() }],
+            reviewComment: { updated_at: counterpartItem.updatedAt },
+          };
         },
         isVerifiedFixedCloseReason: () => false,
         itemSnapshotHash: () => "reviewed-snapshot",
-        lockedConversationApplyReason: () => (liveLocked ? "conversation is locked" : null),
-        markdownRepository: () => "openclaw/openclaw",
         markedReviewCommentBody: (_number: number, body: string) => body,
         normalizeAuthorAssociation: (value: unknown) => (typeof value === "string" ? value : ""),
         openClosingPullRequestApplyReason: () => null,
         renderReviewCommentFromReport: () => "review",
-        reportCloseReason: () => closeReason,
-        reportDecision: () => ({}),
-        reportItemKind: () => "issue",
         reviewCommentBodyDigest: () => "digest",
         reviewCommentHashMatches: () => true,
-        reviewSectionValue: () => "",
         sameAuthorCounterpartApplyReason: () => null,
-        shouldSyncReviewComment: () => false,
         staleVersionBugApplyBlockReasonSafe: () =>
           closeReason === "stale_version_bug" ? "stale-version bug apply policy is disabled" : null,
         validateCloseDecision: () => ({ ok: true }),
@@ -106,7 +108,7 @@ function counterpartAdmission(
         currentCloseState: () => ({
           closedCount: 0,
           closeReason: "implemented_on_main",
-          markdown: "",
+          markdown: currentMarkdown,
           needsReviewCommentSync: false,
           processedCount: 0,
           storedUpdatedAt: currentItem.updatedAt,

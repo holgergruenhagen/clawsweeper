@@ -4,10 +4,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import test from "node:test";
 
-import {
-  itemSourceRevisionSha256ForTest,
-  renderReviewStartStatusComment,
-} from "../dist/clawsweeper.js";
+import { renderReviewStartStatusComment } from "../dist/clawsweeper.js";
+import { itemSourceRevisionSha256 } from "../dist/clawsweeper-source-revision.js";
 import {
   createApplySourceFreshness,
   OWNED_LEASE_RELEASE_RECEIPT_WINDOW_MS,
@@ -119,12 +117,11 @@ function sourceFreshness(options: {
   existingReviewComment?: Comment;
   // Non-automation comment, review comment, or timeline event after the review snapshot.
   nonAutomationActivityAfterSnapshot?: boolean;
+  // The activity read is truncated and has no complete hydration.
+  truncatedActivity?: boolean;
+  labelSyncRecorded?: boolean;
   timeline?: { event: string; actor: string; createdAt: string; label?: string }[];
 }) {
-  const timestampMs = (value: unknown) => {
-    const parsed = typeof value === "string" ? Date.parse(value) : Number.NaN;
-    return Number.isFinite(parsed) ? parsed : null;
-  };
   const record = (value: unknown) =>
     value && typeof value === "object" ? (value as Record<string, unknown>) : {};
   const context = { issue: {}, comments: [], timeline: [] } as Record<PropertyKey, unknown>;
@@ -136,25 +133,25 @@ function sourceFreshness(options: {
     };
   return createApplySourceFreshness(
     {
-      asRecord: record,
       CLAWSWEEPER_BOT_AUTHORS: new Set(["clawsweeper", "clawsweeper[bot]"]),
       commentBody: (comment: unknown) => record(comment).body as string | undefined,
       commentId: (comment: unknown) => record(comment).id as number | undefined,
       commentUpdatedAt: (comment: unknown) => record(comment).updated_at as string | undefined,
-      contextHasNonAutomationActivityAfter: () =>
-        options.nonAutomationActivityAfterSnapshot ?? false,
+      // Like the real dependency, truncation counts as activity unless the caller opts out.
+      contextHasNonAutomationActivityAfter: (
+        _context: unknown,
+        _afterMs: number,
+        activity?: { truncationCountsAsActivity?: boolean },
+      ) =>
+        options.nonAutomationActivityAfterSnapshot ??
+        (options.truncatedActivity === true && (activity?.truncationCountsAsActivity ?? true)),
       fetchIssueReviewComments: () => {
         throw new Error("acknowledgement witness must reuse the apply comment read");
       },
       freshPullRequestReviewHead: () => true,
-      frontMatterValue: (markdown: string, key: string) =>
-        markdown.match(new RegExp(`^${key}: (.*)$`, "m"))?.[1],
       itemSnapshotHash: () => "snapshot",
-      login: (user: unknown) => record(user).login as string | undefined,
-      recordedLabelSyncCoversUpdate: () => false,
+      recordedLabelSyncCoversUpdate: () => options.labelSyncRecorded ?? false,
       reviewStartLeaseOwner: () => null,
-      stringOrUndefined: (value: unknown) => (typeof value === "string" ? value : undefined),
-      timestampMs,
     } as never,
     {
       action: "proposed_close",
@@ -249,6 +246,14 @@ test("acknowledgement edit cannot mask other activity after the review snapshot"
     assert.equal(freshness.automationOnlyUpdate, false, name);
     assert.equal(freshness.reviewedSourceFresh(), false, name);
   }
+});
+
+test("recorded label sync cannot hide activity behind truncated hydration", () => {
+  const labelSync = { comments: [], completeIdentity: false, labelSyncRecorded: true };
+  assert.equal(sourceFreshness(labelSync).automationOnlyUpdate, true);
+  const truncated = sourceFreshness({ ...labelSync, truncatedActivity: true });
+  assert.equal(truncated.automationOnlyUpdate, false);
+  assert.equal(truncated.reviewedSourceFresh(), false);
 });
 
 test("released review lease after the generation's durable sync is not source drift", () => {
@@ -408,7 +413,7 @@ for (const scenario of [
           labels: "[]",
           pull_head_sha: head,
           item_updated_at: reviewSnapshotAt,
-          item_source_revision: itemSourceRevisionSha256ForTest(
+          item_source_revision: itemSourceRevisionSha256(
             { title, body: "Stale PR body.", labels: [] },
             [],
           ),

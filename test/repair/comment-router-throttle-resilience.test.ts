@@ -1,8 +1,16 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
-import { readText } from "../helpers.ts";
+import { parse as parseYaml } from "yaml";
+
+import {
+  sourceSparseCheckoutEntries,
+  sparseEntriesCover,
+} from "./workflow-sparse-checkout-helpers.ts";
 
 test("comment router defers GitHub throttles without advancing its cursor", async () => {
   const result = await runNode("scripts/e2e/comment-router-throttle-loopback.mjs");
@@ -21,35 +29,54 @@ test("comment router defers GitHub throttles without advancing its cursor", asyn
     undiscovered_explicit_comment_not_counted: true,
     empty_finalization_succeeded: true,
     partial_receipts_finalized: true,
+    throttled_write_stops_command: true,
+    deleted_ack_converges_without_write: true,
+    forced_replay_attempt_routed: true,
+    review_uses_canonical_queue: true,
+    multiline_review_context_preserved: true,
+    retired_commands_reply_once: true,
   });
   assert.equal(receipt.transport, "loopback HTTP via GITHUB_API_URL");
 });
 
-test("comment router workflow publishes only successfully advanced scan cursors", () => {
-  const workflow = readText(".github/workflows/repair-comment-router.yml");
-  assert.equal(workflow.match(/scripts\/comment-router-runner\.mjs/g)?.length, 1);
-  assert.equal(workflow.match(/scripts\/operator-skip-reasons\.mjs/g)?.length, 1);
-  assert.equal(
-    workflow.match(
-      /publish_args\+=\(--path "results\/comment-router-cursors\/\$\{\{ steps\.target\.outputs\.target_slug \}\}\.json"\)/g,
-    )?.length,
-    2,
-  );
-  assert.equal(workflow.match(/\[ "\$cursor_changed" != "true" \]/g)?.length, 2);
+test("comment router workflow publishes only successfully advanced scan cursors", (t) => {
+  const entries = sourceSparseCheckoutEntries(".github/workflows/repair-comment-router.yml");
+  for (const script of ["scripts/comment-router-runner.mjs", "scripts/operator-skip-reasons.mjs"]) {
+    assert.ok(sparseEntriesCover(entries, script), script);
+  }
+
+  const workflow = parseYaml(
+    readFileSync(".github/workflows/repair-comment-router.yml", "utf8"),
+  ) as { jobs: Record<string, { steps?: Array<{ name?: string; run?: string }> }> };
+  const steps = Object.values(workflow.jobs).flatMap((job) => job.steps ?? []);
+  const directory = mkdtempSync(path.join(tmpdir(), "clawsweeper-router-cursor-publish-"));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const run = steps.find((step) => step.name === "Commit comment router ledger")?.run;
+  assert.ok(run);
+  assert.deepEqual(publishArgs(path.join(directory, "unchanged"), run, false), []);
+  const publish = publishArgs(path.join(directory, "changed"), run, true);
+  assert.deepEqual(publish.slice(0, 2), ["run", "repair:publish-main"]);
+  assert.deepEqual(publish.slice(-2), [
+    "--path",
+    "results/comment-router-cursors/openclaw-openclaw.json",
+  ]);
 });
 
-test("broad comment scans are oldest-first, bounded, and resume from a watermark", () => {
-  const source = readText("src/repair/comment-router.ts");
-  const listRecent = source.slice(
-    source.indexOf("function listRecentComments"),
-    source.indexOf("function listCandidateComments"),
+// Run the publish step with an unchanged ledger, and return the publish call.
+function publishArgs(cwd: string, run: string, cursorChanged: boolean): string[] {
+  mkdirSync(path.join(cwd, "results"), { recursive: true });
+  writeFileSync(
+    path.join(cwd, "results", "comment-router-latest.json"),
+    JSON.stringify({ routing_cursor_changed: cursorChanged, ledger_claimed: 0, ledger_changed: 0 }),
   );
-  assert.match(listRecent, /issues\/comments\?since=/);
-  assert.match(listRecent, /sort=updated&direction=asc/);
-  assert.match(listRecent, /ghPagedLimit<LooseRecord>/);
-  assert.match(listRecent, /maxComments \+ sinceCommentIds\.size/);
-  assert.match(listRecent, /recentCommentCursorCandidate/);
-});
+  const script = run.replaceAll("${{ steps.target.outputs.target_slug }}", "openclaw-openclaw");
+  const output = execFileSync("bash", ["-eu", "-c", `pnpm() { printf '%s\\n' "$@"; }\n${script}`], {
+    cwd,
+    encoding: "utf8",
+    env: { PATH: process.env.PATH },
+  });
+  return output.includes("skipping state publication") ? [] : output.trim().split("\n");
+}
 
 function runNode(script: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, [script], {

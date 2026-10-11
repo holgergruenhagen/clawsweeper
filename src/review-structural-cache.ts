@@ -1,6 +1,7 @@
-import { recordOrEmpty as asRecord } from "./value-coerce.js";
+import { asRecord, stringOrUndefined } from "./value-coerce.js";
 import { sha256 } from "./content-hash.js";
-import { escapeRegExp } from "./clawsweeper-text.js";
+import { escapeRegExp } from "./clawsweeper-markdown.js";
+import { parseIsoMs } from "./iso-time.js";
 
 import { REVIEW_CACHE_MAX_AGE_DAYS } from "./scheduler-policy.js";
 import { compareCodeUnits, stableJsonCodeUnit as stableJson } from "./stable-json.js";
@@ -333,10 +334,6 @@ export function reviewStructuralQuery(kind: ReviewStructuralKind): string {
   `;
 }
 
-function stringOrUndefined(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
 function nonNegativeInteger(value: unknown): number | null {
   const number =
     typeof value === "number" ? value : typeof value === "string" ? Number(value) : Number.NaN;
@@ -394,17 +391,6 @@ function structuralActivities(
     return [{ id, updatedAt, author, authorAssociation, state, commitSha, bodyDigest }];
   });
   return { activities, truncated: connection.truncated || malformed };
-}
-
-export function reviewStructuralActivitiesForTest(
-  value: unknown,
-  ignoredAuthors: readonly string[] = [],
-): {
-  activities: ReviewStructuralActivity[];
-  truncated: boolean;
-} {
-  const ignored = new Set(ignoredAuthors.map((author) => author.toLowerCase()));
-  return structuralActivities(value, (author) => ignored.has(author.toLowerCase()));
 }
 
 function structuralLabels(
@@ -1096,8 +1082,8 @@ export function reviewStructuralRecordAtLeastAsFresh(
   record: ReviewStructuralRecord | null,
   observedUpdatedAt: string | undefined,
 ): record is ReviewStructuralRecord {
-  const recordUpdatedAtMs = timestampMs(record?.activityUpdatedAt);
-  const observedUpdatedAtMs = timestampMs(observedUpdatedAt);
+  const recordUpdatedAtMs = parseIsoMs(record?.activityUpdatedAt);
+  const observedUpdatedAtMs = parseIsoMs(observedUpdatedAt);
   return (
     validReviewStructuralRecord(record) &&
     recordUpdatedAtMs !== null &&
@@ -1110,8 +1096,8 @@ export function reviewStructuralRecordMatchesObservedUpdate(
   record: ReviewStructuralRecord | null,
   observedUpdatedAt: string | undefined,
 ): record is ReviewStructuralRecord {
-  const recordUpdatedAtMs = timestampMs(record?.activityUpdatedAt);
-  const observedUpdatedAtMs = timestampMs(observedUpdatedAt);
+  const recordUpdatedAtMs = parseIsoMs(record?.activityUpdatedAt);
+  const observedUpdatedAtMs = parseIsoMs(observedUpdatedAt);
   return (
     validReviewStructuralRecord(record) &&
     recordUpdatedAtMs !== null &&
@@ -1164,12 +1150,6 @@ function fingerprintMatches(expected: string, actual: string): boolean {
   return expected === actual;
 }
 
-function timestampMs(value: string | undefined): number | null {
-  if (!value) return null;
-  const parsed = Date.parse(value);
-  return Number.isFinite(parsed) ? parsed : null;
-}
-
 function activityCoveredByReview(
   prior: ReviewStructuralRecord,
   current: ReviewStructuralRecord,
@@ -1182,12 +1162,12 @@ function activityCoveredByReview(
   // target and pull heads before returning a cache hit, so a same-second target
   // mutation cannot be attributed to automation by this value alone.
   if (current.activityUpdatedAt === review.automationItemUpdatedAt) return true;
-  const priorActivity = timestampMs(prior.activityUpdatedAt);
-  const currentActivity = timestampMs(current.activityUpdatedAt);
+  const priorActivity = parseIsoMs(prior.activityUpdatedAt);
+  const currentActivity = parseIsoMs(current.activityUpdatedAt);
   const latestOwnedSync = Math.max(
-    timestampMs(review.reviewCommentSyncedAt) ?? -Infinity,
-    timestampMs(review.labelsSyncedAt) ?? -Infinity,
-    timestampMs(ownedReservationUpdatedAt) ?? -Infinity,
+    parseIsoMs(review.reviewCommentSyncedAt) ?? -Infinity,
+    parseIsoMs(review.labelsSyncedAt) ?? -Infinity,
+    parseIsoMs(ownedReservationUpdatedAt) ?? -Infinity,
   );
   return (
     priorActivity !== null &&
@@ -1219,7 +1199,7 @@ export function reviewStructuralCacheProbeDecision(
   if (review.reviewModel !== options.reviewModel) {
     return { hit: false, reason: "model_changed" };
   }
-  const lastFullReviewAt = timestampMs(review.lastFullReviewAt);
+  const lastFullReviewAt = parseIsoMs(review.lastFullReviewAt);
   const now = options.now ?? Date.now();
   if (
     lastFullReviewAt === null ||

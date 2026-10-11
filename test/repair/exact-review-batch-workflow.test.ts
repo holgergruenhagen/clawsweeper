@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import {
   cpSync,
   existsSync,
@@ -16,16 +16,19 @@ import { join } from "node:path";
 import test from "node:test";
 import YAML from "yaml";
 
-import { createGitHubExecution } from "../../dist/clawsweeper-github-execution.js";
-import { createGitHubRuntime } from "../../dist/clawsweeper-github-runtime.js";
+import { ghObservedMutationCommand, ghWithRetry } from "../../dist/clawsweeper-github-execution.js";
+import * as gitHubRuntime from "../../dist/clawsweeper-github-runtime.js";
+import { repositoryProfileFor, withTargetProfile } from "../../dist/repository-profiles.js";
+import { githubTest, installGhFixture } from "../github-runtime-fixture.ts";
 import { runCopyProof } from "../../scripts/e2e/exact-review-selected-tuple-copy.mjs";
+import { MAX_MEDIA_PROOF_TIMEOUT_MS } from "../../dist/media-proof-budget.js";
+
+const { gh, ghOnce, ghWithPreparedTimeout, withGitHubRun } = gitHubRuntime;
 
 const path = ".github/workflows/exact-review-batch-publish.yml";
 const source = readFileSync(path, "utf8");
-const cliSource = readFileSync("src/repair/exact-review-batch-cli.ts", "utf8");
-const prepareSource = readFileSync("scripts/prepare-exact-review-batch.mjs", "utf8");
-const publisherSource = readFileSync("src/repair/publish-event-result.ts", "utf8");
-const sweepSource = readFileSync(".github/workflows/sweep.yml", "utf8");
+const sweep = YAML.parse(readFileSync(".github/workflows/sweep.yml", "utf8"));
+const planner = YAML.parse(readFileSync(".github/workflows/review-plan.yml", "utf8"));
 const workflow = YAML.parse(source) as {
   on: {
     schedule?: unknown;
@@ -43,11 +46,35 @@ const workflow = YAML.parse(source) as {
   >;
 };
 
+// Runs the claimed-payload step as the workflow does: from the checkout root,
+// before the build, with the runner Node.
+function resolveEventPayload(decision: Record<string, unknown>, configuredTimeoutMs: number) {
+  const run = sweep.jobs["event-review-apply"].steps.find(
+    (step: { id?: string }) => step.id === "target",
+  ).run;
+  const root = mkdtempSync(join(tmpdir(), "resolve-event-payload-"));
+  try {
+    const output = join(root, "output");
+    execFileSync("bash", ["-c", run], {
+      env: {
+        PATH: process.env.PATH,
+        CLAIM_DECISION: JSON.stringify({
+          targetRepo: "openclaw/openclaw",
+          itemNumber: 71,
+          ...decision,
+        }),
+        CONFIGURED_CODEX_TIMEOUT_MS: String(configuredTimeoutMs),
+        GITHUB_OUTPUT: output,
+        GITHUB_REPOSITORY: "openclaw/clawsweeper",
+      },
+    });
+    return readFileSync(output, "utf8");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 test("manual review timeouts survive queue resolution within the existing exact-review cap", () => {
-  const steps = YAML.parse(sweepSource).jobs["event-review-apply"].steps;
-  const script = steps
-    .find((step: { id?: string }) => step.id === "target")
-    .run.match(/node <<'NODE'\n([\s\S]*?)\nNODE/)[1];
   for (const [sourceAction, codexTimeoutMs, configuredTimeoutMs, expected] of [
     ["manual_explicit_review", 300_000, 1_200_000, 300_000],
     ["manual_explicit_review", 2_400_000, 1_200_000, 2_400_000],
@@ -55,29 +82,32 @@ test("manual review timeouts survive queue resolution within the existing exact-
     ["opened", 2_400_000, 1_200_000, 1_800_000],
     ["opened", 2_400_000, 3_600_000, 2_700_000],
     ["opened", -1, -1, 1_200_000],
-  ]) {
-    let output = "";
-    runInNewContext(script, {
-      require: () => ({
-        appendFileSync: (_path: string, value: string) => {
-          output += value;
-        },
-      }),
-      process: {
-        env: {
-          CLAIM_DECISION: JSON.stringify({
-            targetRepo: "openclaw/openclaw",
-            itemNumber: 71,
-            sourceAction,
-            codexTimeoutMs,
-            publicationPolicy:
-              sourceAction === "manual_explicit_review" ? "record_comment_only" : undefined,
-          }),
-          CONFIGURED_CODEX_TIMEOUT_MS: String(configuredTimeoutMs),
-        },
+  ] as const) {
+    const output = resolveEventPayload(
+      {
+        sourceAction,
+        codexTimeoutMs,
+        publicationPolicy:
+          sourceAction === "manual_explicit_review" ? "record_comment_only" : undefined,
       },
-    });
+      configuredTimeoutMs,
+    );
     assert.match(output, new RegExp(`^codex_timeout_ms=${expected}$`, "m"));
+  }
+});
+
+test("claimed media allowance and review reserve come from the media proof budget", () => {
+  for (const [mediaProofTimeoutMs, expected] of [
+    [MAX_MEDIA_PROOF_TIMEOUT_MS * 10, MAX_MEDIA_PROOF_TIMEOUT_MS],
+    [1_000, 1_000],
+    [-1, 0],
+  ]) {
+    const output = resolveEventPayload({ mediaProofTimeoutMs }, 1_200_000);
+    assert.match(output, new RegExp(`^media_proof_timeout_ms=${expected}$`, "m"));
+    assert.match(
+      output,
+      new RegExp(`^media_preprocessing_reserve_seconds=${MAX_MEDIA_PROOF_TIMEOUT_MS / 1000}$`, "m"),
+    );
   }
 });
 
@@ -156,12 +186,13 @@ test("manual publication proof preserves isolated toolchain settings without inh
 });
 
 test("manual publication stays queue-owned and excludes router and implementation hooks", () => {
-  assert.match(sweepSource, /name: Admit explicit manual reviews/);
-  assert.match(sweepSource, /manual-review-enqueue\.js/);
-  assert.match(sweepSource, /if: \$\{\{ steps\.mode\.outputs\.manual_explicit == 'true' \}\}/);
-  assert.match(prepareSource, /EXACT_REVIEW_DECISION: JSON\.stringify\(producer\)/);
+  const admission = planner.jobs.plan.steps.find(
+    (step: { name?: string }) => step.name === "Admit explicit manual reviews",
+  );
+  assert.equal(admission.if, "${{ steps.mode.outputs.manual_explicit == 'true' }}");
+  assert.match(admission.run, /manual-review-enqueue\.js/);
   assert.match(source, /publication_policy.*record_comment_only.*failed_review_shard_recovery/);
-  assert.match(source, /AUTO_IMPLEMENT_ISSUES.*\n\s*\[ -z "\$publication_policy" \]/);
+  assert.doesNotMatch(source, /AUTO_IMPLEMENT_ISSUES/);
 });
 
 for (const targetBranch of ["release/proof", ""]) {
@@ -169,8 +200,7 @@ for (const targetBranch of ["release/proof", ""]) {
     `manual admission preserves branch selection ${targetBranch || "(default lookup)"}`,
     { skip: process.platform === "win32" },
     () => {
-      const sweep = YAML.parse(sweepSource);
-      const admission = sweep.jobs.plan.steps.find(
+      const admission = planner.jobs.plan.steps.find(
         (step: { name?: string }) => step.name === "Admit explicit manual reviews",
       );
       const root = mkdtempSync(join(tmpdir(), "manual-admission-branch-"));
@@ -223,7 +253,7 @@ ${admission.run}`,
 
 test("terminal batch lifecycle payload carries a stable run-attempt-fence operation id", () => {
   const builder = source.match(
-    /export LIFECYCLE_TERMINAL="\$lifecycle_terminal"\s+lifecycle_payload="\$\(node -e '([\s\S]*?)'\)"/,
+    /export LIFECYCLE_TERMINAL="\$lifecycle_terminal"\s+lifecycle_payload="\$\(node ([^)]*)\)"/,
   )?.[1];
   assert.ok(builder);
   const env = {
@@ -236,7 +266,7 @@ test("terminal batch lifecycle payload carries a stable run-attempt-fence operat
     GITHUB_RUN_ATTEMPT: "2",
   };
   const run = (overrides = {}) => {
-    const result = spawnSync(process.execPath, ["-e", builder], {
+    const result = spawnSync(process.execPath, builder.split(" "), {
       env: { ...env, ...overrides },
       encoding: "utf8",
     });
@@ -269,79 +299,73 @@ test("batch publisher is event-driven and queue-bounded instead of workflow-seri
   assert.deepEqual(workflow.permissions, { actions: "write", contents: "read" });
 });
 
-test("batch publication bounds shared GitHub retries without dropping failed artifacts", () => {
-  assert.match(
-    prepareSource,
-    /publish-event-result\.js"\)\],[\s\S]*?\.\.\.process\.env,\s*CLAWSWEEPER_GH_RETRY_ATTEMPTS: "2"/,
-  );
-  assert.match(
-    prepareSource,
-    /if \(result\.code !== 0 && !existsSync\(outcomePath\)\) \{\s*writeFailure\(outcomePath, "retryable_failure", "unknown_failure"\)/,
-  );
-  assert.match(cliSource, /const failure = failureCompletion\(current, outcome\)/);
-  assert.match(cliSource, /completions\.push\(failure\)/);
-});
-
-test("transient retries stay bounded while GitHub throttles defer immediately", () => {
+githubTest("transient retries stay bounded while GitHub throttles defer immediately", async (t) => {
   const previous = process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
-  try {
-    delete process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
-    const defaultExecution = githubRetryExecution(2);
-    assert.equal(defaultExecution.execution.ghWithRetry(["api", "repos/test/item"]), "ok");
-    assert.equal(defaultExecution.calls(), 3);
-
-    process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS = "2";
-    const boundedExecution = githubRetryExecution(3);
-    assert.throws(
-      () => boundedExecution.execution.ghWithRetry(["api", "repos/test/item"]),
-      /HTTP 502/,
-    );
-    assert.equal(boundedExecution.calls(), 2);
-    assert.deepEqual(boundedExecution.waits, [2_000]);
-
-    for (const kind of ["throttle-403", "throttle-429"] as const) {
-      const throttledExecution = githubRetryExecution(3, kind);
-      assert.throws(
-        () => throttledExecution.execution.ghWithRetry(["api", "repos/test/item"]),
-        /API rate limit exceeded|HTTP 429/,
-      );
-      assert.equal(throttledExecution.calls(), 1);
-      assert.deepEqual(throttledExecution.waits, []);
-
-      const mutationExecution = githubRetryExecution(3, kind);
-      assert.throws(
-        () =>
-          mutationExecution.execution.ghObservedMutationCommand({
-            args: ["api", "repos/test/item"],
-            identity: "batch-publication",
-          }),
-        /API rate limit exceeded|HTTP 429/,
-      );
-      assert.equal(mutationExecution.calls(), 1);
-      assert.deepEqual(mutationExecution.waits, []);
-    }
-
-    const explicitExecution = githubRetryExecution(2);
-    assert.equal(explicitExecution.execution.ghWithRetry(["api", "repos/test/item"], 3), "ok");
-    assert.equal(explicitExecution.calls(), 3);
-  } finally {
+  t.after(() => {
     if (previous === undefined) delete process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
     else process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS = previous;
+  });
+  for (const scenario of ["default", "bounded", "throttle-403", "throttle-429", "explicit"]) {
+    await t.test(scenario, (t) =>
+      withGitHubRun(() => {
+        if (scenario === "default") delete process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS;
+        else process.env.CLAWSWEEPER_GH_RETRY_ATTEMPTS = "2";
+        const failures = scenario === "bounded" ? 3 : 2;
+        const fixture = installGhFixture(
+          t,
+          `
+state.calls = (state.calls || 0) + 1;
+if (state.calls <= ${failures}) {
+  console.error(${JSON.stringify(
+    scenario === "throttle-403"
+      ? "API rate limit exceeded for installation ID 122230863 (HTTP 403)"
+      : scenario === "throttle-429"
+        ? "HTTP 429: Too Many Requests"
+        : "HTTP 502: transient upstream failure",
+  )});
+  process.exitCode = 1;
+} else process.stdout.write("ok");
+`,
+        );
+        const waits: number[] = [];
+        const run = () =>
+          ghWithRetry(["api", "repos/test/item"], scenario === "explicit" ? 3 : undefined, {
+            sleepBeforeRetry: (ms) => waits.push(ms),
+          });
+        if (scenario.startsWith("throttle")) {
+          assert.throws(run, /API rate limit exceeded|HTTP 429/);
+          assert.equal(fixture.requests().length, 1);
+          assert.deepEqual(waits, []);
+          assert.throws(
+            () =>
+              ghObservedMutationCommand({
+                args: ["api", "repos/test/item"],
+                identity: "batch-publication",
+              }),
+            /API rate limit exceeded|HTTP 429/,
+          );
+          assert.equal(fixture.requests().length, 2);
+          assert.deepEqual(waits, []);
+        } else if (scenario === "bounded") {
+          assert.throws(run, /HTTP 502/);
+          assert.equal(fixture.requests().length, 2);
+          assert.deepEqual(waits, [2_000]);
+        } else {
+          assert.equal(run(), "ok");
+          assert.equal(fixture.requests().length, 3);
+          assert.deepEqual(waits, [2_000, 4_000]);
+        }
+      }),
+    );
   }
 });
 
-test("sweep runtime routes only public target REST reads onto the public token", () => {
+githubTest("sweep runtime routes only public target REST reads onto the public token", (t) => {
   const fixtureEnv = {
     EXACT_EVENT_PUBLICATION: "true",
     GH_TOKEN: "target-app-token",
     REPO_TOKEN: "workflow-repository-token",
     CLAWSWEEPER_PUBLIC_GH_TOKEN: "public-read-token",
-    GH_BIN: process.execPath,
-    GH_BIN_ARGS: JSON.stringify([
-      "--eval",
-      "process.stdout.write(JSON.stringify({ token: process.env.GH_TOKEN, args: process.argv.slice(1) }))",
-      "--",
-    ]),
   };
   const previous = Object.fromEntries(
     [...Object.keys(fixtureEnv), "GH_HOST"].map((key) => [key, process.env[key]]),
@@ -349,35 +373,15 @@ test("sweep runtime routes only public target REST reads onto the public token",
   Object.assign(process.env, fixtureEnv);
   delete process.env.GH_HOST;
 
-  let currentTarget = "openclaw/openclaw";
-  const requests: Array<{ args: string[]; token: string | undefined; timeoutMs?: number }> = [];
-  const run = (
-    _command: string,
-    args: string[],
-    options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
-  ) => {
-    const request = {
-      args,
-      token: options?.env?.GH_TOKEN ?? process.env.GH_TOKEN,
-      ...(options?.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
-    };
-    requests.push(request);
-    return JSON.stringify(request);
-  };
-  const runtime = createGitHubRuntime({
-    ROOT: process.cwd(),
-    run,
-    targetRepo: () => currentTarget,
-  });
+  const fixture = installGhFixture(t, `process.stdout.write(JSON.stringify({ token, args }));`);
   const observed = (
     args: string[],
     timeoutMs: number | undefined = 5_000,
     env: NodeJS.ProcessEnv = {},
   ) =>
-    JSON.parse(runtime.ghWithPreparedTimeout(args, timeoutMs, env)) as {
+    JSON.parse(ghWithPreparedTimeout(args, timeoutMs, env)) as {
       token: string;
       args: string[];
-      timeoutMs?: number;
     };
 
   try {
@@ -392,9 +396,9 @@ test("sweep runtime routes only public target REST reads onto the public token",
     }
 
     const publicArgs = ["api", "repos/openclaw/openclaw/issues/comments/123"];
-    assert.equal(observed(publicArgs, 1234).timeoutMs, 1234);
-    assert.equal(JSON.parse(runtime.gh(publicArgs)).token, "public-read-token");
-    assert.equal(JSON.parse(runtime.ghOnce(publicArgs, 10_000)).token, "public-read-token");
+    assert.deepEqual(observed(publicArgs, 1234).args, publicArgs);
+    assert.equal(JSON.parse(gh(publicArgs)).token, "public-read-token");
+    assert.equal(JSON.parse(ghOnce(publicArgs, 10_000)).token, "public-read-token");
 
     const privateRequests = [
       ["api", "user"],
@@ -414,7 +418,7 @@ test("sweep runtime routes only public target REST reads onto the public token",
     for (const args of privateRequests) {
       assert.equal(observed(args).token, "target-app-token", args.join(" "));
     }
-    assert.equal(JSON.parse(runtime.ghOnce(privateRequests[6]!, 10_000)).token, "target-app-token");
+    assert.equal(JSON.parse(ghOnce(privateRequests[6]!, 10_000)).token, "target-app-token");
     assert.equal(
       observed(publicArgs, 5_000, { GH_TOKEN: "explicit-token" }).token,
       "explicit-token",
@@ -424,19 +428,9 @@ test("sweep runtime routes only public target REST reads onto the public token",
       "target-app-token",
     );
 
-    const execution = createGitHubExecution({
-      ROOT: process.cwd(),
-      run,
-      gitHubRuntime: runtime,
-      sweepStatus: {
-        sweepStatusRelativePath: () => "status.json",
-        writeSweepStatus: () => undefined,
-      },
-      labelAlreadyExistsError: () => false,
-    } as unknown as Parameters<typeof createGitHubExecution>[0]);
     assert.equal(
       JSON.parse(
-        execution.ghObservedMutationCommand({
+        ghObservedMutationCommand({
           args: ["api", "repos/openclaw/openclaw/issues/123", "--method", "PATCH"],
           identity: "exact-publication-target-mutation",
         }),
@@ -455,9 +449,9 @@ test("sweep runtime routes only public target REST reads onto the public token",
 
     process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN = "public-read-token";
 
-    currentTarget = "openclaw/private";
-    assert.equal(observed(publicArgs).token, "public-read-token");
-    currentTarget = "openclaw/openclaw";
+    withTargetProfile(repositoryProfileFor("openclaw/private"), () => {
+      assert.equal(observed(publicArgs).token, "public-read-token");
+    });
 
     process.env.GH_HOST = "enterprise.example.invalid";
     assert.equal(observed(publicArgs).token, "target-app-token");
@@ -466,7 +460,7 @@ test("sweep runtime routes only public target REST reads onto the public token",
     delete process.env.CLAWSWEEPER_PUBLIC_GH_TOKEN;
     delete process.env.REPO_TOKEN;
     assert.equal(observed(publicArgs).token, "target-app-token");
-    assert.ok(requests.length > privateRequests.length);
+    assert.ok(fixture.requests().length > privateRequests.length);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
@@ -475,7 +469,7 @@ test("sweep runtime routes only public target REST reads onto the public token",
   }
 });
 
-test("sweep public read throttles fall back once to the ambient App token", () => {
+githubTest("sweep public read throttles fall back once to the ambient App token", (t) => {
   const fixtureEnv = {
     GH_TOKEN: "sweep-fallback-app-token",
     CLAWSWEEPER_PUBLIC_GH_TOKEN: "sweep-fallback-public-token",
@@ -485,41 +479,32 @@ test("sweep public read throttles fall back once to the ambient App token", () =
   );
   Object.assign(process.env, fixtureEnv);
 
-  const observedTokens: string[] = [];
-  const run = (
-    _command: string,
-    _args: string[],
-    options?: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number },
-  ) => {
-    const token = options?.env?.GH_TOKEN ?? process.env.GH_TOKEN ?? "";
-    observedTokens.push(token);
-    if (token === fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN) {
-      throw new Error("gh: API rate limit exceeded for installation (HTTP 403)");
-    }
-    return JSON.stringify({ token });
-  };
-  const runtime = createGitHubRuntime({
-    ROOT: process.cwd(),
-    run,
-    targetRepo: () => "openclaw/openclaw",
-  });
-  const execution = createGitHubExecution({
-    ROOT: process.cwd(),
-    gitHubRuntime: runtime,
-    labelAlreadyExistsError: () => false,
-  });
-
+  const fixture = installGhFixture(
+    t,
+    `
+if (token === ${JSON.stringify(fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN)}) {
+  console.error("gh: API rate limit exceeded for installation (HTTP 403)");
+  process.exitCode = 1;
+} else process.stdout.write(JSON.stringify({ token }));
+`,
+  );
   try {
     const args = ["api", "repos/openclaw/openclaw/issues/123"];
-    assert.equal(JSON.parse(execution.ghWithRetry(args)).token, fixtureEnv.GH_TOKEN);
-    assert.deepEqual(observedTokens, [fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN, fixtureEnv.GH_TOKEN]);
+    assert.equal(JSON.parse(ghWithRetry(args)).token, fixtureEnv.GH_TOKEN);
+    assert.deepEqual(
+      fixture.requests().map(({ token }) => token),
+      [fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN, fixtureEnv.GH_TOKEN],
+    );
 
-    assert.throws(() => execution.ghWithRetry(args), { name: "GitHubRateLimitError" });
-    assert.deepEqual(observedTokens, [
-      fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN,
-      fixtureEnv.GH_TOKEN,
-      fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN,
-    ]);
+    assert.throws(() => ghWithRetry(args), { name: "GitHubRateLimitError" });
+    assert.deepEqual(
+      fixture.requests().map(({ token }) => token),
+      [
+        fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN,
+        fixtureEnv.GH_TOKEN,
+        fixtureEnv.CLAWSWEEPER_PUBLIC_GH_TOKEN,
+      ],
+    );
   } finally {
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
@@ -528,7 +513,7 @@ test("sweep public read throttles fall back once to the ambient App token", () =
   }
 });
 
-test("exact publication records the Actions reset before one bounded App fallback", () => {
+githubTest("exact publication records the Actions reset before one bounded App fallback", (t) => {
   const observationPath = join(
     tmpdir(),
     `clawsweeper-rate-limit-${process.pid}-${Date.now()}.jsonl`,
@@ -543,34 +528,23 @@ test("exact publication records the Actions reset before one bounded App fallbac
     Object.keys(fixtureEnv).map((key) => [key, process.env[key]]),
   );
   Object.assign(process.env, fixtureEnv);
-  const observed: Array<{ token: string; args: string[] }> = [];
   const reset = Math.floor(Date.now() / 1_000) + 600;
-  const run = (_command: string, args: string[], options?: { env?: NodeJS.ProcessEnv }) => {
-    const token = options?.env?.GH_TOKEN ?? process.env.GH_TOKEN ?? "";
-    observed.push({ token, args });
-    if (args[0] === "api" && args[1] === "rate_limit") {
-      return JSON.stringify({ remaining: 0, reset });
-    }
-    if (token === fixtureEnv.REPO_TOKEN) {
-      throw new Error("gh: API rate limit exceeded for repository token (HTTP 403)");
-    }
-    return JSON.stringify({ token });
-  };
-  const runtime = createGitHubRuntime({
-    ROOT: process.cwd(),
-    run,
-    targetRepo: () => "openclaw/openclaw",
-  });
-  const execution = createGitHubExecution({
-    ROOT: process.cwd(),
-    gitHubRuntime: runtime,
-    labelAlreadyExistsError: () => false,
-  });
+  const fixture = installGhFixture(
+    t,
+    `
+if (args[0] === "api" && args[1] === "rate_limit") {
+  process.stdout.write(JSON.stringify({ remaining: 0, reset: ${reset} }));
+} else if (token === ${JSON.stringify(fixtureEnv.REPO_TOKEN)}) {
+  console.error("gh: API rate limit exceeded for repository token (HTTP 403)");
+  process.exitCode = 1;
+} else process.stdout.write(JSON.stringify({ token }));
+`,
+  );
   try {
-    const result = JSON.parse(execution.ghWithRetry(["api", "repos/openclaw/openclaw/issues/123"]));
+    const result = JSON.parse(ghWithRetry(["api", "repos/openclaw/openclaw/issues/123"]));
     assert.equal(result.token, fixtureEnv.GH_TOKEN);
     assert.deepEqual(
-      observed.map(({ token }) => token),
+      fixture.requests().map(({ token }) => token),
       [fixtureEnv.REPO_TOKEN, fixtureEnv.REPO_TOKEN, fixtureEnv.GH_TOKEN],
     );
     const observations = readFileSync(observationPath, "utf8")
@@ -599,7 +573,7 @@ test("exact publication records the Actions reset before one bounded App fallbac
   }
 });
 
-test("inherited GitHub Actions credentials open the repository quota circuit", () => {
+githubTest("inherited GitHub Actions credentials open the repository quota circuit", (t) => {
   const observationPath = join(
     tmpdir(),
     `clawsweeper-inherited-actions-rate-limit-${process.pid}-${Date.now()}.jsonl`,
@@ -614,37 +588,26 @@ test("inherited GitHub Actions credentials open the repository quota circuit", (
   );
   Object.assign(process.env, fixtureEnv);
   for (const key of clearedKeys) delete process.env[key];
-  const observedTokens: string[] = [];
   const reset = Math.floor(Date.now() / 1_000) + 300;
-  const run = (_command: string, args: string[], options?: { env?: NodeJS.ProcessEnv }) => {
-    const token =
-      options?.env?.GH_TOKEN ??
-      options?.env?.GITHUB_TOKEN ??
-      process.env.GH_TOKEN ??
-      process.env.GITHUB_TOKEN ??
-      "";
-    observedTokens.push(token);
-    if (args[0] === "api" && args[1] === "rate_limit") {
-      return JSON.stringify({ remaining: 0, reset });
-    }
-    throw new Error("gh: API rate limit exceeded for GITHUB_TOKEN (HTTP 403)");
-  };
-  const runtime = createGitHubRuntime({
-    ROOT: process.cwd(),
-    run,
-    targetRepo: () => "openclaw/openclaw",
-  });
-  const execution = createGitHubExecution({
-    ROOT: process.cwd(),
-    gitHubRuntime: runtime,
-    labelAlreadyExistsError: () => false,
-  });
+  const fixture = installGhFixture(
+    t,
+    `
+if (args[0] === "api" && args[1] === "rate_limit") {
+  process.stdout.write(JSON.stringify({ remaining: 0, reset: ${reset} }));
+} else {
+  console.error("gh: API rate limit exceeded for GITHUB_TOKEN (HTTP 403)");
+  process.exitCode = 1;
+}
+`,
+  );
   try {
-    assert.throws(
-      () => execution.ghWithRetry(["api", "repos/openclaw/openclaw/issues/123/comments"]),
-      { name: "GitHubRateLimitError" },
+    assert.throws(() => ghWithRetry(["api", "repos/openclaw/openclaw/issues/123/comments"]), {
+      name: "GitHubRateLimitError",
+    });
+    assert.deepEqual(
+      fixture.requests().map(({ token }) => token),
+      [fixtureEnv.GITHUB_TOKEN, fixtureEnv.GITHUB_TOKEN],
     );
-    assert.deepEqual(observedTokens, [fixtureEnv.GITHUB_TOKEN, fixtureEnv.GITHUB_TOKEN]);
     const observations = readFileSync(observationPath, "utf8")
       .trim()
       .split(/\r?\n/)
@@ -686,86 +649,26 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   assert.match(source, /while sleep 60/);
   assert.match(source, /test ! -f "\$heartbeat_failed"/);
   assert.match(source, /node scripts\/prepare-exact-review-batch\.mjs/);
-  assert.match(prepareSource, /"retryable_failure", "artifact_unavailable"/);
-  assert.match(prepareSource, /"permanent_failure", "tuple_protocol_invalid"/);
-  assert.match(prepareSource, /EXACT_REVIEW_BATCH_MUTATION_OUTPUT/);
-  assert.match(
-    publisherSource,
-    /if \(options\.batchMutationOutput\)[\s\S]*?writeBatchMutationResult\(options\.batchMutationOutput, \{[\s\S]*?kind: completionKind,[\s\S]*?reasonCode,/,
-  );
-  assert.match(
-    publisherSource,
-    /canonicalTargetKey: `\$\{options\.targetRepo\}#\$\{options\.itemNumber\}`,\s*fenceKey: itemKey/,
-  );
-  // Keep the fixture from looking like an embedded credential while still
-  // proving that artifact downloads use the owner-scoped repository token.
-  const ghToken = ["GH", "TOKEN"].join("_");
-  assert.match(prepareSource, new RegExp(`${ghToken}: repositoryToken`));
-  assert.match(prepareSource, /activeCircuit[\s\S]*?attempted: false/);
-  assert.match(
-    prepareSource,
-    /githubThrottleText\(result\.stderr\)[\s\S]*?resolveRateLimitObservation/,
-  );
-  assert.match(prepareSource, /was submitted too quickly/);
-  assert.match(source, /gh workflow run repair-comment-router\.yml/);
   assert.match(source, /EXACT_REVIEW_GITHUB_REQUEST_REPEAT="\$repeat_revision"/);
-  assert.match(
+  assert.doesNotMatch(
     source,
-    /EXACT_REVIEW_GITHUB_REQUEST_OUTCOME=success[\s\S]*?repair:exact-review-batch request-metric/,
+    /AUTO_IMPLEMENT|dispatch-issue-implementation|remaining_implementations/,
   );
-  assert.match(source, /was submitted too quickly[\s\S]*?repair:exact-review-batch rate-limit/);
-  assert.match(
-    source,
-    /EXACT_REVIEW_GITHUB_REQUEST_OUTCOME=error[\s\S]*?repair:exact-review-batch request-metric/,
-  );
-  assert.match(
-    source,
-    /AUTO_IMPLEMENT_ISSUES: \$\{\{ vars\.CLAWSWEEPER_AUTO_IMPLEMENT_ISSUES \}\}/,
-  );
-  assert.match(source, /node scripts\/dispatch-issue-implementation-candidates\.mjs/);
-  assert.match(
-    source,
-    /MAX_DISPATCH: \$\{\{ vars\.CLAWSWEEPER_AUTO_IMPLEMENT_MAX_DISPATCH_PER_SWEEP \|\| '' \}\}/,
-  );
-  assert.match(source, /remaining_implementations="\$MAX_DISPATCH"/);
-  assert.match(source, /\[ "\$remaining_implementations" -gt 0 \]/);
-  assert.match(source, /--max-dispatch "\$remaining_implementations"/);
-  assert.match(
-    source,
-    /remaining_implementations=\$\(\(remaining_implementations - dispatched\)\)/,
-  );
-  assert.match(
-    source,
-    /if implementation_output="\$\(node scripts\/dispatch-issue-implementation-candidates\.mjs/,
-  );
-  assert.match(
-    source,
-    /Automatic issue implementation dispatch failed; scheduled backfill will retry/,
-  );
-  assert.match(source, /--item-number "\$item_number"/);
-  assert.match(prepareSource, /outcomePath\.replace\(\/\\\.json\$\/, "\.report\.md"\)/);
   assert.match(source, /post-effect --route router-receipt --payload/);
   assert.match(source, /post-effect --route terminal-disposition --payload/);
   assert.doesNotMatch(
     source,
     /curl --fail|lifecycle_signature|x-clawsweeper-exact-review-signature/,
   );
-  assert.match(source, /router-batch-not-required/);
-  assert.match(source, /router-batch/);
-  assert.match(source, /router-batch-proof/);
+  assert.match(source, /exact-review-queue-request\.ts batch-lifecycle router/);
   assert.match(source, /lifecycle_terminal="requeue"/);
   assert.match(source, /lifecycle_terminal="target_closed"/);
   assert.match(source, /lifecycle_terminal="target_missing"/);
   assert.match(source, /lifecycle_terminal="superseded"/);
   assert.doesNotMatch(source, /lifecycle_terminal="failure"/);
   const lifecycleHandoff = source.indexOf("post-effect --route terminal-disposition");
-  const implementationDispatch = source.indexOf("dispatch-issue-implementation-candidates.mjs");
   const postEffectsComplete = source.indexOf(".postEffectsComplete = true");
-  assert.ok(
-    lifecycleHandoff >= 0 &&
-      lifecycleHandoff < implementationDispatch &&
-      implementationDispatch < postEffectsComplete,
-  );
+  assert.ok(lifecycleHandoff >= 0 && lifecycleHandoff < postEffectsComplete);
   assert.doesNotMatch(source, /TARGET_GH_TOKEN/);
   assert.doesNotMatch(source, /lifecycle\/command-ack\/attempt/);
   assert.doesNotMatch(source, /repair:update-command-status/);
@@ -779,18 +682,12 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   assert.match(source, /durable handoff completes this review lifecycle/);
   assert.match(source, /jq '\.postEffectsRequired = true'/);
   assert.match(source, /jq '\.postEffectsComplete = true'/);
-  assert.match(cliSource, /outcome\.postEffectsRequired === true/);
   assert.match(source, /Capture runner start timestamp/);
   assert.match(source, /EXACT_REVIEW_BATCH_DISPATCH_ID/);
   assert.match(source, /Record batch preparation start/);
   assert.match(source, /Record batch preparation finish/);
   assert.match(source, /EXACT_REVIEW_BATCH_OBSERVATION=final_github_apply/);
-  assert.match(source, /EXACT_REVIEW_BATCH_OBSERVATION=github_throttle/);
-  assert.match(source, /rate limit\|abuse detection\|was submitted too quickly\|HTTP 429/);
-  assert.match(cliSource, /"observe"/);
-  assert.match(cliSource, /optionalDispatchTelemetry/);
-  assert.match(cliSource, /optionalRunnerTelemetry/);
-  assert.match(cliSource, /if \(!startedAt\) return undefined;/);
+  assert.match(source, /COMMENT_ROUTER_RECOVERY_REPO/);
 
   const healthyMembers = workflow.jobs.publish!.steps.find(
     (step) => step.name === "Finalize healthy members under a fenced heartbeat",
@@ -801,15 +698,6 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
     /permanent publisher result remains retryable until the durable/,
   );
   assert.match(healthyMembers.run ?? "", /\[ "\$outcome_kind" = "permanent_failure" \].*continue/s);
-  const implementationBlock = (healthyMembers.run ?? "").slice(
-    (healthyMembers.run ?? "").indexOf("# The optional implementation lane"),
-    (healthyMembers.run ?? "").indexOf('report_path="${outcome_path%.json}.report.md"'),
-  );
-  assert.match(
-    implementationBlock,
-    /\{ \[ "\$receipt_outcome" = "accepted" \] \|\| \[ "\$receipt_outcome" = "deduped" \]; \} &&/,
-  );
-  assert.doesNotMatch(implementationBlock, /superseded|permanent/);
   assert.equal(
     workflow.jobs.publish!.steps.some(
       (step) => step.name === "Acknowledge terminal batch command lifecycle status",
@@ -818,49 +706,80 @@ test("batch workflow signs queue ownership, isolates item failures, and commits 
   );
 });
 
-test("legacy batch proof reviews use the normal verdict router; failure recovery remains review-only", () => {
-  const run =
+test("publication dispatches a router only outside scheduled recovery coverage", () => {
+  const direct =
+    Object.values(sweep.jobs)
+      .flatMap((job) => job.steps ?? [])
+      .find((step) => step.name === "Finalize direct exact review lifecycle")?.run ?? "";
+  const batch =
     workflow.jobs.publish!.steps.find(
       (step) => step.name === "Finalize healthy members under a fenced heartbeat",
     )?.run ?? "";
-  const start = run.indexOf('if [ "$receipt_outcome" = "superseded" ]; then');
-  const end = run.indexOf(
-    'if [ -n "$lifecycle_router_outcome" ] || [ -n "$lifecycle_terminal" ]; then',
-    start,
-  );
-  assert.ok(start >= 0 && end > start);
-  const branch = run.slice(start, end);
-  for (const action of [
-    "command_proof_result",
-    "failed_review_shard_recovery",
-    "legacy_dispatch",
+  for (const [mode, run, startText, endText] of [
+    [
+      "direct",
+      direct,
+      'if [ "${DIRECT_PUBLICATION_SUPERSEDED:-false}" != "true" ]; then',
+      'if [ -n "$lifecycle_router_outcome" ]; then',
+    ],
+    [
+      "batch",
+      batch,
+      'if [ "$receipt_outcome" = "superseded" ]; then',
+      'if [ -n "$lifecycle_router_outcome" ] || [ -n "$lifecycle_terminal" ]; then',
+    ],
   ]) {
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        [
-          'source_action="$SOURCE_ACTION_CASE"',
-          "receipt_outcome=accepted; outcome_kind=eligible; outcome_path=fixture.json",
-          "lifecycle_router_outcome=; lifecycle_terminal=",
-          'jq() { [ "$1" = "-e" ] && [ "$2" = ".disposition.routableSyncExpected == true" ]; }',
-          'gh() { printf "router_called\\n"; }',
-          "pnpm() { :; }",
-          "for once in only; do",
-          branch,
-          "done",
-          'printf "outcome=%s\\n" "$lifecycle_router_outcome"',
-        ].join("\n"),
-      ],
-      { encoding: "utf8", env: { ...process.env, SOURCE_ACTION_CASE: action } },
-    );
-    assert.equal(result.status, 0, result.stderr);
-    if (action !== "failed_review_shard_recovery") {
-      assert.match(result.stdout, /router_called/);
-      assert.match(result.stdout, /outcome=durable/);
-    } else {
-      assert.doesNotMatch(result.stdout, /router_called/);
-      assert.match(result.stdout, /outcome=not_required/);
+    const start = run.indexOf(startText);
+    const end = run.indexOf(endText, start);
+    assert.ok(start >= 0 && end > start);
+    for (const execute of ["", "0", "1"]) {
+      for (const target of ["openclaw/openclaw", "openclaw/clawhub"]) {
+        for (const action of [
+          "legacy_dispatch",
+          "command_proof_result",
+          "failed_review_shard_recovery",
+        ]) {
+          const result = spawnSync(
+            "bash",
+            [
+              "-c",
+              [
+                "source_action=$SOURCE_ACTION_CASE",
+                "target_repo=$TARGET_REPO",
+                "receipt_outcome=accepted; outcome_kind=eligible; outcome_path=fixture.json",
+                "DIRECT_PUBLICATION_SUPERSEDED=false; DIRECT_OUTCOME=fixture.json",
+                "lifecycle_router_outcome=; lifecycle_terminal=",
+                'jq() { [ "$1" = "-e" ] && [ "$2" = ".disposition.routableSyncExpected == true" ]; }',
+                'gh() { printf "router_called\\n"; }',
+                "pnpm() { :; }",
+                "for once in only; do",
+                run.slice(start, end),
+                "done",
+                'printf "outcome=%s\\n" "$lifecycle_router_outcome"',
+              ].join("\n"),
+            ],
+            {
+              encoding: "utf8",
+              env: {
+                ...process.env,
+                TARGET_REPO: target,
+                COMMENT_ROUTER_RECOVERY_REPO: "openclaw/openclaw",
+                COMMENT_ROUTER_RECOVERY_EXECUTE: execute,
+                SOURCE_ACTION_CASE: action,
+              },
+            },
+          );
+          assert.equal(result.status, 0, result.stderr);
+          const dispatch =
+            (execute !== "1" || target !== "openclaw/openclaw") &&
+            action !== "failed_review_shard_recovery";
+          assert.equal(
+            result.stdout,
+            dispatch ? "router_called\noutcome=durable\n" : "outcome=not_required\n",
+            `${mode}: ${target}: ${action}: execute=${execute}`,
+          );
+        }
+      }
     }
   }
 });
@@ -879,79 +798,7 @@ test("batch publisher gives canonical supersession precedence over artifact term
   assert.ok(supersededTerminal > supersededReceipt && supersededTerminal < staleArtifactPlan);
 });
 
-test("direct proof reviews use the normal verdict router; failure recovery remains review-only", () => {
-  const sweep = YAML.parse(sweepSource) as typeof workflow;
-  const run =
-    Object.values(sweep.jobs)
-      .flatMap((job) => job.steps ?? [])
-      .find((step) => step.name === "Finalize direct exact review lifecycle")?.run ?? "";
-  const start = run.indexOf('if [ "${DIRECT_PUBLICATION_SUPERSEDED:-false}" != "true" ]; then');
-  const end = run.indexOf('if [ -n "$lifecycle_router_outcome" ]; then', start);
-  assert.ok(start >= 0 && end > start);
-  const branch = run.slice(start, end);
-  for (const action of [
-    "command_proof_result",
-    "failed_review_shard_recovery",
-    "legacy_dispatch",
-  ]) {
-    const result = spawnSync(
-      "bash",
-      [
-        "-c",
-        [
-          'source_action="$SOURCE_ACTION_CASE"',
-          "DIRECT_PUBLICATION_SUPERSEDED=false; DIRECT_OUTCOME=fixture.json",
-          "lifecycle_router_outcome=; lifecycle_terminal=",
-          'jq() { [ "$1" = "-e" ] && [ "$2" = ".disposition.routableSyncExpected == true" ]; }',
-          'gh() { printf "router_called\n"; }',
-          branch,
-          'printf "outcome=%s\nterminal=%s\n" "$lifecycle_router_outcome" "$lifecycle_terminal"',
-        ].join("\n"),
-      ],
-      {
-        encoding: "utf8",
-        env: { ...process.env, SOURCE_ACTION_CASE: action },
-      },
-    );
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(
-      result.stdout,
-      action !== "failed_review_shard_recovery"
-        ? "router_called\noutcome=durable\nterminal=\n"
-        : "outcome=not_required\nterminal=\n",
-      action,
-    );
-  }
-});
-
-test("exact-review producer uses direct publication with bounded legacy fallback", () => {
-  assert.match(sweepSource, /name: Deliver GitHub effects and prepare direct state mutation/);
-  assert.match(sweepSource, /records-item-number: \$\{\{ steps\.target\.outputs\.item_number \}\}/);
-  assert.match(
-    sweepSource,
-    /EXACT_REVIEW_BATCH_MUTATION_OUTPUT: \.artifacts\/direct-publication-outcome\.json/,
-  );
-  assert.match(sweepSource, /repair:exact-review-direct-publication/);
-  assert.match(
-    sweepSource,
-    /EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED: \$\{\{ vars\.EXACT_REVIEW_DIRECT_PUBLICATION_ENABLED \|\| '1' \}\}/,
-  );
-  assert.match(
-    sweepSource,
-    /name: Upload exact review artifact bundle[\s\S]*?steps\.direct-exact-review-publication\.outputs\.accepted != 'true'/,
-  );
-  assert.match(
-    sweepSource,
-    /name: Queue durable exact review publication[\s\S]*?steps\.upload-exact-review-bundle\.outcome == 'success'/,
-  );
-  assert.match(sweepSource, /internal\/exact-review\/enqueue/);
-  assert.match(source, /name: Claim one durable publication batch/);
-});
-
 test("direct publication reads the existing selected bundle instead of producer diagnostics", () => {
-  const sweep = YAML.parse(sweepSource) as {
-    jobs: Record<string, { steps?: Array<{ name?: string; env?: Record<string, string> }> }>;
-  };
   const configured = Object.values(sweep.jobs)
     .flatMap((job) => job.steps ?? [])
     .filter((step) => step.env?.EXACT_REVIEW_PUBLICATION_ARTIFACT_DIR !== undefined);
@@ -963,10 +810,6 @@ test("direct publication reads the existing selected bundle instead of producer 
     direct.env?.EXACT_REVIEW_PUBLICATION_ARTIFACT_DIR,
     ".artifacts/exact-review-bundle/review",
   );
-  assert.match(
-    publisherSource,
-    /artifactDir: resolve\(\s*workRoot,\s*process\.env\.EXACT_REVIEW_PUBLICATION_ARTIFACT_DIR \|\| "artifacts\/event",?\s*\)/,
-  );
 });
 
 test("batch workflow uses owner-scoped mutation credentials and canonical Worker hydration", () => {
@@ -977,28 +820,7 @@ test("batch workflow uses owner-scoped mutation credentials and canonical Worker
   assert.match(source, /records-repo-slugs: \$\{\{ steps\.batch\.outputs\.records_repo_slugs \}\}/);
   assert.match(source, /hydrate-git-state: "false"/);
   assert.match(source, /hydrate-state-blobs: "false"/);
-  assert.match(cliSource, /slugForRepo\(normalizeRepo\(target\)\)/);
   assert.doesNotMatch(source, /permissions:\n(?:.*\n)*?\s+issues: write/);
-  assert.doesNotMatch(prepareSource, /stateClone|CLAWSWEEPER_STATE_DIR|"clone"/);
-  assert.match(prepareSource, /CLAWSWEEPER_CODE_ROOT: workspace/);
-  assert.match(prepareSource, /EXACT_REVIEW_WORK_ROOT: root/);
-  assert.match(prepareSource, /publish-event-result\.js"\)\],\s*\{\s*cwd: root,\s*env:/);
-  assert.match(publisherSource, /codeRoot: resolve\(process\.env\.CLAWSWEEPER_CODE_ROOT/);
-  assert.match(publisherSource, /const cli = join\(options\.codeRoot, "dist\/clawsweeper\.js"\)/);
-  assert.match(
-    publisherSource,
-    /spawnSync\(process\.execPath, \[cli, \.\.\.args\], \{\s*cwd: options\.workRoot,/,
-  );
-  assert.equal(
-    publisherSource.match(/\.\.\.eventRecordDirectoryArgs\(options, (?:recordPaths|paths)\)/g)
-      ?.length,
-    2,
-  );
-  for (const flag of ["items", "closed", "plans", "decision-packets"]) {
-    assert.match(publisherSource, new RegExp(`"--${flag}-dir"`));
-  }
-  assert.match(publisherSource, /"--record-root",\s*options\.workRoot/);
-  assert.doesNotMatch(publisherSource, /runStreaming\("pnpm"/);
 });
 
 test("batch preparation copies only canonical selected tuples and preserves publisher bases", () => {
@@ -1027,19 +849,6 @@ for (const invalidDecision of [
   });
 }
 
-test("batch preparation is bounded, heartbeat-fenced, and deterministically aggregated", () => {
-  assert.match(prepareSource, /const MAX_CONCURRENCY = 4/);
-  assert.match(prepareSource, /const MAX_ITEMS = 32/);
-  assert.match(prepareSource, /results\[index\] = await worker/);
-  assert.match(prepareSource, /EXACT_REVIEW_BATCH_HEARTBEAT_FAILURE_PATH/);
-  assert.match(prepareSource, /DEFAULT_ITEM_TIMEOUT_MS/);
-  assert.match(prepareSource, /DEFAULT_TOTAL_TIMEOUT_MS/);
-  assert.match(prepareSource, /Math\.min\(itemTimeoutMs, remainingTimeout\(deadline\)\)/);
-  assert.doesNotMatch(prepareSource, /importPreparedMutationObjects|pack-objects|targetOid/);
-  assert.match(prepareSource, /terminate\("SIGKILL"\)/);
-  assert.match(prepareSource, /prepare-telemetry\.json/);
-});
-
 test("batch workflow tolerates periodic heartbeat outages but establishes each lease strictly", () => {
   for (const name of [
     "Prepare each item independently",
@@ -1063,93 +872,3 @@ test("batch workflow shell steps are valid Bash", () => {
     assert.equal(syntax.status, 0, `${step.name ?? "unnamed step"}: ${syntax.stderr}`);
   }
 });
-
-test("batch claim treats an all-stale fetched batch as terminal", () => {
-  assert.match(cliSource, /if \(!manifest\.items\.length\) return;/);
-  assert.ok(
-    cliSource.indexOf("if (!manifest.items.length) return;") < cliSource.indexOf("owners.size"),
-  );
-});
-
-test("batch manifest records the dashboard effective lease size", () => {
-  assert.match(cliSource, /configuredBatchSize: lease\.configuredBatchSize/);
-  assert.doesNotMatch(
-    cliSource,
-    /configuredBatchSize: positiveInteger\(env\("EXACT_REVIEW_BATCH_MAX_ITEMS"\)\)/,
-  );
-});
-
-test("batch failure cleanup completes manifest fences without a queue fetch", () => {
-  const releaseSource = /async function release\(\) \{([\s\S]*?)\n\}/.exec(cliSource)?.[1] ?? "";
-  assert.match(releaseSource, /manifest\.items\.map/);
-  assert.match(releaseSource, /readBatchReceipt\(manifest, false\)/);
-  assert.match(releaseSource, /receipt\?\.outcomes\.get\(member\.itemKey\)/);
-  assert.match(releaseSource, /receipt\?\.publishedItemKeys\.has\(member\.itemKey\)/);
-  assert.match(releaseSource, /terminalOutcome: "published"/);
-  assert.match(releaseSource, /receipt\?\.stateCommitSha/);
-  assert.match(releaseSource, /receipt\?\.stateWriter/);
-  assert.doesNotMatch(releaseSource, /client\.fetch/);
-});
-
-test("batch commit publishes every prepared tuple to canonical Worker state", () => {
-  const commitSource = /async function commit\(\) \{([\s\S]*?)\n\}/.exec(cliSource)?.[1] ?? "";
-  assert.match(commitSource, /await publishCanonicalBatch\(commitCandidates\)/);
-  assert.match(commitSource, /permanentPublicationOutcome\(current, failureFingerprint\(error\)\)/);
-  assert.match(commitSource, /outcomes: publicationOutcomes/);
-  assert.match(cliSource, /canonicalTargetKey/);
-  assert.match(cliSource, /fenceKey/);
-  assert.match(cliSource, /postDirectPublicationResult/);
-  assert.match(cliSource, /publication-batch-results/);
-  assert.match(
-    cliSource,
-    /payload: prepareDirectPublicationPayload\(\{ revision: plan\.identity\.revision, plan \}\)/,
-  );
-  assert.doesNotMatch(cliSource, /runGit|targetOid/);
-  assert.doesNotMatch(cliSource, /commitPreparedStateBatch/);
-  assert.doesNotMatch(cliSource, /state-publication-batch/);
-});
-
-function githubRetryExecution(
-  failures: number,
-  kind: "transient" | "throttle-403" | "throttle-429" = "transient",
-) {
-  let calls = 0;
-  const waits: number[] = [];
-  class TestGitHubRuntimeBudgetError extends Error {}
-  const request = () => {
-    calls += 1;
-    if (calls <= failures) {
-      throw new Error(
-        kind === "throttle-403"
-          ? "API rate limit exceeded for installation ID 122230863 (HTTP 403)"
-          : kind === "throttle-429"
-            ? "HTTP 429: Too Many Requests"
-            : "HTTP 502: transient upstream failure",
-      );
-    }
-    return "ok";
-  };
-  const execution = createGitHubExecution({
-    ROOT: process.cwd(),
-    run: request,
-    gitHubRuntime: {
-      GitHubRuntimeBudgetError: TestGitHubRuntimeBudgetError,
-      claimPublicReadFallback: () => null,
-      ensureGitHubRetryFits: () => undefined,
-      ensureGitHubRuntimeAvailable: () => undefined,
-      gh: request,
-      ghOnce: request,
-      ghWithPreparedTimeout: request,
-      githubCommandTimeoutMs: () => undefined,
-      githubRuntimeBudgetError: () => new TestGitHubRuntimeBudgetError(),
-      sleepBeforeGitHubRetry: (waitMs: number) => waits.push(waitMs),
-    },
-    sweepStatus: {
-      sweepStatusRelativePath: () => "status.json",
-      writeSweepStatus: () => undefined,
-    },
-    labelAlreadyExistsError: () => false,
-  } as unknown as Parameters<typeof createGitHubExecution>[0]);
-
-  return { execution, calls: () => calls, waits };
-}

@@ -7,7 +7,6 @@ test("comment router config preserves target branch from dispatch args", () => {
   const config = readCommentRouterConfig({
     repo: "openclaw/example",
     "target-branch": "master",
-    "repair-repo": "openclaw/clawsweeper",
     "review-repo": "openclaw/clawsweeper",
   });
 
@@ -21,7 +20,6 @@ test("comment router config omits target branch by default", () => {
   try {
     const config = readCommentRouterConfig({
       repo: "openclaw/example",
-      "repair-repo": "openclaw/clawsweeper",
       "review-repo": "openclaw/clawsweeper",
     });
 
@@ -36,6 +34,25 @@ test("comment router config omits target branch by default", () => {
   }
 });
 
+test("comment router keeps event and exact-review receipts on the sweep workflow", () => {
+  const previous = process.env.CLAWSWEEPER_REVIEW_WORKFLOW;
+  delete process.env.CLAWSWEEPER_REVIEW_WORKFLOW;
+  try {
+    const config = readCommentRouterConfig({ repo: "openclaw/example" });
+    assert.equal(config.reviewWorkflow, "sweep.yml");
+    assert.equal(
+      readCommentRouterConfig({
+        repo: "openclaw/example",
+        "review-workflow": "custom-event-review.yml",
+      }).reviewWorkflow,
+      "custom-event-review.yml",
+    );
+  } finally {
+    if (previous === undefined) delete process.env.CLAWSWEEPER_REVIEW_WORKFLOW;
+    else process.env.CLAWSWEEPER_REVIEW_WORKFLOW = previous;
+  }
+});
+
 test("comment router config derives and binds durable forced replay identity", () => {
   const previousRunId = process.env.GITHUB_RUN_ID;
   const previousRunAttempt = process.env.GITHUB_RUN_ATTEMPT;
@@ -44,7 +61,6 @@ test("comment router config derives and binds durable forced replay identity", (
   try {
     const config = readCommentRouterConfig({
       repo: "openclaw/example",
-      "repair-repo": "openclaw/clawsweeper",
       "review-repo": "openclaw/clawsweeper",
       "force-reprocess": true,
     });
@@ -58,7 +74,6 @@ test("comment router config derives and binds durable forced replay identity", (
     process.env.GITHUB_RUN_ATTEMPT = "3";
     const retried = readCommentRouterConfig({
       repo: "openclaw/example",
-      "repair-repo": "openclaw/clawsweeper",
       "review-repo": "openclaw/clawsweeper",
       "force-reprocess": true,
     });
@@ -74,7 +89,6 @@ test("comment router config derives and binds durable forced replay identity", (
 test("comment router config rejects unscoped or invalid replay attempts", () => {
   const base = {
     repo: "openclaw/example",
-    "repair-repo": "openclaw/clawsweeper",
     "review-repo": "openclaw/clawsweeper",
   };
 
@@ -91,4 +105,19 @@ test("comment router config rejects unscoped or invalid replay attempts", () => 
       }),
     /non-empty token/,
   );
+});
+
+test("retired repair policy inputs cannot block review routing", () => {
+  const config = readCommentRouterConfig({
+    repo: "openclaw/enterprise",
+    "review-repo": "openclaw/clawsweeper",
+    "max-live-workers": "invalid",
+    "automerge-max-live-workers": "invalid",
+    "max-auto-repairs-per-head": "invalid",
+    "max-autoclose-targets": "invalid",
+    "repair-repo": "invalid",
+  });
+  assert.equal(config.targetRepo, "openclaw/enterprise");
+  assert.equal("repairRepo" in config, false);
+  assert.equal("maxLiveWorkers" in config, false);
 });

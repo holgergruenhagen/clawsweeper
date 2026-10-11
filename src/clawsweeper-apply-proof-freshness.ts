@@ -15,6 +15,11 @@ import { stableJson } from "./stable-json.js";
 
 export interface ApplySelfMutationItemReceipt {
   updatedAt: string;
+  /**
+   * `updated_at` of the ClawSweeper write itself, when it differs from the item `updated_at` read
+   * right after the write. GitHub can move the item to this time later.
+   */
+  ownedWriteUpdatedAt?: string;
   sourceRevision: string;
   activityReceipt: string;
   allowsPostReviewAutomationActivity?: boolean;
@@ -40,6 +45,12 @@ type ApplyProofFreshnessDependencies = Pick<
   automationItemUpdatedAt: string | undefined;
   completeReviewActivityReceiptMatches: (context: ItemContext) => boolean;
   currentProofState: () => {
+    /**
+     * Live `updated_at` that the pre-apply source-freshness gate already accepted as the
+     * reviewed source (unchanged, or moved only by receipt-backed ClawSweeper writes). Absent
+     * when that gate did not accept it.
+     */
+    acceptedUpdatedAt: string | undefined;
     cachedPrCloseCoverageProofGateResult: PrCloseCoverageProofGateResult | undefined;
     prCloseCoverageProofGateChecked: boolean;
     prCloseCoverageProofStartedAtMs: number | null;
@@ -84,6 +95,7 @@ export function createApplyProofFreshnessGuards({
     currentSnapshotHash?: string;
   } | null => {
     const {
+      acceptedUpdatedAt,
       cachedPrCloseCoverageProofGateResult,
       prCloseCoverageProofGateChecked,
       prCloseCoverageProofStartedAtMs,
@@ -120,7 +132,9 @@ export function createApplyProofFreshnessGuards({
         })),
       );
     const candidateItemReceipts = selfMutationItemReceipts.filter(
-      (receipt) => receipt.updatedAt === refreshed.item.updatedAt,
+      (receipt) =>
+        receipt.updatedAt === refreshed.item.updatedAt ||
+        receipt.ownedWriteUpdatedAt === refreshed.item.updatedAt,
     );
     const mayMatchPersistedAutomationReceipt =
       Boolean(automationItemUpdatedAt) && refreshed.item.updatedAt === automationItemUpdatedAt;
@@ -135,10 +149,19 @@ export function createApplyProofFreshnessGuards({
     const refreshedActivityReceipt = refreshedCompleteActivityContext
       ? stableJson(refreshedCompleteActivityContext)
       : null;
+    // The pre-apply gate already accepted this updated_at as ClawSweeper's own receipt-backed
+    // write (such as the automatic review progress edit). A same-second human edit can share
+    // that timestamp, so the accepted baseline still needs the review's complete structural
+    // receipt (source, timeline, head, review activity) to match the live item below.
+    const atAcceptedBaseline =
+      acceptedUpdatedAt !== undefined &&
+      acceptedUpdatedAt !== storedUpdatedAt &&
+      refreshed.item.updatedAt === acceptedUpdatedAt;
     const refreshedReviewActivityCursor =
       itemKind === "pull_request" &&
       (candidateItemReceipts.length > 0 ||
         mayMatchPersistedAutomationReceipt ||
+        atAcceptedBaseline ||
         refreshed.item.updatedAt === storedUpdatedAt)
         ? fetchReviewedPrActivityCursor(number)
         : null;
@@ -210,9 +233,16 @@ export function createApplyProofFreshnessGuards({
       mayMatchPersistedAutomationReceipt &&
       reviewHasCompleteActivityIdentity &&
       refreshedCompleteReceiptMatchesReview();
+    // Same structural standard as a persisted automation receipt: the timestamp alone never
+    // proves ownership.
+    const acceptedBaselineReceiptMatches =
+      atAcceptedBaseline &&
+      reviewHasCompleteActivityIdentity &&
+      refreshedCompleteReceiptMatchesReview();
     const refreshedSelfMutationOnlyUpdate =
       refreshedItemReceiptMatches ||
       persistedAutomationReceiptMatches ||
+      acceptedBaselineReceiptMatches ||
       refreshedCommandStatusOnlyUpdate;
     const selfMutationMaskedNonAutomationActivity = (): boolean => {
       const postReviewSelfMutationAtMs = candidateItemReceipts
@@ -242,6 +272,27 @@ export function createApplyProofFreshnessGuards({
           currentUpdatedAt: refreshed.item.updatedAt,
         };
       }
+      // Names which self-mutation receipt failed, so a self-feeding re-review loop shows
+      // its cause in the workflow log. Booleans and public GitHub timestamps only.
+      console.error(
+        `[apply] post-proof drift #${number} ${JSON.stringify({
+          stored_updated_at: storedUpdatedAt,
+          item_updated_at: refreshed.item.updatedAt,
+          automation_item_updated_at: automationItemUpdatedAt ?? null,
+          self_mutation_receipt_updated_ats: selfMutationItemReceipts.map(
+            (receipt) => receipt.updatedAt,
+          ),
+          self_mutation_owned_write_updated_ats: selfMutationItemReceipts.flatMap((receipt) =>
+            receipt.ownedWriteUpdatedAt ? [receipt.ownedWriteUpdatedAt] : [],
+          ),
+          candidate_receipts: candidateItemReceipts.length,
+          receipt_matches: refreshedItemReceiptMatches,
+          persisted_receipt_matches: persistedAutomationReceiptMatches,
+          accepted_baseline: atAcceptedBaseline,
+          accepted_baseline_receipt_matches: acceptedBaselineReceiptMatches,
+          command_status_only: refreshedCommandStatusOnlyUpdate,
+        })}`,
+      );
       return {
         reason: "updated_at changed",
         currentUpdatedAt: refreshed.item.updatedAt,

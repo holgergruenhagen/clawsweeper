@@ -1,52 +1,50 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { linkSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import {
   createRelatedContext,
   redactCredentialUriUserinfo,
 } from "../dist/clawsweeper-related-context.js";
+import { withReviewRecord } from "./helpers.ts";
 
 const TARGET_REPO = "openclaw/openclaw";
 const SECRET_URI = ["https://alice", "secret@example.com/chrome"].join(":");
 const PASS_URI = ["https://user", "pass@chrome.example.com"].join(":");
 const PASS_HTTP_URI = ["http://user", "pass@chrome.example.com"].join(":");
 
-function relatedContextWith(records: Record<string, unknown>) {
+function relatedContextWith(records: Record<string, unknown>, localReportsRoot?: string) {
   const requested: string[] = [];
+  const batches: string[][] = [];
   const context = createRelatedContext({
-    root: process.cwd(),
+    root: localReportsRoot ?? process.cwd(),
     targetRepo: () => TARGET_REPO,
     reportUrl: (value: string) => value,
-    defaultItemsDir: () => "items",
-    defaultClosedDir: () => "closed",
-    isMarkdownForActiveRepo: () => false,
+    defaultItemsDir: () => (localReportsRoot ? join(localReportsRoot, "items") : "items"),
+    defaultClosedDir: () => (localReportsRoot ? join(localReportsRoot, "closed") : "closed"),
+    isMarkdownForActiveRepo: () => localReportsRoot !== undefined,
     gitHubRuntimeBudgetError: class GitHubRuntimeBudgetError extends Error {},
-    ghJson: <T>(args: string[]): T => {
-      const path = args[1] ?? "";
-      requested.push(path);
-      if (!(path in records)) throw new Error(`unexpected GitHub request: ${path}`);
-      return records[path] as T;
+    ghJsonEach: <T>(requests: readonly string[][]) => {
+      const paths = requests.map((args) => args[1] ?? "");
+      if (paths.length > 0) batches.push(paths);
+      requested.push(...paths);
+      return paths.map((path) =>
+        path in records
+          ? { ok: true as const, value: records[path] as T }
+          : { ok: false as const, error: new Error(`unexpected GitHub request: ${path}`) },
+      );
     },
     ghJsonOnce: () => {
       throw new Error("unexpected GitHub request");
     },
-    asRecord: (value: unknown) =>
-      value && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : {},
-    login: () => undefined,
     compactIssue: (value: unknown) => value,
     compactPullRequest: (value: unknown) => value,
-    envFlagEnabled: () => false,
-    envFlagDisabled: () => false,
-    frontMatterValue: () => undefined,
-    reviewSectionValue: () => "",
-    effectiveReviewStatus: () => "",
     displayTitle: (value: string) => value,
-    markdownFiles: () => [],
-    numberForMarkdownFile: () => 0,
     repoRelativePath: (value: string) => value,
   });
-  return { context, requested };
+  return { context, requested, batches };
 }
 
 const item = {
@@ -152,4 +150,190 @@ test("timeline cross-references from other repositories are not fetched from the
     [5, 7],
   );
   assert.ok(!requested.some((path) => path.endsWith("/issues/436")));
+});
+
+test("related items read every issue in one batch, then their pull requests, failing per item", () => {
+  const { context, batches } = relatedContextWith({
+    [`repos/${TARGET_REPO}/issues/11`]: { number: 11, pull_request: { url: "x" }, body: "a" },
+    [`repos/${TARGET_REPO}/pulls/11`]: { number: 11, body: "a pull" },
+    [`repos/${TARGET_REPO}/issues/22`]: { number: 22, body: "b" },
+    [`repos/${TARGET_REPO}/issues/44`]: { number: 44, pull_request: { url: "y" }, body: "d" },
+  });
+  const related = context.relatedItemsContext({
+    item,
+    issue: { body: "See #44, #11, #33 and #22." },
+    comments: [],
+    timeline: [],
+  });
+
+  assert.deepEqual(batches, [
+    [11, 22, 33, 44].map((number) => `repos/${TARGET_REPO}/issues/${number}`),
+    [11, 44].map((number) => `repos/${TARGET_REPO}/pulls/${number}`),
+  ]);
+  assert.deepEqual(related, [
+    {
+      mentionedIn: ["item body"],
+      issue: { number: 11, pull_request: { url: "x" }, body: "a" },
+      commentCount: undefined,
+      pullRequest: { number: 11, body: "a pull" },
+    },
+    {
+      mentionedIn: ["item body"],
+      issue: { number: 22, body: "b" },
+      commentCount: undefined,
+    },
+    {
+      number: 33,
+      mentionedIn: ["item body"],
+      error: `unexpected GitHub request: repos/${TARGET_REPO}/issues/33`,
+    },
+    {
+      mentionedIn: ["item body"],
+      issue: { number: 44, pull_request: { url: "y" }, body: "d" },
+      commentCount: undefined,
+      pullRequestError: `unexpected GitHub request: repos/${TARGET_REPO}/pulls/44`,
+    },
+  ]);
+});
+
+test("local title matches read recorded summaries and decisions", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-related-record-"));
+  try {
+    mkdirSync(join(root, "items"));
+    mkdirSync(join(root, "closed"));
+    const report = (number: number) => `---
+repository: ${TARGET_REPO}
+number: ${number}
+type: pull_request
+title: Browser credential transmission repair
+url: https://github.com/${TARGET_REPO}/pull/${number}
+author: contributor-example
+decision: keep_open
+close_reason: none
+action_taken: kept_open
+---
+
+## Summary
+
+Keep browser credentials out of model input.
+
+## Evidence
+
+The body is unrelated to the review record.
+`;
+    const paths = [join(root, "items", "1.md"), join(root, "closed", "2.md")];
+    paths.forEach((path, index) => writeFileSync(path, report(index + 1)));
+    const options = {
+      item: { ...item, title: "Browser credential transmission" },
+      issue: {},
+      comments: [],
+      timeline: [],
+    };
+    const before = relatedContextWith({}, root).context.relatedItemsContext(options);
+    assert.equal(before.length, 0, "reports without typed records are excluded");
+    paths.forEach((path, index) => {
+      writeFileSync(
+        path,
+        withReviewRecord(report(index + 1), {
+          decision: "close",
+          closeReason: "cannot_reproduce",
+          summary: "Recorded browser repair summary.",
+        }),
+      );
+    });
+    const after = relatedContextWith({}, root).context.relatedItemsContext(options);
+    assert.equal(after.length, 2);
+    assert.match(JSON.stringify(after), /Recorded browser repair summary/);
+    assert.match(JSON.stringify(after), /cannot_reproduce/);
+    assert.doesNotMatch(JSON.stringify(after), /Keep browser credentials/);
+    writeFileSync(
+      paths[0]!,
+      withReviewRecord(report(1)).replace(/^review_record: \{/m, "review_record: {broken"),
+    );
+    const surviving = relatedContextWith({}, root).context.relatedItemsContext(options);
+    assert.equal(surviving.length, 1);
+    assert.match(JSON.stringify(surviving), /Recorded browser repair summary/);
+    assert.doesNotMatch(JSON.stringify(surviving), /Keep browser credentials/);
+    // The current item is excluded from results, but still visited while indexing.
+    writeFileSync(
+      join(root, "items", `${item.number}.md`),
+      withReviewRecord(report(item.number)).replace(
+        /^review_record: \{/m,
+        "review_record: {broken",
+      ),
+    );
+    assert.deepEqual(relatedContextWith({}, root).context.relatedItemsContext(options), surviving);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("local title index does not retain the reports backing its metadata", () => {
+  const root = mkdtempSync(join(tmpdir(), "clawsweeper-related-heap-"));
+  try {
+    const itemsDir = join(root, "items");
+    mkdirSync(itemsDir);
+    const source = join(root, "source.md");
+    // The retained summary is tiny compared with the irrelevant report body.
+    // Hardlinks keep the fixture small on disk while every read gets its own string.
+    writeFileSync(
+      source,
+      withReviewRecord(
+        `---
+repository: ${TARGET_REPO}
+number: 1
+type: pull_request
+title: Browser credential transmission repair
+url: https://github.com/${TARGET_REPO}/pull/1
+author: contributor-example
+decision: keep_open
+close_reason: none
+action_taken: kept_open
+---
+
+## Summary
+
+Keep browser credentials out of model input.
+
+## Evidence
+
+${"e".repeat(512 * 1024)}
+`,
+        {
+          decision: "keep_open",
+          closeReason: "none",
+          summary: "Keep browser credentials out of model input.",
+          architectureDiagram: "r".repeat(512 * 1024),
+        },
+      ),
+    );
+    for (let number = 1; number <= 100; number += 1) {
+      linkSync(source, join(itemsDir, `${number}.md`));
+    }
+    const moduleUrl = new URL("../dist/clawsweeper-related-context.js", import.meta.url).href;
+    const script = `
+      import { createRelatedContext } from ${JSON.stringify(moduleUrl)};
+      const root = ${JSON.stringify(root)};
+      const context = createRelatedContext({
+        root, targetRepo: () => ${JSON.stringify(TARGET_REPO)}, reportUrl: x => x,
+        defaultItemsDir: () => root + "/items", defaultClosedDir: () => root + "/closed",
+        isMarkdownForActiveRepo: () => true, gitHubRuntimeBudgetError: Error,
+        ghJsonEach: () => [], ghJsonOnce: () => { throw Error("unexpected network"); },
+        compactIssue: x => x, compactPullRequest: x => x,
+        displayTitle: x => x, repoRelativePath: x => x,
+      });
+      const related = context.relatedItemsContext({
+        item: ${JSON.stringify({ ...item, title: "Browser credential transmission" })}, issue: {}, comments: [], timeline: [],
+      });
+      console.log(JSON.stringify(related.map(entry => entry.localReport.number)));
+    `;
+    const stdout = execFileSync(
+      process.execPath,
+      ["--max-old-space-size=64", "--input-type=module", "--eval", script],
+      { encoding: "utf8", timeout: 30_000 },
+    );
+    assert.deepEqual(JSON.parse(stdout), [1, 2, 3, 4, 5]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

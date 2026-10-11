@@ -1,6 +1,9 @@
 import type { CreateApplyDecisionWorkflowDependencies } from "./clawsweeper-apply-dependencies.js";
 import { completeActivityContextSymbol } from "./clawsweeper-types.js";
 import type { ApplyResult, Item, ItemContext } from "./clawsweeper-types.js";
+import { asRecord, login, nonBlankStringOrUndefined } from "./value-coerce.js";
+import { parseIsoMs } from "./iso-time.js";
+import { frontMatterValue, replaceFrontMatterValue } from "./report-front-matter.js";
 
 /**
  * A released review lease leaves no live timestamp. Its deletion must follow the review
@@ -10,7 +13,6 @@ export const OWNED_LEASE_RELEASE_RECEIPT_WINDOW_MS = 5 * 60 * 1000;
 
 type ApplySourceFreshnessDependencies = Pick<
   CreateApplyDecisionWorkflowDependencies,
-  | "asRecord"
   | "CLAWSWEEPER_BOT_AUTHORS"
   | "commentBody"
   | "commentId"
@@ -18,13 +20,9 @@ type ApplySourceFreshnessDependencies = Pick<
   | "contextHasNonAutomationActivityAfter"
   | "fetchIssueReviewComments"
   | "freshPullRequestReviewHead"
-  | "frontMatterValue"
   | "itemSnapshotHash"
-  | "login"
   | "recordedLabelSyncCoversUpdate"
   | "reviewStartLeaseOwner"
-  | "stringOrUndefined"
-  | "timestampMs"
 >;
 
 interface ApplySourceFreshnessOptions {
@@ -66,12 +64,7 @@ interface ApplyChangedSinceReviewMarkerOptions {
   writeReportMarkdown: (path: string, markdown: string) => void;
 }
 
-export function createApplyChangedSinceReviewMarker(
-  {
-    replaceFrontMatterValue,
-  }: Pick<CreateApplyDecisionWorkflowDependencies, "replaceFrontMatterValue">,
-  options: ApplyChangedSinceReviewMarkerOptions,
-) {
+export function createApplyChangedSinceReviewMarker(options: ApplyChangedSinceReviewMarkerOptions) {
   return ({
     reason,
     currentUpdatedAt,
@@ -150,7 +143,6 @@ export function createApplySourceFreshness(
   options: ApplySourceFreshnessOptions,
 ) {
   const {
-    asRecord,
     CLAWSWEEPER_BOT_AUTHORS,
     commentBody,
     commentId,
@@ -158,13 +150,9 @@ export function createApplySourceFreshness(
     contextHasNonAutomationActivityAfter,
     fetchIssueReviewComments,
     freshPullRequestReviewHead,
-    frontMatterValue,
     itemSnapshotHash,
-    login,
     recordedLabelSyncCoversUpdate,
     reviewStartLeaseOwner,
-    stringOrUndefined,
-    timestampMs,
   } = dependencies;
   const {
     action,
@@ -194,13 +182,13 @@ export function createApplySourceFreshness(
     : [];
   const latestAutomationUpdatedAt = [existingReviewComment, ...reportOwnedLeaseComments]
     .map(commentUpdatedAt)
-    .filter((value): value is string => timestampMs(value) !== null)
-    .sort((left, right) => (timestampMs(left) ?? 0) - (timestampMs(right) ?? 0))
+    .filter((value): value is string => parseIsoMs(value) !== null)
+    .sort((left, right) => (parseIsoMs(left) ?? 0) - (parseIsoMs(right) ?? 0))
     .at(-1);
   const { markdown, storedUpdatedAt } = currentState();
   const updatedSinceReview = Boolean(storedUpdatedAt && item.updatedAt !== storedUpdatedAt);
   const reviewCommentOnlyUpdate = item.updatedAt === existingReviewCommentUpdatedAt;
-  const storedUpdatedAtMs = timestampMs(storedUpdatedAt);
+  const storedUpdatedAtMs = parseIsoMs(storedUpdatedAt);
   const recordedLabelSyncMatches =
     updatedSinceReview &&
     recordedLabelSyncCoversUpdate({
@@ -258,7 +246,7 @@ export function createApplySourceFreshness(
         CLAWSWEEPER_BOT_AUTHORS.has((login(asRecord(entry).user) ?? "").trim().toLowerCase()) &&
         (commentBody(entry) ?? "").includes("<!-- clawsweeper-command-status:"),
     );
-    const createdAt = comment ? stringOrUndefined(comment.created_at) : undefined;
+    const createdAt = comment ? nonBlankStringOrUndefined(comment.created_at) : undefined;
     return Boolean(
       createdAt &&
       (reviewHasCompleteActivityIdentity
@@ -280,14 +268,14 @@ export function createApplySourceFreshness(
   // changing the reviewed source. A later apply of the same review, such as the deferred batch
   // publisher, accepts such an update only when a receipt ClawSweeper recorded for this item
   // accounts for the latest updated_at and the review's complete activity receipt still matches.
-  const itemUpdatedAtMs = timestampMs(item.updatedAt);
+  const itemUpdatedAtMs = parseIsoMs(item.updatedAt);
   const isClawSweeperLogin = (value: string | undefined): boolean =>
     CLAWSWEEPER_BOT_AUTHORS.has((value ?? "").trim().toLowerCase());
   const ownedItemMarker = new RegExp(
     `<!--\\s*clawsweeper-[\\w:-]+\\s[^>]*?\\bitem=${number}(?![0-9])`,
   );
   const ownedCommentWriteTimes = comments.flatMap((comment) => {
-    const at = timestampMs(commentUpdatedAt(comment));
+    const at = parseIsoMs(commentUpdatedAt(comment));
     return at !== null &&
       isClawSweeperLogin(login(asRecord(comment).user)) &&
       ownedItemMarker.test(commentBody(comment) ?? "")
@@ -298,8 +286,8 @@ export function createApplySourceFreshness(
   const ownedTimelineWriteTimes = (): number[] =>
     (currentItemContext()[completeActivityContextSymbol]?.timeline ?? []).flatMap((event) => {
       const record = asRecord(event);
-      const at = timestampMs(stringOrUndefined(record.createdAt));
-      return at !== null && isClawSweeperLogin(stringOrUndefined(record.actor)) ? [at] : [];
+      const at = parseIsoMs(nonBlankStringOrUndefined(record.createdAt));
+      return at !== null && isClawSweeperLogin(nonBlankStringOrUndefined(record.actor)) ? [at] : [];
     });
   const exactOwnedWriteAccountsForUpdate = (): boolean =>
     itemUpdatedAtMs !== null &&
@@ -313,7 +301,7 @@ export function createApplySourceFreshness(
       .match(/<!--\s+clawsweeper-review-version\b[^>]*-->/g)
       ?.at(-1);
     if (!marker) return false;
-    const reviewedAtMs = timestampMs(
+    const reviewedAtMs = parseIsoMs(
       frontMatterValue(markdownBeforeApplyDecisionMutations, "reviewed_at"),
     );
     const sourceRevision = frontMatterValue(
@@ -324,7 +312,7 @@ export function createApplySourceFreshness(
       Number(reviewVersionAttribute(marker, "item")) === number &&
       reviewVersionAttribute(marker, "v") === "1" &&
       reviewedAtMs !== null &&
-      timestampMs(reviewVersionAttribute(marker, "reviewed_at")) === reviewedAtMs &&
+      parseIsoMs(reviewVersionAttribute(marker, "reviewed_at")) === reviewedAtMs &&
       Boolean(sourceRevision) &&
       reviewVersionAttribute(marker, "source_revision") === sourceRevision &&
       reviewVersionAttribute(marker, "lease_owner") === reportReviewLeaseOwner &&
@@ -340,7 +328,7 @@ export function createApplySourceFreshness(
     }
     if (comments.some((comment) => commentId(comment) === reportReviewLeaseCommentId)) return false;
     if (!durableCommentRecordsReviewGeneration()) return false;
-    const syncedAtMs = timestampMs(existingReviewCommentUpdatedAt);
+    const syncedAtMs = parseIsoMs(existingReviewCommentUpdatedAt);
     if (syncedAtMs === null || syncedAtMs < storedUpdatedAtMs) return false;
     const latestOwnedWriteMs = Math.max(
       syncedAtMs,
@@ -354,16 +342,32 @@ export function createApplySourceFreshness(
   };
   // Every receipt also requires that no non-automation comment, review comment, or timeline
   // event (including a human edit of a managed label) is visible after the review snapshot.
-  const ownedAutomationReceiptOnlyUpdate = (): boolean =>
-    updatedSinceReview &&
-    reviewHasCompleteActivityIdentity &&
-    storedUpdatedAtMs !== null &&
-    (exactOwnedWriteAccountsForUpdate() || releasedReviewLeaseAccountsForUpdate()) &&
-    completeAutomationReceiptMatchesReview() &&
-    !contextHasNonAutomationActivityAfter(currentItemContext(), storedUpdatedAtMs - 1, {
-      truncationCountsAsActivity: true,
-      useCompleteActivityContext: true,
-    });
+  // The first failed condition is kept for drift diagnostics; evaluation order and short-circuit
+  // are unchanged, so diagnostics add no GitHub reads.
+  let ownedReceiptFailure: string | null = null;
+  const ownedAutomationReceiptOnlyUpdate = (): boolean => {
+    const fail = (reason: string): false => {
+      ownedReceiptFailure = reason;
+      return false;
+    };
+    if (!updatedSinceReview) return fail("not_updated_since_review");
+    if (!reviewHasCompleteActivityIdentity) return fail("no_complete_activity_identity");
+    if (storedUpdatedAtMs === null) return fail("no_stored_updated_at");
+    if (!(exactOwnedWriteAccountsForUpdate() || releasedReviewLeaseAccountsForUpdate())) {
+      return fail("no_owned_write_at_item_updated_at");
+    }
+    if (!completeAutomationReceiptMatchesReview()) return fail("activity_receipt_mismatch");
+    if (
+      contextHasNonAutomationActivityAfter(currentItemContext(), storedUpdatedAtMs - 1, {
+        truncationCountsAsActivity: true,
+        useCompleteActivityContext: true,
+      })
+    ) {
+      return fail("non_automation_activity_after_review");
+    }
+    ownedReceiptFailure = null;
+    return true;
+  };
   const { isCloseProposal } = currentState();
   const automationOnlyUpdate = Boolean(
     (reviewCommentOnlyUpdate ||
@@ -396,7 +400,7 @@ export function createApplySourceFreshness(
       freshPullRequestReviewHead(markdown, currentItemContext());
     if (completeFreshHeadReview && reviewHasCompleteActivityIdentity) {
       if (!completeReviewActivityReceiptMatches(currentItemContext())) return false;
-      const reviewedAtMs = timestampMs(frontMatterValue(markdown, "reviewed_at"));
+      const reviewedAtMs = parseIsoMs(frontMatterValue(markdown, "reviewed_at"));
       if (reviewedAtMs === null) return false;
       // GitHub activity has second precision; that whole second is ambiguous.
       const reviewSecondStartMs = Math.floor(reviewedAtMs / 1000) * 1000;
@@ -406,22 +410,48 @@ export function createApplySourceFreshness(
     }
     if (!updatedSinceReview || automationOnlyUpdate) return true;
     if (!completeFreshHeadReview) {
-      const latestAutomationMs = timestampMs(latestAutomationUpdatedAt);
-      const itemUpdatedAtMs = timestampMs(item.updatedAt);
+      const latestAutomationMs = parseIsoMs(latestAutomationUpdatedAt);
+      const itemUpdatedAtMs = parseIsoMs(item.updatedAt);
       if (latestAutomationMs === null || itemUpdatedAtMs === null) return false;
       if (Math.abs(itemUpdatedAtMs - latestAutomationMs) > 5 * 60 * 1000) return false;
     }
-    const reviewedTimestampMs = timestampMs(storedUpdatedAt);
+    const reviewedTimestampMs = parseIsoMs(storedUpdatedAt);
     if (reviewedTimestampMs === null) return false;
-    const reviewedAtMs = timestampMs(frontMatterValue(markdown, "reviewed_at"));
+    const reviewedAtMs = parseIsoMs(frontMatterValue(markdown, "reviewed_at"));
     return !contextHasNonAutomationActivityAfter(currentItemContext(), reviewedTimestampMs, {
       useCompleteActivityContext: true,
       ...(reviewedAtMs === null ? {} : { ignoreTimelineCommentsThroughMs: reviewedAtMs }),
     });
   };
 
+  // Names which ClawSweeper-owned-write receipt failed when apply treats an update as source
+  // drift, so a self-feeding re-review loop shows its cause in the workflow log. Uses only values
+  // already read; never fetches. Booleans and public GitHub timestamps only.
+  const driftDiagnostics = () => ({
+    kind: item.kind,
+    close_proposal: isCloseProposal,
+    stored_updated_at: storedUpdatedAt ?? null,
+    item_updated_at: item.updatedAt,
+    review_comment_updated_at: existingReviewCommentUpdatedAt ?? null,
+    complete_activity_identity: reviewHasCompleteActivityIdentity,
+    review_comment_only: reviewCommentOnlyUpdate,
+    label_sync_only: labelSyncOnlyUpdate,
+    owned_issue_lease_only: ownedIssueReviewLeaseOnlyUpdate,
+    command_status_only: commandStatusOnlyUpdate,
+    owned_comment_write_at_item_updated_at:
+      itemUpdatedAtMs !== null && ownedCommentWriteTimes.includes(itemUpdatedAtMs),
+    owned_comment_write_count: ownedCommentWriteTimes.length,
+    review_lease_comment_present: comments.some(
+      (comment) => commentId(comment) === reportReviewLeaseCommentId,
+    ),
+    durable_comment_records_generation: durableCommentRecordsReviewGeneration(),
+    owned_receipt_failure: ownedReceiptFailure,
+    automation_only_update: automationOnlyUpdate,
+  });
+
   return {
     automationOnlyUpdate,
+    driftDiagnostics,
     labelSyncFreshEnough,
     reviewedSourceFresh,
     retryCloseCoverageCommandStatusOnlyUpdate,

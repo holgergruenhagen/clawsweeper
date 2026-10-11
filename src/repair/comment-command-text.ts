@@ -1,3 +1,5 @@
+import { commandAckMarker } from "./markers.ts";
+
 export type ClawSweeperCommandTrigger = "slash" | "mention";
 
 export type ClawSweeperCommandLine = {
@@ -10,9 +12,9 @@ export type ClawSweeperCommandLine = {
 const MENTION_COMMAND_PATTERN =
   /^\s*@(?:clawsweeper|openclaw-clawsweeper)(?:\[bot\])?(?:(?:\s*[:,]\s*|\s+)(.+))?\s*$/i;
 const RE_REVIEW_COMMAND_PATTERN =
-  /^(?:review(?:\s+again)?|re-?review|rereview|re-?run(?:\s+review)?|rerun(?:\s+review)?|run\s+(?:review|again))\b[:\s-]+\S/i;
+  /^(?:review(?:\s+again)?|re[-_]?review|rereview|re-?run(?:\s+review)?|rerun(?:\s+review)?|run\s+(?:review|again))\b[:\s-]+\S/i;
 const RE_REVIEW_PROMPT_PREFIX_PATTERN =
-  /^(?:review(?:\s+again)?|re-?review|rereview|re-?run(?:\s+review)?|rerun(?:\s+review)?|run\s+(?:review|again))\b[:\s-]*/i;
+  /^(?:review(?:\s+again)?|re[-_]?review|rereview|re-?run(?:\s+review)?|rerun(?:\s+review)?|run\s+(?:review|again))\b[:\s-]*/i;
 
 export function extractClawSweeperCommandLine(body: unknown): ClawSweeperCommandLine | null {
   const lines = String(body ?? "").split(/\r?\n/);
@@ -59,6 +61,7 @@ export function isClawSweeperReReviewCommandText(commandText: unknown) {
   return (
     command === "review" ||
     command === "re-review" ||
+    command === "re_review" ||
     command === "rereview" ||
     command === "review again" ||
     command === "rerun" ||
@@ -112,9 +115,6 @@ export function directReReviewAdditionalPrompt(options: {
   ].join("\n");
 }
 
-export const clawSweeperCommandAckMarker = (sourceCommentId: number) =>
-  `<!-- clawsweeper-command-ack:${sourceCommentId} -->`;
-
 export function renderClawSweeperQueuedAcknowledgement(
   sourceCommentId: number,
   statusMarker?: string,
@@ -127,7 +127,7 @@ export function renderClawSweeperQueuedAcknowledgement(
         "",
         "Command router queued. I will update this comment with the next step.",
       ];
-  return [clawSweeperCommandAckMarker(sourceCommentId), ...detail].join("\n");
+  return [commandAckMarker(sourceCommentId), ...detail].join("\n");
 }
 
 function commandLine(

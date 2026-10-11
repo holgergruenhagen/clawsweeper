@@ -12,7 +12,6 @@ import {
   exactReviewPublicationCapacityForState,
   exactReviewQueueAdmittedItems,
   exactReviewQueueCapacity,
-  summarizeAutomergeReliability,
   commandAcknowledgementState,
   EXACT_REVIEW_ACKNOWLEDGEMENT_ATTEMPT_LEASE_MS,
   ExactReviewLifecycleProjectionStore,
@@ -31,9 +30,6 @@ import {
   unclaimedExactReviewQueueItem,
   type ExactReviewQueueItem,
 } from "./dashboard-worker-harness.ts";
-import { reviewCommandProofBinding } from "../dist/clawsweeper-review-command-workflow.js";
-import { skipAutomaticEndorReview } from "../dist/repair/endor-automerge-intake.js";
-import { COMMAND_PROOF_SOURCE_ACTION } from "../src/command-proof-contract.ts";
 
 function credentialRecoveryJitterMs(key: string) {
   let hash = 2166136261;
@@ -84,14 +80,13 @@ test("live activity is bounded, redacted, expiring, and separate from lifecycle 
       diagnostics: { errors: [] },
       workers: [
         {
-          work_kind: "pr_repair",
           mode: "repair",
           status: "in_progress",
           run_id: "private-run-marker",
           repository: "private-owner/private-project",
           current_step: "private step marker",
         },
-        { work_kind: "other", mode: "exact-review", status: "queued" },
+        { mode: "exact-review", status: "queued" },
       ],
       bay: { active_census_complete: true },
       control_plane: {
@@ -128,7 +123,6 @@ test("live activity is bounded, redacted, expiring, and separate from lifecycle 
       generated_at: new Date(now).toISOString(),
       diagnostics: { errors: [] },
       workers: Array.from({ length: LIVE_ACTIVITY_SOURCE_LIMIT }, () => ({
-        work_kind: "other",
         mode: "exact-review",
         status: "in_progress",
       })),
@@ -202,7 +196,6 @@ test("live activity fails closed for stale, mixed, unavailable, and over-bound s
       {
         ...source,
         workers: Array.from({ length: LIVE_ACTIVITY_SOURCE_LIMIT }, () => ({
-          work_kind: "other",
           mode: "exact-review",
           status: "in_progress",
         })),
@@ -218,8 +211,7 @@ test("live activity fails closed for stale, mixed, unavailable, and over-bound s
         ...source,
         workers: [
           {
-            work_kind: { nested_private_marker: "must-not-surface" },
-            mode: "exact-review",
+            mode: { nested_private_marker: "must-not-surface" },
             status: "in_progress",
           },
         ],
@@ -248,8 +240,7 @@ test("live activity fails closed for stale, mixed, unavailable, and over-bound s
           ...source,
           workers: [
             {
-              work_kind: { nested_private_marker: "must-not-surface" },
-              mode: "exact-review",
+              mode: { nested_private_marker: "must-not-surface" },
               status: "in_progress",
             },
           ],
@@ -930,26 +921,33 @@ test("lifecycle telemetry counts durable terminal coverage without treating ackn
     observedAt: admittedAt - 7 * 24 * 60 * 60 * 1_000 - 1,
   });
 
-  const summary = telemetry.summary(admittedAt + 10_000);
-  assert.equal(summary.terminalCoverage.acknowledgementPendingRecords, 1);
-  assert.equal(summary.terminalCoverage.unknownTerminalRecords, 5);
-  assert.equal(summary.terminalCoverage.nonCurrentRecords, 2);
-  assert.equal(summary.terminalCoverage.terminalClasses.review_completed_routed, 3);
-  assert.equal(summary.terminalCoverage.terminalClasses.superseded, 2);
-  assert.equal(summary.publication.direct.accepted, 1);
-  assert.equal(summary.publication.direct.superseded, 1);
-  assert.equal(summary.publication.direct.fallback, 0);
-  assert.equal(summary.publication.direct.unknown, 2);
-  assert.deepEqual(summary.publication.batch, {
-    accepted: 1,
-    deduped: 1,
-    superseded: 1,
-    retryable: 1,
-    permanent: 1,
-  });
-  assert.equal(summary.publication.lifecycleRetries, 1);
-  assert.equal(summary.publication.lastSuccessfulCanonicalAcceptanceAt, admittedAt + 816);
-  assert.equal(JSON.stringify(summary).includes("openclaw/openclaw"), false);
+  const pending = lifecycle.read(
+    acknowledgementPending.canonicalTargetKey,
+    acknowledgementPending.fenceKey,
+    acknowledgementPending.revision,
+  )!;
+  assert.equal(commandAcknowledgementState(pending), "pending");
+  assert.equal(pending.terminalDisposition?.kind, "review_completed_routed");
+  assert.equal(pending.claims.length, 2);
+  const cutoff = admittedAt + 10_000 - 7 * 24 * 60 * 60 * 1_000;
+  assert.deepEqual(
+    Array.from(
+      storage.sql.exec(
+        "SELECT outcome FROM exact_review_lifecycle_telemetry_direct_v1 WHERE observed_at >= ? ORDER BY outcome",
+        cutoff,
+      ),
+    ).map((row) => row.outcome),
+    ["accepted", "superseded"],
+  );
+  assert.deepEqual(
+    Array.from(
+      storage.sql.exec(
+        "SELECT outcome FROM exact_review_lifecycle_telemetry_batch_v1 WHERE observed_at >= ? ORDER BY outcome",
+        cutoff,
+      ),
+    ).map((row) => row.outcome),
+    ["permanent", "retryable"],
+  );
 });
 
 test("full review admission does not inflate staged publication capacity", () => {
@@ -1652,58 +1650,6 @@ test("exact-review supersession audit migration keeps existing rows non-authorit
   );
   assert.equal(completion.status, 409);
   assert.deepEqual(await completion.json(), { error: "lease_not_claimed" });
-});
-
-test("automerge reliability summarizes failures, recovery, duration, and stalled runs", () => {
-  const run = (
-    id: number,
-    number: number,
-    status: string,
-    conclusion: string | null,
-    createdAt: string,
-    updatedAt: string,
-  ) => ({
-    id,
-    display_title: `automerge repair jobs/openclaw/inbox/automerge-openclaw-openclaw-${number}.md`,
-    status,
-    conclusion,
-    html_url: `https://github.com/openclaw/clawsweeper/actions/runs/${id}`,
-    created_at: createdAt,
-    updated_at: updatedAt,
-  });
-  const summary = summarizeAutomergeReliability(
-    [
-      run(1, 107691, "completed", "failure", "2026-07-16T09:00:00Z", "2026-07-16T09:20:00Z"),
-      run(2, 107691, "completed", "success", "2026-07-16T09:30:00Z", "2026-07-16T09:40:00Z"),
-      run(3, 107692, "completed", "failure", "2026-07-16T10:00:00Z", "2026-07-16T10:20:00Z"),
-      run(6, 107692, "completed", "failure", "2026-07-16T08:00:00Z", "2026-07-16T08:05:00Z"),
-      run(4, 107693, "in_progress", null, "2026-07-16T09:30:00Z", "2026-07-16T09:30:00Z"),
-      {
-        ...run(5, 107694, "completed", "failure", "2026-07-16T11:00:00Z", "2026-07-16T11:05:00Z"),
-        display_title: "repair cluster jobs/openclaw/inbox/gitcrawl-55.md",
-      },
-    ],
-    ["openclaw/openclaw"],
-    "2026-07-16T12:00:00Z",
-  );
-
-  assert.equal(summary.sampled_runs, 5);
-  assert.equal(summary.completed_attempts, 4);
-  assert.equal(summary.failed_attempts, 3);
-  assert.equal(summary.failure_rate_percent, 75);
-  assert.equal(summary.average_duration_ms, 825_000);
-  assert.equal(summary.longest_duration_ms, 1_200_000);
-  assert.equal(summary.active_attempts, 1);
-  assert.equal(summary.stalled_attempts, 1);
-  assert.equal(summary.recovered_failures, 1);
-  assert.equal(summary.unresolved_failures, 1);
-  assert.deepEqual(
-    summary.failures.map((failure) => [failure.number, failure.status]),
-    [
-      [107692, "unresolved"],
-      [107691, "recovered"],
-    ],
-  );
 });
 
 test("exact-review publication scales bounded capacity with ready backlog", () => {
@@ -3251,233 +3197,6 @@ test("explicit pull request commands bind to pending source authority", async ()
     assert.equal(current.decision.commandStatusMarker, commandStatusMarker);
   } finally {
     Date.now = originalNow;
-  }
-});
-
-test("Endor repair reviews retain their owner when ordinary PR events supersede them", async () => {
-  const repo = "openclaw/endor-clawsweeper-e2e";
-  const head = "b".repeat(40);
-  const nextHead = "c".repeat(40);
-  const issue = {
-    pull_request: {},
-    user: { login: "endor-labs-pro[bot]", id: 179191674, type: "Bot" },
-    labels: [{ name: "clawsweeper:automerge" }],
-  };
-  const marker = `<!-- clawsweeper-command-status:42:automerge:${"a".repeat(40)} -->`;
-  for (const phase of ["pending", "dispatching", "leased"] as const) {
-    const storage = new MemoryDurableStorage();
-    const queue = new ExactReviewQueue({ storage }, {});
-    const key = `${repo}#42`;
-    const synchronize = (sequence: number, sourceHeadSha: string) =>
-      buildExactReviewQueueRequest(
-        `${phase}-push-${sequence}`,
-        42,
-        "synchronize",
-        "pull_request",
-        repo,
-        {
-          sourceHeadSha,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: sequence,
-        },
-      );
-    await queue.fetch(synchronize(2, head));
-    const repaired = await queue.fetch(
-      buildExactReviewQueueRequest(
-        `${phase}-repair-followup`,
-        42,
-        "branch_repaired",
-        "pull_request",
-        repo,
-        {
-          sourceEvent: "issues",
-          supersedesInProgress: true,
-          commandStatusMarker: marker,
-          statusCommentId: 9001,
-        },
-      ),
-    );
-    assert.equal(repaired.status, 202);
-    assert.equal((await repaired.json()).queued, true);
-    let state = await storage.get<{ items: Record<string, ExactReviewQueueItem> }>(
-      "exact-review-queue",
-    );
-    assert.ok(state);
-    let current = state.items[key];
-    assert.equal(current.decision.sourceAction, "branch_repaired");
-    assert.equal(current.decision.sourceHeadSha, head);
-    assert.equal(current.decision.sourceAuthoritySeq, 2);
-    assert.equal(current.decision.sourceHeadVerified, true);
-    assert.equal(current.decision.commandStatusMarker, marker);
-    assert.equal(current.decision.statusCommentId, 9001);
-    assert.equal(skipAutomaticEndorReview(repo, issue, current.decision), false);
-
-    const priorRevision = current.revision;
-    if (phase !== "pending") {
-      const active =
-        phase === "leased"
-          ? leasedExactReviewQueueItem(42, "4242")
-          : unclaimedExactReviewQueueItem(42);
-      current.state = phase;
-      current.leasePhase = "review";
-      current.leaseDecision = structuredClone(current.decision);
-      current.leaseId = active.leaseId;
-      current.leaseRevision = priorRevision;
-      current.leaseExpiresAt = active.leaseExpiresAt;
-      current.claimedRunId = active.claimedRunId;
-      current.claimedRunAttempt = active.claimedRunAttempt;
-      current.claimGeneration = active.claimGeneration;
-      current.claimProtocolVersion = active.claimProtocolVersion;
-      await storage.put("exact-review-queue", state);
-    }
-
-    const successorHead = phase === "pending" ? head : nextHead;
-    const superseding = await queue.fetch(synchronize(3, successorHead));
-    assert.equal(superseding.status, 202);
-    assert.equal((await superseding.json()).queued, true);
-    state = await storage.get<{ items: Record<string, ExactReviewQueueItem> }>(
-      "exact-review-queue",
-    );
-    assert.ok(state);
-    current = state.items[key];
-    assert.equal(current.state, "pending");
-    assert.equal(current.leaseId, undefined);
-    assert.equal(current.leaseDecision, undefined);
-    assert.equal(current.decision.sourceAction, "synchronize");
-    assert.equal(current.decision.sourceHeadSha, successorHead);
-    assert.equal(current.decision.sourceAuthoritySeq, 3);
-    assert.equal(current.decision.commandStatusMarker, marker);
-    assert.equal(current.decision.statusCommentId, 9001);
-    assert.equal(skipAutomaticEndorReview(repo, issue, current.decision), false);
-    const priorLifecycle = new ExactReviewLifecycleProjectionStore(storage).read(
-      key,
-      key,
-      priorRevision,
-    );
-    assert.ok(priorLifecycle);
-    assert.equal(priorLifecycle.terminalDisposition?.kind, "requeue");
-  }
-});
-
-test("active proof reviews retain command identity without retargeting proof context", async () => {
-  const repo = "openclaw/openclaw";
-  const itemNumber = 762;
-  const proofHead = "b".repeat(40);
-  const marker = `<!-- clawsweeper-command-status:${itemNumber}:request_proof:${"a".repeat(64)} -->`;
-  const proofPrompt =
-    "<!-- command-proof-assessment-v1 head=" +
-    proofHead +
-    " body=" +
-    "c".repeat(64) +
-    " base=" +
-    "d".repeat(64) +
-    " base_sha=" +
-    "e".repeat(40) +
-    " request=" +
-    "a".repeat(64) +
-    " scenario=web-ui-chat-proof -->\nVerified evidence context.";
-
-  for (const [name, successorHead] of [
-    ["same-head", proofHead],
-    ["new-head", "f".repeat(40)],
-  ] as const) {
-    const storage = new MemoryDurableStorage();
-    const queue = new ExactReviewQueue({ storage }, {});
-    const key = `${repo}#${itemNumber}`;
-    const leased = leasedExactReviewQueueItem(itemNumber, "7620");
-    const proofDecision: ExactReviewQueueItem["decision"] = {
-      ...leased.decision,
-      itemKind: "pull_request",
-      sourceEvent: "pull_request",
-      sourceAction: COMMAND_PROOF_SOURCE_ACTION,
-      sourceHeadSha: proofHead,
-      sourceCommentId: 7620,
-      sourceCommentUpdatedAt: "2026-09-23T01:00:00Z",
-      commandBodyDigest: "9".repeat(64),
-      commandOrigin: "comment_router",
-      sourceCommentVerified: true,
-      sourceDeliveryId: `command-proof-${name}`,
-      additionalPrompt: proofPrompt,
-      commandStatusMarker: marker,
-    };
-    const active = {
-      ...leased,
-      decision: proofDecision,
-      leaseDecision: structuredClone(proofDecision),
-      state: "leased" as const,
-      leasePhase: "review" as const,
-    } satisfies ExactReviewQueueItem;
-    const priorRevision = active.revision;
-    await storage.put("exact-review-queue", {
-      deliveries: {},
-      items: { [key]: active },
-    });
-
-    const successor = await queue.fetch(
-      buildExactReviewQueueRequest(
-        `active-proof-successor-${name}`,
-        itemNumber,
-        "synchronize",
-        "pull_request",
-        repo,
-        {
-          sourceHeadSha: successorHead,
-          sourceHeadVerified: true,
-          sourceAuthoritySeq: 1,
-        },
-      ),
-    );
-    assert.equal(successor.status, 202);
-    assert.equal((await successor.json()).queued, true);
-
-    const state = await storage.get<{ items: Record<string, ExactReviewQueueItem> }>(
-      "exact-review-queue",
-    );
-    assert.ok(state);
-    const pending = state.items[key];
-    assert.equal(pending.state, "pending");
-    assert.equal(pending.leaseId, undefined);
-    assert.equal(pending.leaseDecision, undefined);
-    assert.equal(pending.decision.sourceAction, "synchronize");
-    assert.equal(pending.decision.sourceHeadSha, successorHead);
-    assert.equal(pending.decision.sourceAuthoritySeq, 1);
-    assert.equal(pending.decision.commandStatusMarker, marker);
-    assert.equal(pending.decision.sourceCommentId, 7620);
-    assert.equal(pending.decision.sourceDeliveryId, `command-proof-${name}`);
-    assert.equal(pending.decision.additionalPrompt, undefined);
-    assert.equal(
-      reviewCommandProofBinding(
-        pending.decision.sourceAction,
-        pending.decision.additionalPrompt ?? "",
-      ),
-      null,
-    );
-    const staleCompletion = await queue.fetch(
-      new Request("https://clawsweeper-exact-review-queue/complete", {
-        method: "POST",
-        body: JSON.stringify({
-          lease_id: active.leaseId,
-          item_key: key,
-          lease_revision: priorRevision,
-          claim_generation: active.claimGeneration,
-          run_id: active.claimedRunId,
-          run_attempt: active.claimedRunAttempt,
-          outcome: "success",
-        }),
-      }),
-    );
-    assert.equal(staleCompletion.status, 409);
-    assert.deepEqual(await staleCompletion.json(), {
-      error: "lease_superseded",
-      superseded_by_revision: pending.revision,
-    });
-    const priorLifecycle = new ExactReviewLifecycleProjectionStore(storage).read(
-      key,
-      key,
-      priorRevision,
-    );
-    assert.ok(priorLifecycle);
-    assert.equal(priorLifecycle.terminalDisposition?.kind, "requeue");
   }
 });
 

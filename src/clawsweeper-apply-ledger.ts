@@ -1,3 +1,4 @@
+import { sha256 } from "./content-hash.js";
 import {
   ACTION_EVENT_REASON_CODES,
   ACTION_EVENT_STATUSES,
@@ -7,7 +8,11 @@ import {
   type ActionEventStatus,
   type ActionEventSubject,
 } from "./action-ledger.js";
-import { recordWorkflowPhaseEvent } from "./action-ledger-runtime.js";
+import {
+  finishWorkflowMutationAttempt,
+  recordWorkflowPhaseEvent,
+  startWorkflowMutationAttempt,
+} from "./action-ledger-runtime.js";
 import type { createReviewActionLedger } from "./clawsweeper-review-ledger.js";
 import type {
   ActionTaken,
@@ -20,18 +25,15 @@ import type {
   ApplyPhaseCursor,
   ApplyResult,
   CloseReason,
-  ItemKind,
   ReportEntry,
 } from "./clawsweeper-types.js";
+import { frontMatterValue } from "./report-front-matter.js";
+import { reportItemKind, reviewLeaseRevisionFromReport } from "./clawsweeper-record-metadata.js";
 
 interface ApplyActionLedgerDependencies {
   root: string;
   targetRepo: () => string;
   repoRelativePath: (filePath: string) => string;
-  sha256: (value: string) => string;
-  frontMatterValue: (markdown: string, key: string) => string | undefined;
-  reviewLeaseRevisionFromReport: (markdown: string) => string | null;
-  reportItemKind: (markdown: string) => ItemKind | undefined;
   reviewLedger: ReturnType<typeof createReviewActionLedger>;
 }
 
@@ -39,10 +41,6 @@ export function createApplyActionLedger({
   root,
   targetRepo,
   repoRelativePath,
-  sha256,
-  frontMatterValue,
-  reviewLeaseRevisionFromReport,
-  reportItemKind,
   reviewLedger,
 }: ApplyActionLedgerDependencies) {
   const {
@@ -57,11 +55,6 @@ export function createApplyActionLedger({
     const phaseSeq = cursor.nextPhaseSeq;
     cursor.nextPhaseSeq += 1;
     return phaseSeq;
-  }
-
-  function applyPhaseSequenceForTest(count: number): number[] {
-    const cursor: ApplyPhaseCursor = { nextPhaseSeq: 2 };
-    return Array.from({ length: Math.max(0, count) }, () => nextApplyPhaseSeq(cursor));
   }
 
   function startApplyActionLedger(options: {
@@ -151,7 +144,7 @@ export function createApplyActionLedger({
     };
   }
 
-  function applyItemBusinessIdempotencyIdentityForTest(options: {
+  function applyItemBusinessIdempotencyIdentity(options: {
     slot: "apply_item" | "apply_mutation" | "review_comment";
     repository: string;
     number: number;
@@ -174,13 +167,13 @@ export function createApplyActionLedger({
     state: ApplyLedgerItem,
     slot: "apply_item" | "apply_mutation" | "review_comment",
   ): ApplyItemBusinessIdempotencyIdentity {
-    return applyItemBusinessIdempotencyIdentityForTest({
+    return applyItemBusinessIdempotencyIdentity({
       ...state.businessIdentity,
       slot,
     });
   }
 
-  function applyMutationBusinessIdempotencyIdentityForTest(options: {
+  function applyMutationBusinessIdempotencyIdentity(options: {
     repository: string;
     number: number;
     sourceRevision: string;
@@ -189,7 +182,7 @@ export function createApplyActionLedger({
     mutationIdentity: string;
   }): ApplyMutationBusinessIdempotencyIdentity {
     return {
-      ...applyItemBusinessIdempotencyIdentityForTest({
+      ...applyItemBusinessIdempotencyIdentity({
         ...options,
         slot: "apply_mutation",
       }),
@@ -269,53 +262,21 @@ export function createApplyActionLedger({
   ): ApplyMutationAttempt | null {
     const state = startApplyActionLedgerItem(ledger, entry);
     if (!state) return null;
-    const mutationIndex = state.mutationAttemptCount;
-    state.mutationAttemptCount += 1;
-    const businessIdempotencyIdentity = applyMutationBusinessIdempotencyIdentityForTest({
-      ...state.businessIdentity,
-      mutationIdentity: idempotencyIdentity,
-    });
-    const receiptIdentitySha256 = sha256(receiptIdentity);
-    const phaseSeq = nextApplyPhaseSeq(ledger);
-    const attempt = recordWorkflowPhaseEvent(root, {
+    return startWorkflowMutationAttempt(root, state, receiptIdentity, {
       phase: ACTION_EVENT_TYPES.applyAction,
-      status: ACTION_EVENT_STATUSES.started,
-      reasonCode: ACTION_EVENT_REASON_CODES.selected,
-      retryable: true,
-      mutation: false,
-      identity: {
-        slot: "apply_mutation_attempt",
-        index: state.index,
-        mutationIndex,
-        receiptIdentitySha256,
-        repository: entry.repo,
-        number: entry.number,
-      },
+      slot: "apply_mutation_attempt",
       operation: "apply",
       operationIdentity: ledger.operationIdentity,
-      parentEventId: state.lastEventId ?? state.startEventId,
-      phaseSeq,
-      idempotencyIdentity: businessIdempotencyIdentity,
+      phaseSeq: nextApplyPhaseSeq(ledger),
+      idempotencyIdentity: applyMutationBusinessIdempotencyIdentity({
+        ...state.businessIdentity,
+        mutationIdentity: idempotencyIdentity,
+      }),
       component: "apply_decisions",
       subject: applyLedgerItemSubject(state),
       evidence: workflowRunEvidence(),
-      attributes: {
-        batch_index: state.index,
-        attempt: mutationIndex + 1,
-        action_count: 1,
-        partial: true,
-        completion_reason: "mutation_attempted",
-      },
       privacy: actionLedgerPrivacy(),
     });
-    state.lastEventId = attempt?.event_id ?? state.lastEventId;
-    return {
-      state,
-      eventId: attempt?.event_id ?? null,
-      idempotencyIdentity: businessIdempotencyIdentity,
-      mutationIndex,
-      receiptIdentitySha256,
-    };
   }
 
   function finishApplyMutationAttempt(options: {
@@ -324,63 +285,21 @@ export function createApplyActionLedger({
     attempt: ApplyMutationAttempt;
     outcome: "accepted" | "rejected" | "unknown";
   }): string | null {
-    const mutation = options.outcome !== "rejected";
-    const phaseSeq = nextApplyPhaseSeq(options.ledger);
-    const event = recordWorkflowPhaseEvent(root, {
+    const eventId = finishWorkflowMutationAttempt(root, options.attempt, options.outcome, {
       phase: ACTION_EVENT_TYPES.applyAction,
-      status:
-        options.outcome === "accepted"
-          ? ACTION_EVENT_STATUSES.executed
-          : options.outcome === "rejected"
-            ? ACTION_EVENT_STATUSES.skipped
-            : ACTION_EVENT_STATUSES.failed,
-      reasonCode:
-        options.outcome === "accepted"
-          ? ACTION_EVENT_REASON_CODES.completed
-          : options.outcome === "rejected"
-            ? ACTION_EVENT_REASON_CODES.notApplicable
-            : ACTION_EVENT_REASON_CODES.unavailable,
-      retryable: options.outcome === "unknown",
-      mutation,
-      identity: {
-        slot: "apply_mutation_outcome",
-        index: options.attempt.state.index,
-        mutationIndex: options.attempt.mutationIndex,
-        receiptIdentitySha256: options.attempt.receiptIdentitySha256,
-        outcome: options.outcome,
-        repository: options.entry.repo,
-        number: options.entry.number,
-      },
+      slot: "apply_mutation_outcome",
       operation: "apply",
       operationIdentity: options.ledger.operationIdentity,
-      parentEventId: options.attempt.eventId,
-      phaseSeq,
-      idempotencyIdentity: options.attempt.idempotencyIdentity,
+      phaseSeq: nextApplyPhaseSeq(options.ledger),
       component: "apply_decisions",
       subject: applyLedgerItemSubject(options.attempt.state),
       evidence: workflowRunEvidence(),
-      attributes: {
-        batch_index: options.attempt.state.index,
-        attempt: options.attempt.mutationIndex + 1,
-        action_count: mutation ? 1 : 0,
-        partial: options.outcome === "unknown",
-        completion_reason:
-          options.outcome === "accepted"
-            ? "mutation_accepted"
-            : options.outcome === "rejected"
-              ? "mutation_rejected"
-              : "mutation_outcome_unknown",
-      },
       privacy: actionLedgerPrivacy(),
     });
-    options.attempt.state.lastEventId = event?.event_id ?? options.attempt.state.lastEventId;
-    if (mutation) {
-      options.attempt.state.mutationEventId = event?.event_id ?? options.attempt.eventId;
+    if (options.outcome !== "rejected") {
+      options.attempt.state.mutationEventId = eventId ?? options.attempt.eventId;
     }
-    if (options.outcome === "unknown") {
-      options.attempt.state.uncertainMutationObserved = true;
-    }
-    return event?.event_id ?? null;
+    return eventId;
   }
 
   function recordApplyMutationBoundary(
@@ -990,9 +909,6 @@ export function createApplyActionLedger({
 
   return {
     applyActionEventDisposition,
-    applyItemBusinessIdempotencyIdentityForTest,
-    applyMutationBusinessIdempotencyIdentityForTest,
-    applyPhaseSequenceForTest,
     applyRuntimeBudgetYieldResults,
     applyRuntimeBudgetYieldResultsForTest,
     finishApplyMutationAttempt,

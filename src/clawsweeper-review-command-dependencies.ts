@@ -13,6 +13,7 @@ import type {
   ExistingReview,
   ExpectedIssueSourceRevisionOptions,
   FileModeSnapshot,
+  GitHubDeadlineOptions,
   GitInfo,
   Item,
   ItemContext,
@@ -20,7 +21,6 @@ import type {
   PreviousClawSweeperReview,
   ReviewActionLedger,
   ReviewCheckout,
-  ReviewFinding,
   ReviewGitInfoOptions,
   ReviewPromptBuild,
   ReviewPromptRuntimeHints,
@@ -29,13 +29,14 @@ import type {
 } from "./clawsweeper-types.js";
 import type { UserFacingCommandError } from "./command.js";
 import type { CodexProcessResult } from "./codex-process.js";
+import type { CodexFailureLogKind } from "./clawsweeper-review-runtime.js";
 import type { RepositoryProfile } from "./repository-profiles.js";
 import type { ReviewStructuralPullState } from "./review-structural-cache.js";
 import type { ReviewStructuralRecord } from "./review-structural-cache.js";
 import type { PrHydrationSnapshot } from "./pr-hydration-snapshot.js";
 
 export interface CreateReviewCommandWorkflowDependencies {
-  reviewEnvironment: (preserveCodexAuth?: boolean) => NodeJS.ProcessEnv;
+  reviewEnvironment: (sandboxMode: string, preserveCodexAuth?: boolean) => NodeJS.ProcessEnv;
   actionLedgerFailureDisposition: (error: unknown) => {
     status: ActionEventStatus;
     reasonCode: ActionEventReasonCode;
@@ -43,7 +44,6 @@ export interface CreateReviewCommandWorkflowDependencies {
   };
   actionLedgerItemKey: (item: Pick<Item, "repo" | "number">) => string;
   activeReviewMutationRunner: MutationRunner | null;
-  asRecord: (value: unknown) => Record<string, unknown>;
   attachFixedPullRequest: (
     decision: Decision,
     item: Item,
@@ -57,7 +57,11 @@ export interface CreateReviewCommandWorkflowDependencies {
     checkoutDir: string,
     git: GitInfo,
   ) => Decision;
-  authorIssueCountInBulkFilerWindow: (author: string, windowStart: string) => number;
+  authorIssueCountInBulkFilerWindow: (
+    author: string,
+    windowStart: string,
+    windowEnd: string,
+  ) => number;
   buildLocalRangeReview: (
     targetDir: string,
     repo: string,
@@ -73,46 +77,15 @@ export interface CreateReviewCommandWorkflowDependencies {
   bulkFilerPolicyInvalidatesCachedReview: (
     markdown: string | null,
     exemptionApplied: boolean,
+    belowThreshold?: boolean,
   ) => boolean;
   bulkFilerRepositoryPermission: (
     author: string,
     cache: BulkFilerRepositoryPermissionCache,
   ) => string | null;
-  codexFailureDecision: (
-    status: number | null,
-    detail: string,
-    stdout?: string,
-    stderr?: string,
-    processResult?: {
-      errorCode?: string | null;
-      signal?: NodeJS.Signals | null;
-      diagnostic?: string;
-      retryHint?: string;
-    },
-  ) => Decision;
-  codexFailureLogKind: (markdown: string) => string;
-  CodexReviewError: new (options: {
-    message: string;
-    status: number | null;
-    stdout?: string;
-    stderr?: string;
-    errorCode?: string | null;
-    signal?: NodeJS.Signals | null;
-    retryable?: boolean;
-    diagnostic?: string;
-    retryHint?: string;
-  }) => Error & {
-    readonly status: number | null;
-    readonly stdout: string;
-    readonly stderr: string;
-    readonly errorCode: string | null;
-    readonly signal: NodeJS.Signals | null;
-    readonly retryable: boolean;
-    readonly diagnostic: string;
-    readonly retryHint?: string;
-  };
+  codexReviewFailure: (error: unknown) => { decision: Decision; logKind: CodexFailureLogKind };
   codexReviewFailureRetryable: (error: unknown) => boolean;
-  ghJson: <T>(args: string[]) => T;
+  ghJson: <T>(args: string[], options?: GitHubDeadlineOptions) => T;
   collectItemContext: (
     item: Item,
     options?: {
@@ -200,7 +173,6 @@ export interface CreateReviewCommandWorkflowDependencies {
     owner: string | null;
     commentId: number | null;
   }>;
-  frontMatterValue: (markdown: string, key: string) => string | undefined;
   gitInfo: (openclawDir: string, options?: ReviewGitInfoOptions) => GitInfo;
   isBulkFilerExemptAuthorAssociation: (value: unknown) => boolean;
   isBulkFilerExemptRepositoryPermission: (value: unknown) => boolean;
@@ -284,7 +256,6 @@ export interface CreateReviewCommandWorkflowDependencies {
     retryable?: boolean;
   }) => ActionEvent | null;
   removePullRequestReviewTree: (options: { targetDir: string; worktreeDir: string }) => boolean;
-  replaceFrontMatterValue: (markdown: string, key: string, value: string) => string;
   renderReviewCommentFromReport: (
     markdown: string,
     reason: "none",
@@ -292,7 +263,6 @@ export interface CreateReviewCommandWorkflowDependencies {
   ) => string;
   repoFromArgs: (args: Args) => RepositoryProfile;
   reportFileName: (repo: string, number: number) => string;
-  reportReviewFindings: (markdown: string) => ReviewFinding[];
   resolveReviewCheckout: (options: {
     args: Args;
     artifactDir: string;
@@ -372,7 +342,6 @@ export interface CreateReviewCommandWorkflowDependencies {
     batchSize: number;
   }) => ReviewActionLedger;
   startReviewActionLedgerItem: (ledger: ReviewActionLedger, item: Item) => ActionEvent | null;
-  stringOrUndefined: (value: unknown) => string | undefined;
   suppliedReviewStartLeaseFromArgs: (
     args: Args,
   ) => Pick<AcquiredReviewStartLease, "owner" | "commentId"> | null;

@@ -10,6 +10,7 @@ import {
 } from "./codex-process.js";
 import { runOpenclawProcess } from "./openclaw-process.js";
 import { AgentInputScanError, scanAgentInput, type AgentScanSource } from "./agent-input-scan.js";
+import type { DecisionRepairOptions } from "./review-decision-repair.js";
 
 export type AgentRunner = "codex" | "openclaw";
 
@@ -31,6 +32,8 @@ export interface RunAgentProcessOptions {
   stderrPath?: string;
   appServer?: CodexAppServerProcessOptions;
   codexExtraArgs?: readonly string[];
+  // Codex only: one repair turn on the same thread when the final decision fails validation.
+  decisionRepair?: DecisionRepairOptions;
 }
 
 export function agentRunner(env: NodeJS.ProcessEnv = process.env): AgentRunner {
@@ -84,8 +87,14 @@ export function runAgentProcess(options: RunAgentProcessOptions): CodexProcessRe
     timeoutMs: options.timeoutMs,
     ...(schemaPath ? { schemaPath } : {}),
   });
+  // OpenClaw has no structured-output option, so it reads the same schema file that Codex
+  // receives through --output-schema as a prompt section.
+  const prompt =
+    runner === "openclaw" && schemaPath
+      ? `${options.prompt.trimEnd()}\n\n## Output schema\n\nReturn one JSON object that matches this JSON Schema. The field descriptions are part of the review contract.\n\n\`\`\`json\n${readFileSync(schemaPath, "utf8").trim()}\n\`\`\`\n`
+      : options.prompt;
   if (options.diagnosticPromptPath) {
-    writeFileSync(options.diagnosticPromptPath, options.prompt, { mode: 0o600, flag: "wx" });
+    writeFileSync(options.diagnosticPromptPath, prompt, { mode: 0o600, flag: "wx" });
   }
   options = { ...options, timeoutMs: options.timeoutMs - (Date.now() - startedAt) };
   if (options.timeoutMs <= 0) {
@@ -114,13 +123,14 @@ export function runAgentProcess(options: RunAgentProcessOptions): CodexProcessRe
       ...(options.stdoutPath ? { stdoutPath: options.stdoutPath } : {}),
       ...(options.stderrPath ? { stderrPath: options.stderrPath } : {}),
       ...(options.appServer ? { appServer: options.appServer } : {}),
+      ...(options.decisionRepair ? { decisionRepair: options.decisionRepair } : {}),
     });
   }
 
   const model = openclawModel(options.env);
   const rawResult = runOpenclawProcess({
     label: options.label,
-    prompt: options.prompt,
+    prompt,
     model,
     ...(options.reasoningEffort?.trim() ? { reasoningEffort: options.reasoningEffort.trim() } : {}),
     cwd: options.cwd,

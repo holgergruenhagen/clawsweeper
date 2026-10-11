@@ -1,10 +1,6 @@
-import { createHash } from "node:crypto";
 import { parseDecision } from "../dist/clawsweeper.js";
-import { createReportDocumentRendering } from "../dist/clawsweeper-report-document.js";
-import { createReportContextRendering } from "../dist/clawsweeper-report-context.js";
-import { createDashboardPresentation } from "../dist/clawsweeper-dashboard.js";
-import { createRepositoryLinks } from "../dist/clawsweeper-links.js";
-import { normalizeRepo, repositoryProfileFor } from "../dist/repository-profiles.js";
+import * as document from "../dist/clawsweeper-report-document.js";
+import { verifyLikelyOwnerHistory } from "../dist/clawsweeper-regression-provenance.js";
 import type { DataModelCompatibility } from "../src/clawsweeper-types.ts";
 import { closeDecision, item, reviewReportFrontMatter } from "./helpers.ts";
 
@@ -33,8 +29,6 @@ export function compatibilityReport({
     work_candidate: "none",
     pull_head_sha: "a".repeat(40),
     labels: JSON.stringify(["clawsweeper:automerge"]),
-    data_model_change: "true",
-    data_model_surfaces: '["database schema: src/db/schema.sql"]',
     real_behavior_proof_status: "sufficient",
     real_behavior_proof_evidence_kind: "terminal",
     real_behavior_proof_needs_contributor_action: "false",
@@ -76,32 +70,11 @@ Full review comments:
 `;
 }
 
-// Use the real decision parser and report writer; only surrounding context/formatting is synthetic.
+// Use the real model parser, host owner projection and report writer; surrounding context is synthetic.
 export function generatedCompatibilityReport(
   compatibility: DataModelCompatibility,
   decisionOverrides: Record<string, unknown> = {},
 ): string {
-  const document = createReportDocumentRendering({
-    ...createRepositoryLinks({
-      reportRepo: "openclaw/clawsweeper-state",
-      normalizeRepo,
-      targetRepo: () => "openclaw/openclaw",
-      targetProfile: () => repositoryProfileFor("openclaw/openclaw"),
-    }),
-    ...createReportContextRendering({} as never),
-    ...createDashboardPresentation({} as never),
-    prSurfaceFilesFromContext: () => [{ path: "src/db/schema.sql", additions: 1, deletions: 0 }],
-    compactPullFilePaths: (file) => [file.filename],
-    confidenceText: String,
-    fixedInText: () => "unknown",
-    formatTimestamp: String,
-    labelJustificationsMarkdown: () => "- none",
-    publicLikelyOwnerRole: String,
-    pullHeadShaFromContext: () => "a".repeat(40),
-    reviewStructuralPullStateFromContext: () => null,
-    sentence: String,
-    sha256: (value: string) => createHash("sha256").update(value).digest("hex"),
-  } as Parameters<typeof createReportDocumentRendering>[0]);
   const decision = parseDecision(
     closeDecision({
       decision: "keep_open",
@@ -147,11 +120,18 @@ export function generatedCompatibilityReport(
       labels: ["clawsweeper:automerge"],
       authorAssociation: "MEMBER",
     }),
-    decision: { ...decision, localCheckoutAccess: "verified" },
+    decision: {
+      ...verifyLikelyOwnerHistory(decision, {
+        checkoutDir: process.cwd(),
+        reviewedCommitShas: [],
+      }),
+      localCheckoutAccess: "verified",
+    },
     context: {
       issue: {},
       comments: [],
       timeline: [],
+      pullRequest: { head: { sha: "a".repeat(40) } },
       sourceRevision: "b".repeat(64),
       pullFiles: [
         {

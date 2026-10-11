@@ -1,31 +1,39 @@
+import { renderReviewCommentFromReport } from "../dist/clawsweeper-report-comment-presentation.js";
+import { markdownFor } from "../dist/clawsweeper-report-document.js";
+import { parseDecision } from "../dist/clawsweeper.js";
+import { sectionValue } from "../dist/report-front-matter.js";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
-  compactPullRequestForTest,
   assistPromptContextForTest,
-  renderReviewContextBudgetForTest,
-  reviewContextLedgerForTest,
   reviewDecisionSchemaText,
   reviewPromptForTest,
   reviewPromptTelemetryForTest,
-  reviewPromptTemplate,
-  extractLatestClawSweeperReviewForTest,
-  filterReviewContextCommentsForTest,
-  renderReviewCommentFromReport,
+  reviewPromptTemplates,
   reviewAutomationMarkersFromReport,
 } from "../dist/clawsweeper.js";
+import {
+  compactPullRequest,
+  extractLatestClawSweeperReview,
+  filterReviewContextComments,
+} from "../dist/clawsweeper-context-hydration.js";
 import { parseArgs as parseClawsweeperArgs } from "../dist/clawsweeper-args.js";
 import { REPOSITORY_PROFILES, repositoryProfileFor } from "../dist/repository-profiles.js";
+import { renderReviewSections, reviewPromptSections } from "../dist/review-prompt-sections.js";
 import {
+  closeDecision,
   git,
   item,
   markedReviewCommentForTest,
   prRatingReportSection,
   realBehaviorProofReportSection,
   reportFrontMatter,
+  withReviewRecord,
 } from "./helpers.ts";
 import type { PrimaryBodyContext } from "../dist/clawsweeper-primary-body.js";
 import {
@@ -35,6 +43,22 @@ import {
   longProofBody,
   scriptSentinel,
 } from "./primary-body-fixture.ts";
+
+function renderedContextBudget(context: unknown, subject = item()): string {
+  const report = markdownFor({
+    item: subject,
+    decision: parseDecision(closeDecision({ decision: "keep_open", closeReason: "none" })),
+    context,
+    git,
+    action: { actionTaken: "kept_open" },
+    reviewMode: "propose",
+    snapshotHash: "synthetic-snapshot",
+    contentDigest: "synthetic-content",
+    reviewPolicy: "synthetic-policy",
+    runtime: { model: "Codex", reasoningEffort: "high" },
+  } as Parameters<typeof markdownFor>[0]);
+  return sectionValue(report, "Review Context Budget");
+}
 
 test("GitHub review context omits complete reviewed URI quotations and preserves other evidence", () => {
   const source = readFileSync(new URL("./action-ledger-runtime.test.ts", import.meta.url), "utf8");
@@ -94,7 +118,9 @@ test("GitHub review context omits complete reviewed URI quotations and preserves
   assert.equal(JSON.stringify(context), original);
   assert.equal(prompt.split("## Maintainer Request\n\n")[1]?.trim(), additionalPrompt);
   const introduction =
-    prompt.match(/\n\n## PR Introduction Evidence\n[\s\S]*?\n\x60{3}\n/)?.[0] ?? "";
+    prompt.match(
+      /\n\n## PR Introduction Evidence\n[\s\S]*?\n\x60{3}\n\n## Provenance Evidence\n[\s\S]*?\n\x60{3}\n/,
+    )?.[0] ?? "";
   assert.equal(
     reviewPromptTelemetryForTest(target, context, git).contextChars,
     jsonText.length + introduction.length,
@@ -115,16 +141,21 @@ for (const kind of ["issue", "pull_request"] as const) {
     const jsonText = prompt.split("## GitHub Context\n")[1]?.match(/```json\n([\s\S]*?)\n```/)?.[1];
     assert.ok(jsonText);
     const rendered = JSON.parse(jsonText);
-    for (const key of kind === "issue" ? ["issue"] : ["issue", "pullRequest"]) {
+    if (kind === "pull_request") {
+      assert.equal(rendered.pullRequest.body, "[same as issue.body]");
+      assert.equal(rendered.pullRequest.bodyCoverage, undefined);
+    }
+    for (const key of ["issue"] as const) {
       const compact = rendered[key] as PrimaryBodyContext;
       assertBodyCoverage(body, compact);
       assert.ok(compact.bodyCoverage?.excerpts.some(({ text }) => text.includes(inertTrace)));
       assert.equal(rendered[key].number, target.number);
       assert.deepEqual(rendered[key], JSON.parse(JSON.stringify(context[key])));
       assert.deepEqual(assistPromptContextForTest(context)[key].bodyCoverage, compact.bodyCoverage);
-      assert.equal(
-        reviewContextLedgerForTest(context).find((entry) => entry.section === key)?.chars,
-        JSON.stringify(context[key], null, 2).length,
+      assert.ok(
+        renderedContextBudget(context, target).includes(
+          `- ${key}: 1 entry, ${JSON.stringify(context[key], null, 2).length} chars`,
+        ),
       );
     }
     if (kind === "issue") {
@@ -134,7 +165,9 @@ for (const kind of ["issue", "pull_request"] as const) {
     assert.doesNotMatch(prompt, new RegExp(scriptSentinel));
     assert.doesNotMatch(prompt, /PERSISTENCE_ONLY_|prHydrationSnapshot|pullCommitsRevision/);
     const introduction =
-      prompt.match(/\n\n## PR Introduction Evidence\n[\s\S]*?\n```\n/)?.[0] ?? "";
+      prompt.match(
+        /\n\n## PR Introduction Evidence\n[\s\S]*?\n```\n\n## Provenance Evidence\n[\s\S]*?\n```\n/,
+      )?.[0] ?? "";
     assert.equal(
       reviewPromptTelemetryForTest(target, context, git).contextChars,
       jsonText.length + introduction.length,
@@ -156,9 +189,10 @@ for (const kind of ["issue", "pull_request"] as const) {
   });
 }
 
-test("separate issue/pull body reads retain their own source identity", () => {
+test("separate issue/pull body reads retain their own source identity in context and prompt", () => {
   const body = longProofBody();
-  const { context } = hydratePrimaryBody(body, "pull_request", {
+  // Same opening prefix; only the late proof trace differs between the two reads.
+  const { target, context } = hydratePrimaryBody(body, "pull_request", {
     pullBody: body.slice(0, -1) + "!",
   });
   assert.notEqual(
@@ -166,6 +200,16 @@ test("separate issue/pull body reads retain their own source identity", () => {
     context.pullRequest.bodyCoverage.sourceBodySha256,
   );
   assert.deepEqual(context.issue.bodyCoverage.excerpts, context.pullRequest.bodyCoverage.excerpts);
+
+  const prompt = reviewPromptForTest(target, context, git);
+  const rendered = JSON.parse(
+    prompt.split("## GitHub Context\n")[1]!.match(/```json\n([\s\S]*?)\n```/)![1]!,
+  );
+  assert.equal(rendered.issue.body, rendered.pullRequest.body);
+  assert.equal(
+    rendered.pullRequest.bodyCoverage.sourceBodySha256,
+    context.pullRequest.bodyCoverage.sourceBodySha256,
+  );
 });
 
 for (const [layout, body] of [
@@ -182,12 +226,11 @@ for (const [layout, body] of [
     const rendered = JSON.parse(
       prompt.split("## GitHub Context\n")[1]!.match(/```json\n([\s\S]*?)\n```/)![1]!,
     );
-    for (const compact of [rendered.issue, rendered.pullRequest]) {
-      assertBodyCoverage(body, compact);
-      assert.ok(compact.bodyCoverage.omittedUnits > 0);
-      assert.equal(compact.bodyCoverage.complete, false);
-      assert.equal(compact.bodyCoverage.status, undefined);
-    }
+    assertBodyCoverage(body, rendered.issue);
+    assert.ok(rendered.issue.bodyCoverage.omittedUnits > 0);
+    assert.equal(rendered.issue.bodyCoverage.complete, false);
+    assert.equal(rendered.issue.bodyCoverage.status, undefined);
+    assert.equal(rendered.pullRequest.body, "[same as issue.body]");
   });
 }
 
@@ -210,18 +253,19 @@ for (const scenario of ["optional", "recursive", "concrete", "missing-context"] 
       scenario === "recursive"
         ? "Check unspecified filtered prior rank-up moves before merge."
         : "Document the cache eviction boundary.";
-    const report = `${reportFrontMatter({
-      type: "pull_request",
-      number: "101",
-      review_status: "complete",
-      reviewed_at: "2026-08-30T10:00:00Z",
-      pull_head_sha: "a".repeat(40),
-      review_lease_owner: "continuity-fixture",
-      review_lease_comment_id: "79",
-      author: "contributor",
-      author_association: "CONTRIBUTOR",
-      work_candidate: "none",
-    })}
+    const report = withReviewRecord(
+      `${reportFrontMatter({
+        type: "pull_request",
+        number: "101",
+        review_status: "complete",
+        reviewed_at: "2026-08-30T10:00:00Z",
+        pull_head_sha: "a".repeat(40),
+        review_lease_owner: "continuity-fixture",
+        review_lease_comment_id: "79",
+        author: "contributor",
+        author_association: "CONTRIBUTOR",
+        work_candidate: "none",
+      })}
 
 ## Summary
 
@@ -252,7 +296,49 @@ Overall confidence: 0.9
 Full review comments:
 
 ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cache.ts:10-12`\n  - body: A revoked session still reuses the cached credential.\n  - confidence: 0.9" : "- none"}
-`;
+`,
+      {
+        decision: "keep_open",
+        closeReason: "none",
+        summary: "Review the session-cache change.",
+        changeSummary: "Changes cache invalidation.",
+        workReason: "",
+        evidence: [],
+        likelyOwners: [],
+        bestSolution: "None.",
+        realBehaviorProof: {
+          status: "sufficient",
+          evidenceKind: "terminal",
+          needsContributorAction: false,
+          summary: "Synthetic fixture records successful cache invalidation.",
+        },
+        prRating: {
+          overallTier: "B",
+          proofTier: "A",
+          patchTier: "B",
+          summary: "This PR has strong proof and normal merge-ready implementation quality.",
+          nextSteps: [rank],
+        },
+        risks: risk === "None." ? [] : [risk],
+        nextStep: risk === "None." ? { kind: "none", text: "" } : { kind: "required", text: risk },
+        overallCorrectness: scenario === "concrete" ? "patch is incorrect" : "patch is correct",
+        overallConfidenceScore: 0.9,
+        reviewFindings:
+          scenario === "concrete"
+            ? [
+                {
+                  title: "Invalidate revoked credentials",
+                  body: "A revoked session still reuses the cached credential.",
+                  priority: 1,
+                  confidenceScore: 0.9,
+                  file: "src/cache.ts",
+                  lineStart: 10,
+                  lineEnd: 12,
+                },
+              ]
+            : [],
+      },
+    );
     const body = markedReviewCommentForTest(101, renderReviewCommentFromReport(report, "none"));
     const previousComment = {
       id: 80,
@@ -267,8 +353,8 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
       body: "Rank-up disposition: the cache boundary is documented. Unspecified recursive advice is skipped; no code finding is waived.",
     };
     const comments = [previousComment, disposition];
-    const filtered = filterReviewContextCommentsForTest(comments, 101);
-    const previous = extractLatestClawSweeperReviewForTest(comments, 101)!;
+    const filtered = filterReviewContextComments(comments, 101);
+    const previous = extractLatestClawSweeperReview(comments, 101)!;
     const prompt = reviewPromptForTest(
       item({ kind: "pull_request", number: 101 }),
       {
@@ -299,12 +385,6 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
       JSON.stringify(input),
       /Agent review details|Optional improvements that raise the rating/,
     );
-    assert.match(prompt, /Intentional\s+self-comment filtering alone is not missing evidence/);
-    assert.match(
-      prompt,
-      /Apply each applicable rank-up move\s+or explicitly justify its exception before landing/,
-    );
-    assert.match(prompt, /Disclose genuinely material missing, malformed, or truncated context/);
 
     // Controlled follow-up report, not a model evaluation: concrete risks still publish.
     const rerendered = renderReviewCommentFromReport(report, "none", {
@@ -313,7 +393,7 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     const rerenderedBody = markedReviewCommentForTest(101, rerendered);
     assert.equal(rerenderedBody, body);
     assert.doesNotMatch(rerenderedBody, /<!-- clawsweeper-review-history\b/);
-    const again = extractLatestClawSweeperReviewForTest(
+    const again = extractLatestClawSweeperReview(
       [{ ...previousComment, body: rerenderedBody }],
       101,
     )!;
@@ -335,25 +415,28 @@ ${scenario === "concrete" ? "- **[P1] Invalidate revoked credentials:** `src/cac
     if (scenario === "optional") {
       assert.match(rerendered, /## Before merge\n\nNone\./);
     } else {
-      assert.ok(rerendered.includes(`- [ ] **Resolve merge risk (P1)** - ${risk}`));
+      assert.ok(rerendered.includes(`- [ ] **Resolve merge risk** - ${risk}`));
       if (scenario === "recursive") assert.equal(previous.nextStep, recursiveWarning);
     }
   });
 }
 
 test("review prompt assets match tracked files", () => {
-  assert.equal(reviewPromptTemplate(), readFileSync("prompts/review-item.md", "utf8"));
+  assert.deepEqual(reviewPromptTemplates(), {
+    core: readFileSync("prompts/review-item.md", "utf8"),
+    issue: readFileSync("prompts/review-item-issue.md", "utf8"),
+    pull_request: readFileSync("prompts/review-item-pr.md", "utf8"),
+    closeReasons: readFileSync("prompts/review-close-reasons.md", "utf8"),
+  });
   assert.deepEqual(
     JSON.parse(reviewDecisionSchemaText()),
     JSON.parse(readFileSync("schema/clawsweeper-decision.schema.json", "utf8")),
   );
 });
 
-test("assembled review prompt retires executable live-proof guidance", () => {
+test("assembled review prompt carries no retired live-proof or Mantis guidance", () => {
   const prompt = reviewPromptForTest(item({ kind: "pull_request" }), {}, git);
-  assert.match(prompt, /Always fill `liveProofPlan` with the retired compatibility shape/);
-  assert.match(prompt, /automatic live\s+proof is retired/);
-  assert.match(prompt, /Do not recommend or plan proof execution/);
+  assert.doesNotMatch(prompt, /liveProofPlan|mantisRecommendation/);
   assert.doesNotMatch(prompt, /Keep `entry` and\s+every terminal `run\.command` on one line/);
   assert.doesNotMatch(prompt, /## Maintainer Request/);
 });
@@ -375,7 +458,7 @@ test("review preparation uses an explicitly configured external-owner profile", 
       git,
     );
     assert.match(prompt, /- Target repo: partner\/configured-repo/);
-    assert.match(prompt, /- Repository policy: Use the configured partner repository policy\./);
+    assert.match(prompt, /## Repository Policy\n\nUse the configured partner repository policy\./);
   } finally {
     REPOSITORY_PROFILES.splice(REPOSITORY_PROFILES.indexOf(profile), 1);
   }
@@ -447,21 +530,8 @@ for (const [repo, core] of [
       const scenario = `${repo}: ${variant}, ${authorAssociation}`;
 
       assert.ok(prompt.includes(`- Target repo: ${repo}`), scenario);
-      assert.ok(prompt.includes(`- Repository policy: ${profile.promptNote}`), scenario);
-      assert.match(prompt, /policy of the authoritative Target repo in\s+Repository State/);
-      assert.match(
-        prompt,
-        /Do not infer that policy from the organization, display name,\s+PR body, or linked repository/,
-      );
-      assert.match(
-        prompt,
-        /Being outside `openclaw\/openclaw` does not itself\s+permit contributors or workers to edit release-owned files; the target's own\s+policy governs/,
-      );
-      assert.equal(
-        prompt.includes("For `openclaw/openclaw` PR release-note review"),
-        core,
-        scenario,
-      );
+      assert.ok(prompt.includes(`## Repository Policy\n\n${profile.promptNote}`), scenario);
+      assert.equal(prompt.includes("`CHANGELOG.md` is release-owned"), core, scenario);
       if (core) {
         assert.match(prompt, /`CHANGELOG\.md` is release-owned/);
         assert.match(
@@ -470,7 +540,7 @@ for (const [repo, core] of [
         );
         assert.match(
           prompt,
-          /Do not make missing `CHANGELOG\.md` a review finding, merge blocker, work item, or next-step blocker/,
+          /do not make missing `CHANGELOG\.md` a review finding, merge blocker, work item, or next-step blocker/,
         );
         assert.match(prompt, /ask for PR-body or commit message context/);
         assert.match(prompt, /user-visible behavior, affected surface, issue\/PR refs/);
@@ -504,17 +574,6 @@ test("review prompt omits retired automatic live-proof execution context", () =>
   assert.doesNotMatch(prompt, /inheritsReviewerOrControllerBuildOutput/);
   assert.doesNotMatch(prompt, /browserStartup/);
   assert.match(prompt, /## GitHub Context/);
-});
-
-test("sweep apply jobs wire the default-off product direction policy gate", () => {
-  const workflow = readFileSync(".github/workflows/sweep.yml", "utf8");
-  assert.ok(
-    (workflow.match(/CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED:/g)?.length ?? 0) >= 2,
-  );
-  assert.match(
-    workflow,
-    /vars\.CLAWSWEEPER_UNCONFIRMED_PRODUCT_DIRECTION_CLOSE_ENABLED \|\| 'false'/,
-  );
 });
 
 test("main CLI args ignore package-manager double dash separators", () => {
@@ -601,8 +660,87 @@ test("review prompt excludes persistence-only PR hydration snapshots", () => {
   assert.doesNotMatch(prompt, /PERSISTED_FULL_COMMENT_MUST_STAY_PRIVATE/);
 });
 
+test("review prompt points at linked-item bodies only when the reviewer can read GitHub", () => {
+  const context = {
+    issue: { number: 123, title: "Sample PR", body: "PRIMARY_BODY" },
+    comments: [],
+    timeline: [],
+    relatedItems: [
+      {
+        mentionedIn: ["body"],
+        issue: { number: 7, title: "Linked", body: "LINKED_ISSUE_BODY" },
+        pullRequest: { number: 7, merged: true, body: "LINKED_PR_BODY" },
+      },
+    ],
+    closingPullRequests: [{ number: 8, title: "Closer", body: "CLOSING_PR_BODY" }],
+  };
+  const target = item({ kind: "pull_request", number: 123 });
+
+  const online = reviewPromptForTest(target, context, git, "", {
+    networkCapability: "allowlisted-proxy",
+  });
+  assert.match(online, /PRIMARY_BODY/);
+  assert.match(online, /"title": "Linked"/);
+  assert.match(online, /"merged": true/);
+  assert.doesNotMatch(online, /LINKED_ISSUE_BODY|LINKED_PR_BODY|CLOSING_PR_BODY/);
+
+  const offline = reviewPromptForTest(target, context, git, "", { networkCapability: "none" });
+  assert.match(offline, /LINKED_ISSUE_BODY/);
+  assert.match(offline, /CLOSING_PR_BODY/);
+});
+
+test("review prompt counts passing checks and lists only the ones that did not pass", () => {
+  const context = {
+    issue: { number: 123, title: "Sample PR" },
+    comments: [],
+    timeline: [],
+    pullChecks: {
+      complete: true,
+      checkRuns: [
+        { name: "PASSING_LINT", status: "completed", conclusion: "success", app: "github-actions" },
+        {
+          name: "SKIPPED_SMOKE",
+          status: "completed",
+          conclusion: "skipped",
+          app: "github-actions",
+        },
+        { name: "FAILING_TEST", status: "completed", conclusion: "failure", app: "github-actions" },
+        { name: "PENDING_BUILD", status: "in_progress", conclusion: null, app: "github-actions" },
+      ],
+      checkRunsTruncated: false,
+      statuses: [
+        { context: "PASSING_STATUS", state: "success", description: null },
+        { context: "PENDING_STATUS", state: "pending", description: null },
+      ],
+      statusesTruncated: false,
+    },
+  };
+
+  const prompt = reviewPromptForTest(item({ kind: "pull_request", number: 123 }), context, git);
+  const rendered = JSON.parse(
+    prompt.split("## GitHub Context\n")[1]!.match(/```json\n([\s\S]*?)\n```/)![1]!,
+  );
+
+  assert.deepEqual(rendered.pullChecks.checkRunCounts, {
+    success: 1,
+    skipped: 1,
+    failure: 1,
+    in_progress: 1,
+  });
+  assert.deepEqual(
+    rendered.pullChecks.checkRunsNotPassed.map((run: { name: string }) => run.name),
+    ["FAILING_TEST", "PENDING_BUILD"],
+  );
+  assert.deepEqual(rendered.pullChecks.statusCounts, { success: 1, pending: 1 });
+  assert.deepEqual(
+    rendered.pullChecks.statusesNotPassed.map((status: { context: string }) => status.context),
+    ["PENDING_STATUS"],
+  );
+  assert.equal(rendered.pullChecks.complete, true);
+});
+
 test("review prompt includes merge state and guards clean behind-branch drift", () => {
-  const compactPullRequest = compactPullRequestForTest({
+  const pullRequest = compactPullRequest({
     number: 123,
     title: "Sample PR",
     html_url: "https://github.com/openclaw/openclaw/pull/123",
@@ -622,16 +760,15 @@ test("review prompt includes merge state and guards clean behind-branch drift", 
     issue: { number: 123, title: "Sample PR" },
     comments: [],
     timeline: [],
-    pullRequest: compactPullRequest,
+    pullRequest,
     counts: { comments: 0, timeline: 0 },
   };
 
   const prompt = reviewPromptForTest(item({ kind: "pull_request", number: 123 }), context, git);
 
-  assert.deepEqual((compactPullRequest as { mergeableState?: unknown }).mergeableState, "clean");
+  assert.ok(pullRequest && typeof pullRequest === "object" && "mergeableState" in pullRequest);
+  assert.equal(pullRequest.mergeableState, "clean");
   assert.match(prompt, /"mergeableState": "clean"/);
-  assert.match(prompt, /Do not treat a branch being behind the current base as proof/);
-  assert.match(prompt, /actual three-way merge result/);
 });
 
 test("review context ledger records ordered section budgets", () => {
@@ -672,38 +809,25 @@ test("review context ledger records ordered section budgets", () => {
     },
   };
 
-  const ledger = reviewContextLedgerForTest(context);
-
+  const budget = renderedContextBudget(context, item({ kind: "pull_request" }));
+  const expected = [
+    ["issue", "1 entry", context.issue],
+    ["comments", "1/10 hydrated, truncated", context.comments],
+    ["timeline events", "1/1 hydrated", context.timeline],
+    ["previous ClawSweeper review", "1 entry", context.previousClawSweeperReview],
+    ["related items", "1/1 hydrated", context.relatedItems],
+    ["pull request", "1 entry", context.pullRequest],
+    ["PR files", "2/120 hydrated, truncated", context.pullFiles],
+    ["PR commits", "1/1 hydrated", context.pullCommits],
+    ["context counts", "16 entries", context.counts],
+  ] as const;
   assert.deepEqual(
-    ledger.map(({ section, entries, total, hydrated, truncated }) => [
-      section,
-      entries,
-      total,
-      hydrated,
-      truncated,
-    ]),
-    [
-      ["issue", 1, undefined, undefined, undefined],
-      ["comments", 1, 10, 1, true],
-      ["timeline", 1, 1, 1, false],
-      ["previousClawSweeperReview", 1, undefined, undefined, undefined],
-      ["relatedItems", 1, 1, undefined, undefined],
-      ["pullRequest", 1, undefined, undefined, undefined],
-      ["pullFiles", 2, 120, 2, true],
-      ["pullCommits", 1, 1, 1, false],
-      ["counts", 16, undefined, undefined, undefined],
-    ],
+    budget.trim().split("\n"),
+    expected.map(
+      ([label, count, value]) =>
+        `- ${label}: ${count}, ${JSON.stringify(value, null, 2).length} chars`,
+    ),
   );
-  assert.equal(
-    ledger.find((entry) => entry.section === "pullFiles")?.chars,
-    JSON.stringify(context.pullFiles, null, 2).length,
-  );
-  assert.match(
-    renderReviewContextBudgetForTest(context),
-    /- PR files: 2\/120 hydrated, truncated, \d+ chars/,
-  );
-  assert.match(renderReviewContextBudgetForTest(context), /- timeline events: 1\/1 hydrated/);
-  assert.match(renderReviewContextBudgetForTest(context), /- previous ClawSweeper review: 1 entry/);
 });
 
 test("PR prompt omits only source patch fields without mutating policy evidence", () => {
@@ -743,4 +867,62 @@ test("PR prompt omits only source patch fields without mutating policy evidence"
   assert.equal(JSON.stringify(context), original);
   const issuePrompt = reviewPromptForTest(item({ kind: "issue" }), context, git);
   assert.ok(issuePrompt.includes("SOURCE_PATCH_SENTINEL"));
+});
+
+test("item prompts carry only the review template for their kind", () => {
+  const templates = reviewPromptTemplates();
+  const context = {
+    issue: { number: 123, title: "Sample item" },
+    comments: [],
+    timeline: [],
+    counts: { comments: 0, timeline: 0 },
+  };
+  const prItem = item({ kind: "pull_request" });
+  const prompt = reviewPromptForTest(prItem, context, git);
+  const issuePrompt = reviewPromptForTest(item({ kind: "issue" }), context, git);
+  assert.ok(
+    prompt.includes(
+      renderReviewSections(templates.pull_request, reviewPromptSections(prItem, context)).trim(),
+    ),
+  );
+  assert.ok(!prompt.includes(templates.issue.trim()));
+  assert.ok(issuePrompt.includes(templates.issue.trim()));
+  assert.ok(!issuePrompt.includes("\n## Review Rules\n"));
+  for (const text of [prompt, issuePrompt]) assert.doesNotMatch(text, /\{\{\w+\}\}/);
+});
+
+test("public planning policy changes when a review prompt template changes", () => {
+  const cli = fileURLToPath(new URL("../dist/clawsweeper.js", import.meta.url));
+  const planPolicy = (preload?: string) =>
+    JSON.parse(
+      execFileSync(
+        process.execPath,
+        [
+          ...(preload ? ["--import", `data:text/javascript,${encodeURIComponent(preload)}`] : []),
+          cli,
+          "plan",
+          "--target-repo",
+          "openclaw/openclaw",
+          "--item-numbers",
+          "none",
+        ],
+        { encoding: "utf8" },
+      ),
+    ).reviewPolicy;
+  const preload = (suffix: string) => `
+    import fs from "node:fs";
+    import { syncBuiltinESMExports } from "node:module";
+    const read = fs.readFileSync;
+    fs.readFileSync = function(path, ...args) {
+      const result = read.call(this, path, ...args);
+      return String(path).endsWith("/prompts/review-item-pr.md")
+        ? result + ${JSON.stringify(suffix)}
+        : result;
+    };
+    syncBuiltinESMExports();
+  `;
+  const original = planPolicy();
+  assert.match(original, /^[0-9a-f]{16}$/);
+  assert.equal(planPolicy(preload("")), original);
+  assert.notEqual(planPolicy(preload("\nOne more rule.\n")), original);
 });

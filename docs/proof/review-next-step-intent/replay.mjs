@@ -6,6 +6,10 @@ import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { parseArgs } from "node:util";
 
+throw new Error(
+  "Historical-only proof: these no-record and malformed-intent fixtures require the retired report parser. Use the original driver and README from pinned pre-cutover commit dbb40525904c2176d192ef6e92c588853e676207 (historical baseline 39592f04448bdc34d37b9e7f8d5c5d7c828b73f2), not the current runtime.",
+);
+
 const root = fileURLToPath(new URL("../../../", import.meta.url));
 const { values } = parseArgs({
   options: {
@@ -31,6 +35,7 @@ const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8"
 const baselineSha = git("rev-parse", "--verify", `${values["baseline-sha"]}^{commit}`);
 const before = await from(join(baselineDist, "clawsweeper.js"));
 const after = await from(join(candidateDist, "clawsweeper.js"));
+const afterPresentation = await from(join(candidateDist, "clawsweeper-report-comment-presentation.js"));
 const { nextStepFromReport } = await from(join(candidateDist, "clawsweeper-next-step.js"));
 const {
   reportFrontMatter,
@@ -157,7 +162,7 @@ const results = [];
 for (const fixture of scenarios) {
   // Identical serialized bytes enter both real renderers, bypassing producer-schema validation.
   const baselineMarkdown = before.renderReviewCommentFromReport(fixture.report, "none");
-  const candidateMarkdown = after.renderReviewCommentFromReport(fixture.report, "none");
+  const candidateMarkdown = afterPresentation.renderReviewCommentFromReport(fixture.report, "none");
   const baseline = observation(baselineMarkdown);
   const candidate = observation(candidateMarkdown);
   assert.equal(baseline.checkboxCount, fixture.beforeCount, `${fixture.name}: baseline checklist`);
@@ -193,38 +198,7 @@ for (const fixture of scenarios) {
 }
 
 // Separately exercise the real producer -> canonical report -> reader -> renderer path.
-const { createReportDocumentRendering } = await from(
-  join(candidateDist, "clawsweeper-report-document.js"),
-);
-const { createReportContextRendering } = await from(
-  join(candidateDist, "clawsweeper-report-context.js"),
-);
-const { createDashboardPresentation } = await from(join(candidateDist, "clawsweeper-dashboard.js"));
-const { createRepositoryLinks } = await from(join(candidateDist, "clawsweeper-links.js"));
-const { normalizeRepo, repositoryProfileFor } = await from(
-  join(candidateDist, "repository-profiles.js"),
-);
-const document = createReportDocumentRendering({
-  ...createRepositoryLinks({
-    reportRepo: "openclaw/clawsweeper-state",
-    normalizeRepo,
-    targetRepo: () => "openclaw/openclaw",
-    targetProfile: () => repositoryProfileFor("openclaw/openclaw"),
-  }),
-  ...createReportContextRendering({}),
-  ...createDashboardPresentation({}),
-  prSurfaceFilesFromContext: () => [],
-  compactPullFilePaths: () => [],
-  confidenceText: String,
-  fixedInText: () => "unknown",
-  formatTimestamp: String,
-  labelJustificationsMarkdown: () => "- none",
-  publicLikelyOwnerRole: String,
-  pullHeadShaFromContext: () => "c".repeat(40),
-  reviewStructuralPullStateFromContext: () => null,
-  sentence: String,
-  sha256: hash,
-});
+const document = await from(join(candidateDist, "clawsweeper-report-document.js"));
 const producerInput = closeDecision({
   decision: "keep_open",
   closeReason: "none",
@@ -272,7 +246,7 @@ const durable = document.markdownFor({
   runtime: { model: "Codex", reasoningEffort: "high" },
 });
 assert.deepEqual(nextStepFromReport(durable), none);
-const roundTripComment = after.renderReviewCommentFromReport(durable, "none");
+const roundTripComment = afterPresentation.renderReviewCommentFromReport(durable, "none");
 const roundTrip = observation(roundTripComment);
 assert.equal(roundTrip.checklist, "None.");
 assert.equal(roundTrip.remainingCount, 0);

@@ -6,7 +6,9 @@ import test from "node:test";
 
 import { createApplyProofFreshnessGuards } from "../dist/clawsweeper-apply-proof-freshness.js";
 import { completeActivityContextSymbol } from "../dist/clawsweeper-types.js";
+import { stableJson } from "../dist/stable-json.js";
 import {
+  canonicalPullRequestClusterForTest,
   emptyReviewedPrActivityCursor,
   lowSignalCloseReport,
   promotionGhMock,
@@ -127,6 +129,134 @@ test("forced final freshness rechecks an item without coverage proof or a new se
   assert.equal(fetchCount, 1);
 });
 
+test("post-proof freshness keeps a structurally verified accepted updated_at and blocks every other change", () => {
+  // openclaw/openclaw#158915: the review read the PR at 20:55:06; the automatic review progress
+  // edit moved updated_at to 20:59:05 before apply; the pre-apply gate accepted that owned write.
+  const storedUpdatedAt = "2026-10-11T20:55:06Z";
+  const acceptedUpdatedAt = "2026-10-11T20:59:05Z";
+  const guards = ({
+    live = acceptedUpdatedAt,
+    accepted = acceptedUpdatedAt as string | null,
+    receiptMatches = true,
+    humanActivityAfterProof = false,
+  } = {}) =>
+    createApplyProofFreshnessGuards({
+      action: undefined,
+      automationItemUpdatedAt: undefined,
+      collectItemContext: () => ({}),
+      completeReviewActivityReceiptMatches: () => receiptMatches,
+      contextHasNonAutomationActivityAfter: () => humanActivityAfterProof,
+      coveringPrCloseCoveragePullRequestSnapshotSha256: () => "c".repeat(64),
+      currentProofState: () => ({
+        acceptedUpdatedAt: accepted ?? undefined,
+        cachedPrCloseCoverageProofGateResult: { status: "allowed" },
+        prCloseCoverageProofGateChecked: true,
+        prCloseCoverageProofStartedAtMs: Date.parse("2026-10-11T21:00:00Z"),
+        storedHash: undefined,
+        storedUpdatedAt,
+      }),
+      expectedReviewActivityCursor: emptyReviewedPrActivityCursor,
+      fetchItem: () => ({ state: "open", item: { kind: "pull_request", updatedAt: live } }),
+      fetchReviewedPrActivityCursor: () => emptyReviewedPrActivityCursor,
+      freshPullRequestReviewHead: () => true,
+      GitHubRuntimeBudgetError: class extends Error {},
+      itemKind: "pull_request",
+      itemSnapshotHash: () => "d".repeat(64),
+      number: 158915,
+      reviewHasCompleteActivityIdentity: true,
+      reviewMarkdown: "---\ntype: pull_request\n---\n",
+      retryCloseCoverageCommandStatusOnlyUpdate: () => false,
+      selfMutationItemReceipts: [],
+    } as never).postProofFreshnessBlock()?.reason ?? null;
+
+  assert.equal(guards(), null, "acknowledgement-only update keeps the accepted review");
+  assert.equal(
+    guards({ receiptMatches: false }),
+    "updated_at changed",
+    "a same-second title/body edit changes the structural receipt and blocks",
+  );
+  assert.equal(
+    guards({ humanActivityAfterProof: true }),
+    "non-automation activity after coverage proof",
+  );
+  assert.equal(guards({ live: "2026-10-11T21:01:00Z" }), "updated_at changed");
+  assert.equal(
+    guards({ accepted: null }),
+    "updated_at changed",
+    "without the gate's acceptance the review snapshot stays the baseline",
+  );
+});
+
+test("post-proof freshness recognizes an owned write that GitHub reflects on the item later", () => {
+  // openclaw/openclaw#142693: apply synced its durable review comment (updated_at 22:29:54), but the
+  // item read right after the write still said 22:28:58; the final gate later read 22:29:54.
+  const itemReadAfterWrite = "2026-10-11T22:28:58Z";
+  const ownedWriteUpdatedAt = "2026-10-11T22:29:54Z";
+  const activity = { comments: [], timeline: [], pullReviewComments: [] };
+  const context = {
+    sourceRevision: "a".repeat(64),
+    pullHeadSha: "b".repeat(40),
+    [completeActivityContextSymbol]: activity,
+  };
+  const reason = ({
+    ownedWrite = ownedWriteUpdatedAt as string | null,
+    sourceRevision = "a".repeat(64),
+  } = {}) =>
+    createApplyProofFreshnessGuards({
+      action: undefined,
+      automationItemUpdatedAt: undefined,
+      collectItemContext: () => context,
+      completeReviewActivityReceiptMatches: () => true,
+      contextHasNonAutomationActivityAfter: () => false,
+      coveringPrCloseCoveragePullRequestSnapshotSha256: () => "c".repeat(64),
+      currentProofState: () => ({
+        acceptedUpdatedAt: undefined,
+        cachedPrCloseCoverageProofGateResult: { status: "allowed" },
+        prCloseCoverageProofGateChecked: true,
+        prCloseCoverageProofStartedAtMs: Date.parse("2026-10-11T22:29:00Z"),
+        storedHash: undefined,
+        storedUpdatedAt: "2026-10-11T22:23:58Z",
+      }),
+      expectedReviewActivityCursor: emptyReviewedPrActivityCursor,
+      fetchItem: () => ({
+        state: "open",
+        item: { kind: "pull_request", updatedAt: ownedWriteUpdatedAt },
+      }),
+      fetchReviewedPrActivityCursor: () => emptyReviewedPrActivityCursor,
+      freshPullRequestReviewHead: () => true,
+      GitHubRuntimeBudgetError: class extends Error {},
+      itemKind: "pull_request",
+      itemSnapshotHash: () => "d".repeat(64),
+      number: 142693,
+      reviewHasCompleteActivityIdentity: true,
+      reviewMarkdown: "---\ntype: pull_request\n---\n",
+      retryCloseCoverageCommandStatusOnlyUpdate: () => false,
+      selfMutationItemReceipts: [
+        {
+          updatedAt: itemReadAfterWrite,
+          ...(ownedWrite ? { ownedWriteUpdatedAt: ownedWrite } : {}),
+          sourceRevision,
+          activityReceipt: stableJson(activity),
+          prHeadSha: null,
+          prHeadMatches: true,
+          reviewActivityCursor: emptyReviewedPrActivityCursor,
+        },
+      ],
+    } as never).postProofFreshnessBlock()?.reason ?? null;
+
+  assert.equal(reason(), null, "the owned write's own time identifies the receipt");
+  assert.equal(
+    reason({ sourceRevision: "e".repeat(64) }),
+    "updated_at changed",
+    "a receipt whose structural source no longer matches still blocks",
+  );
+  assert.equal(
+    reason({ ownedWrite: null }),
+    "updated_at changed",
+    "without the write time it blocks",
+  );
+});
+
 function sourceRevisionForTest(title: string): string {
   return createHash("sha256")
     .update(
@@ -160,28 +290,6 @@ function timelineRevisionForTest(
     sourceIssue: null,
   }));
   return createHash("sha256").update(JSON.stringify(digestParts)).digest("hex");
-}
-
-function boundDuplicateCloseComment(number: number, canonicalUrl: string): string {
-  const markerFields = [
-    `item=${number}`,
-    "sha=head-sha",
-    "confidence=high",
-    "updated_at=2026-05-01T00:00:00.000Z",
-    "reviewed_at=2026-05-01T00:00:00.000Z",
-    "source_revision=reviewed-source",
-    "action_taken=proposed_close",
-    "reason=duplicate_or_superseded",
-  ].join(" ");
-  return [
-    "Codex review: close this as superseded.",
-    "",
-    `Canonical: ${canonicalUrl}`,
-    "",
-    `<!-- clawsweeper-verdict:close ${markerFields} -->`,
-    `<!-- clawsweeper-action:close-required ${markerFields} -->`,
-    `<!-- clawsweeper-review item=${number} -->`,
-  ].join("\n");
 }
 
 test("apply-decisions fails closed when a self-mutation receipt is truncated", () => {
@@ -381,6 +489,9 @@ test("apply-decisions accepts same-second human activity already captured by the
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
         "Closing this PR as superseded by https://github.com/openclaw/openclaw/pull/400.",
@@ -455,6 +566,9 @@ test("apply-decisions keeps existing duplicate PR close proposals open when cove
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
         "Closing this PR as superseded by https://github.com/openclaw/openclaw/pull/400.",
@@ -523,6 +637,9 @@ test("apply-decisions retries transient duplicate PR coverage proof failures", (
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
         "Closing this PR as superseded by https://github.com/openclaw/openclaw/pull/400.",
@@ -658,6 +775,9 @@ test("apply-decisions checks age before duplicate PR coverage proof", () => {
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }).replace(
         "Closing this PR because the branch is not a useful landing base.",
         "Closing this PR as superseded by https://github.com/openclaw/openclaw/pull/400.",
@@ -733,7 +853,11 @@ test("apply-decisions ignores unrelated unsafe PR links when canonical PR is saf
       number: 347,
       title: "Already proposed duplicate close",
       close_reason: "duplicate_or_superseded",
+      // PR 401 appears only in prose, so its unsafe state does not block the close.
       work_cluster_refs: JSON.stringify(["https://github.com/openclaw/openclaw/pull/401"]),
+      root_cause_cluster: canonicalPullRequestClusterForTest(
+        "https://github.com/openclaw/openclaw/pull/400",
+      ),
     }).replace(
       "Closing this PR because the branch is not a useful landing base.",
       [
@@ -799,63 +923,6 @@ test("apply-decisions ignores unrelated unsafe PR links when canonical PR is saf
   });
 });
 
-test("apply-decisions blocks duplicate close when canonical PR is a bare cluster ref", () => {
-  withApplyTestWorkspace(tmpPrefix, ({ root, itemsDir, closedDir, plansDir, reportPath }) => {
-    const synced = reportWithSyncedReviewComment(
-      lowSignalCloseReport({
-        number: 341,
-        title: "Already proposed duplicate close",
-        close_reason: "duplicate_or_superseded",
-        work_cluster_refs: JSON.stringify(["https://github.com/openclaw/openclaw/pull/400"]),
-      }),
-      341,
-      "duplicate_or_superseded",
-    );
-    writeFileSync(join(itemsDir, "341.md"), synced.report, "utf8");
-
-    withMockGh(
-      root,
-      promotionGhMock({
-        number: 341,
-        title: "Already proposed duplicate close",
-        comment: boundDuplicateCloseComment(341, "https://github.com/openclaw/openclaw/pull/400"),
-        linkedPulls: {
-          400: {
-            number: 400,
-            title: "Closed unmerged canonical PR",
-            html_url: "https://github.com/openclaw/openclaw/pull/400",
-            state: "closed",
-            merged_at: null,
-            labels: [],
-          },
-        },
-      }),
-      () => {
-        runOpenClawApplyDecisionsForTest({
-          itemsDir,
-          closedDir,
-          plansDir,
-          reportPath,
-          dryRun: true,
-        });
-      },
-    );
-
-    const report = JSON.parse(readFileSync(reportPath, "utf8")) as Array<{
-      action: string;
-      reason: string;
-    }>;
-    assert.equal(
-      report.some((entry) => entry.action === "closed"),
-      false,
-    );
-    assert.match(
-      report.find((entry) => entry.action === "kept_open")?.reason ?? "",
-      /closed and unmerged/,
-    );
-  });
-});
-
 test("apply-decisions retries duplicate close when linked canonical PR comments cannot be read", () => {
   withApplyTestWorkspace(tmpPrefix, ({ root, itemsDir, closedDir, plansDir, reportPath }) => {
     const synced = reportWithSyncedReviewComment(
@@ -866,6 +933,9 @@ test("apply-decisions retries duplicate close when linked canonical PR comments 
         work_cluster_refs: JSON.stringify([
           "Superseded by https://github.com/openclaw/openclaw/pull/400",
         ]),
+        root_cause_cluster: canonicalPullRequestClusterForTest(
+          "https://github.com/openclaw/openclaw/pull/400",
+        ),
       }),
       340,
       "duplicate_or_superseded",

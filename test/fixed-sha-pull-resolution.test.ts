@@ -1,24 +1,88 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import type { TestContext } from "node:test";
+import { githubTest as test, installGhFixture } from "./github-runtime-fixture.ts";
+import {
+  GitHubRuntimeBudgetError,
+  withGitHubRuntimeBudget,
+} from "../dist/clawsweeper-github-runtime.js";
 
 import {
   createStatusContext,
   linkedIssueNumbersForPullRequestBody,
+  fixedInReportText,
 } from "../dist/clawsweeper-status-context.js";
 import { GitHubRateLimitError } from "../dist/github-retry.js";
-import { closeDecision, item, reportFrontMatter } from "./helpers.ts";
+import { closeDecision, item, reportFrontMatter, withReviewRecord } from "./helpers.ts";
+import { repositoryProfileFor, setTargetRepo, targetRepo } from "../dist/repository-profiles.js";
+import { ReviewRecordFormatError, updateReviewRecordDecision } from "../dist/review-record.js";
 
-class TestGitHubRuntimeBudgetError extends Error {
-  readonly reason: string;
+test("fixed report text uses recorded evidence without overriding host repository metadata", () => {
+  const legacy = reportFrontMatter({
+    repository: "openclaw/openclaw",
+    number: 123,
+    type: "issue",
+    fixed_release: "v-legacy",
+    fixed_sha: "legacy-sha",
+    fixed_at: "legacy-time",
+  });
+  const profile = repositoryProfileFor("openclaw/openclaw");
+  assert.equal(fixedInReportText(legacy, profile), "not determined");
+  const typed = withReviewRecord(legacy, {
+    fixedRelease: "v2026.10.1",
+    fixedSha: "a".repeat(40),
+    fixedAt: "2026-10-01T00:00:00Z",
+  });
+  const rendered = fixedInReportText(typed, profile);
+  assert.match(rendered, /v2026\.10\.1/);
+  assert.match(rendered, /openclaw\/openclaw/);
+  assert.doesNotMatch(rendered, /legacy/);
+  assert.equal(
+    fixedInReportText(typed.replace(/^review_record: \{/m, "review_record: {broken"), profile),
+    "not determined",
+  );
+});
 
-  constructor(reason: string) {
-    super(reason);
-    this.name = "GitHubRuntimeBudgetError";
-    this.reason = reason;
-  }
-}
+test("apply-time fixing PR provenance uses the recorded PR number", (t) => {
+  const { context } = statusContextWithCalls(t, "main", { freshApplyBody: true });
+  const legacy = reportFrontMatter({
+    repository: "openclaw/openclaw",
+    number: 123,
+    type: "pull_request",
+    fixed_pr_number: "999",
+  });
+  const typed = updateReviewRecordDecision(withReviewRecord(legacy), () => ({
+    fixedPullRequest: {
+      repo: "openclaw/openclaw",
+      number: 900,
+      url: "https://github.com/openclaw/openclaw/pull/900",
+      title: "Recorded fix",
+      mergedAt: "2026-10-01T00:00:00Z",
+      sha: "a".repeat(40),
+      confidence: "high",
+      source: "GitHub linked-issue current closing PR",
+    },
+  }));
+  assert.equal(
+    context.implementedOnMainPullRequestProvenanceApplyBlock(
+      typed,
+      item({ number: 123, kind: "pull_request" }),
+      "implemented_on_main",
+    ),
+    null,
+  );
+  assert.throws(
+    () =>
+      context.implementedOnMainPullRequestProvenanceApplyBlock(
+        typed.replace(/^review_record: \{/m, "review_record: {broken"),
+        item({ number: 123, kind: "pull_request" }),
+        "implemented_on_main",
+      ),
+    ReviewRecordFormatError,
+  );
+});
 
 function statusContextWithCalls(
+  t: TestContext,
   defaultBranch = "main",
   options: {
     rateLimitOnApplyRead?: boolean;
@@ -37,7 +101,9 @@ function statusContextWithCalls(
     linkedIssueGenericCrossReferenceOnly?: boolean;
   } = {},
 ) {
-  const calls: string[] = [];
+  const previousRepo = targetRepo();
+  setTargetRepo("openclaw/openclaw");
+  t.after(() => setTargetRepo(previousRepo));
   const recentPulls = [
     pull(701, "cold-list-a", 101),
     {
@@ -49,149 +115,98 @@ function statusContextWithCalls(
       head: { sha: "cold-list-a" },
     },
   ];
-  const fallbackPulls = new Map([
-    ["cold-list-a", [recentPulls[0], recentPulls[2]]],
-    [
-      "cold-list-b",
-      [
-        recentPulls[1],
-        {
-          ...pull(704, "other-merge-for-shared-head", 102),
-          head: { sha: "cold-list-b" },
-        },
-      ],
+  const fallbackPulls: Record<string, unknown[]> = {
+    "cold-list-a": [recentPulls[0], recentPulls[2]],
+    "cold-list-b": [
+      recentPulls[1],
+      {
+        ...pull(704, "other-merge-for-shared-head", 102),
+        head: { sha: "cold-list-b" },
+      },
     ],
-    ["cold-fallback", [pull(703, "cold-fallback", 103)]],
-  ]);
-  const ghJson = <T>(args: string[]): T => {
-    const path = args[1] ?? "";
-    calls.push(path);
-    if (path === "graphql") {
-      if (options.runtimeBudgetOnIssueRead)
-        throw new TestGitHubRuntimeBudgetError("runtime budget exhausted");
-      if (options.rateLimitOnIssueRead) throw new GitHubRateLimitError("API rate limit exceeded");
-      if (args.some((argument) => argument.includes("closingIssuesReferences"))) {
-        return {
-          data: {
-            repository: {
-              pullRequest: {
-                closingIssuesReferences: {
-                  nodes:
-                    options.canonicalClosingIssueMissing ||
-                    options.linkedIssueGenericCrossReferenceOnly
-                      ? []
-                      : [
-                          {
-                            number: options.canonicalClosingIssueNumber ?? 456,
-                            state: options.canonicalClosingIssueOpen === false ? "CLOSED" : "OPEN",
-                            repository: { nameWithOwner: "openclaw/openclaw" },
-                          },
-                        ],
-                },
-                ...(options.linkedIssueGenericCrossReferenceOnly
-                  ? {
-                      timelineItems: {
-                        nodes: [
-                          {
-                            __typename: "CrossReferencedEvent",
-                            source: {
-                              __typename: "PullRequest",
-                              number: 900,
-                              repository: { nameWithOwner: "openclaw/openclaw" },
-                            },
-                          },
-                        ],
-                      },
-                    }
-                  : {}),
-              },
-            },
-          },
-        } as T;
-      }
-      return {
-        data: {
-          repository: {
-            issue: {
-              state: options.linkedIssueOpen ? "OPEN" : "CLOSED",
-              timelineItems: {
-                nodes: [
-                  {
-                    __typename: "ClosedEvent",
-                    createdAt: "2026-08-19T12:00:00Z",
-                    closer: {
-                      __typename: "PullRequest",
-                      number: options.linkedIssueCloserNumber ?? 900,
-                      repository: { nameWithOwner: "openclaw/openclaw" },
-                    },
-                  },
-                ],
-              },
-            },
-          },
-        },
-      } as T;
-    }
-    if (path === "repos/openclaw/openclaw") return { default_branch: defaultBranch } as T;
-    if (path.startsWith("repos/openclaw/openclaw/pulls?")) return recentPulls as T;
-    if (path === "repos/openclaw/openclaw/pulls/123") {
-      if (options.runtimeBudgetOnApplyRead)
-        throw new TestGitHubRuntimeBudgetError("runtime budget exhausted");
-      if (options.rateLimitOnApplyRead) throw new GitHubRateLimitError("API rate limit exceeded");
-      return { body: options.freshApplyBody ? "Fixes #456" : "No longer linked" } as T;
-    }
-    if (path === "repos/openclaw/openclaw/pulls/900") {
-      return { ...pull(900, "current", 456), base: { ref: defaultBranch } } as T;
-    }
-    if (path === "repos/openclaw/openclaw/pulls/901") {
-      return { ...pull(901, "other-current", 456), base: { ref: defaultBranch } } as T;
-    }
-    if (path.startsWith("repos/openclaw/openclaw/compare/current...")) {
-      if (options.runtimeBudgetOnContainmentRead)
-        throw new TestGitHubRuntimeBudgetError("runtime budget exhausted");
-      if (options.rateLimitOnContainmentRead)
-        throw new GitHubRateLimitError("API rate limit exceeded");
-      return { status: options.mergeCommitReachable === false ? "diverged" : "ahead" } as T;
-    }
-    const fallback = path.match(/^repos\/openclaw\/openclaw\/commits\/([^/]+)\/pulls$/);
-    if (fallback?.[1]) return (fallbackPulls.get(fallback[1]) ?? []) as T;
-    const commit = path.match(/^repos\/openclaw\/openclaw\/commits\/([^/]+)$/);
-    if (commit?.[1]) return { commit: { message: `Fixes #${issueForSha(commit[1])}` } } as T;
-    throw new Error(`Unexpected GitHub path: ${path}`);
+    "cold-fallback": [pull(703, "cold-fallback", 103)],
   };
-  const context = createStatusContext({
-    targetProfile: () => ({}) as never,
-    targetRepo: () => "openclaw/openclaw",
-    markdownLink: (label) => label,
-    repoUrlFor: () => "",
-    linkedRelease: (tag) => tag,
-    linkedSha: (sha) => sha,
-    profileStatusStart: () => "",
-    profileStatusEnd: () => "",
-    sweepStatusPath: () => "",
-    markdownRepository: () => "openclaw/openclaw",
-    ghJson,
-    GitHubRuntimeBudgetError: TestGitHubRuntimeBudgetError,
-    asRecord: (value) =>
-      value && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : {},
-    frontMatterValue: (markdown, key) => {
-      const value = markdown.match(new RegExp(`^${key}: (.*)$`, "m"))?.[1];
-      return value?.startsWith('"') && value.endsWith('"') ? value.slice(1, -1) : value;
-    },
-    stringOrUndefined: (value) => (typeof value === "string" ? value : undefined),
-    numberOrUndefined: (value) => (typeof value === "number" ? value : undefined),
-    recordOrUndefined: (value) =>
-      value && typeof value === "object" && !Array.isArray(value)
-        ? (value as Record<string, unknown>)
-        : undefined,
-  });
-  return { calls, context };
-}
-
-function issueForSha(sha: string): number {
-  return sha === "cold-list-a" ? 101 : sha === "cold-list-b" ? 102 : 103;
+  const fixture = installGhFixture(
+    t,
+    `
+    const options = ${JSON.stringify(options)};
+    const defaultBranch = ${JSON.stringify(defaultBranch)};
+    const recentPulls = ${JSON.stringify(recentPulls)};
+    const fallbackPulls = ${JSON.stringify(fallbackPulls)};
+    const path = args[1] ?? "";
+    const failRateLimit = () => {
+      process.stderr.write("API rate limit exceeded");
+      process.exitCode = 1;
+    };
+    const exhaustBudget = () => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+    let value;
+    if (path === "rate_limit") {
+      value = { resources: { core: { remaining: 0, reset: 0 }, graphql: { remaining: 0, reset: 0 } } };
+    } else if (path === "graphql") {
+      if (options.runtimeBudgetOnIssueRead) exhaustBudget();
+      if (options.rateLimitOnIssueRead) failRateLimit();
+      if (args.some(argument => argument.includes("closingIssuesReferences"))) {
+        value = { data: { repository: { pullRequest: {
+          closingIssuesReferences: { nodes:
+            options.canonicalClosingIssueMissing || options.linkedIssueGenericCrossReferenceOnly
+              ? []
+              : [{
+                  number: options.canonicalClosingIssueNumber ?? 456,
+                  state: options.canonicalClosingIssueOpen === false ? "CLOSED" : "OPEN",
+                  repository: { nameWithOwner: "openclaw/openclaw" },
+                }],
+          },
+          ...(options.linkedIssueGenericCrossReferenceOnly ? {
+            timelineItems: { nodes: [{
+              __typename: "CrossReferencedEvent",
+              source: { __typename: "PullRequest", number: 900,
+                repository: { nameWithOwner: "openclaw/openclaw" } },
+            }] },
+          } : {}),
+        } } } };
+      } else {
+        value = { data: { repository: { issue: {
+          state: options.linkedIssueOpen ? "OPEN" : "CLOSED",
+          timelineItems: { nodes: [{
+            __typename: "ClosedEvent", createdAt: "2026-08-19T12:00:00Z",
+            closer: { __typename: "PullRequest", number: options.linkedIssueCloserNumber ?? 900,
+              repository: { nameWithOwner: "openclaw/openclaw" } },
+          }] },
+        } } } };
+      }
+    } else if (path === "repos/openclaw/openclaw") {
+      value = { default_branch: defaultBranch };
+    } else if (path.startsWith("repos/openclaw/openclaw/pulls?")) {
+      value = recentPulls;
+    } else if (path === "repos/openclaw/openclaw/pulls/123") {
+      if (options.runtimeBudgetOnApplyRead) exhaustBudget();
+      if (options.rateLimitOnApplyRead) failRateLimit();
+      value = { body: options.freshApplyBody ? "Fixes #456" : "No longer linked" };
+    } else if (path === "repos/openclaw/openclaw/pulls/900") {
+      value = { ...${JSON.stringify(pull(900, "current", 456))}, base: { ref: defaultBranch } };
+    } else if (path === "repos/openclaw/openclaw/pulls/901") {
+      value = { ...${JSON.stringify(pull(901, "other-current", 456))}, base: { ref: defaultBranch } };
+    } else if (path.startsWith("repos/openclaw/openclaw/compare/current...")) {
+      if (options.runtimeBudgetOnContainmentRead) exhaustBudget();
+      if (options.rateLimitOnContainmentRead) failRateLimit();
+      value = { status: options.mergeCommitReachable === false ? "diverged" : "ahead" };
+    } else {
+      const fallback = path.match(/^repos\\/openclaw\\/openclaw\\/commits\\/([^/]+)\\/pulls$/);
+      const commit = path.match(/^repos\\/openclaw\\/openclaw\\/commits\\/([^/]+)$/);
+      if (fallback?.[1]) value = fallbackPulls[fallback[1]] ?? [];
+      else if (commit?.[1]) {
+        const issueNumber = commit[1] === "cold-list-a" ? 101 : commit[1] === "cold-list-b" ? 102 : 103;
+        value = { commit: { message: "Fixes #" + issueNumber } };
+      }
+      else throw new Error("Unexpected GitHub path: " + path);
+    }
+    if (!process.exitCode) process.stdout.write(JSON.stringify(value));
+  `,
+  );
+  return {
+    calls: () => fixture.requests().map(({ args }) => args[1] ?? ""),
+    context: createStatusContext(),
+  };
 }
 
 function pull(number: number, sha: string, issueNumber: number) {
@@ -208,17 +223,47 @@ function pull(number: number, sha: string, issueNumber: number) {
 }
 
 function persistedReview(issueNumber: number, fixedSha: string, pullNumber: number): string {
-  return reportFrontMatter({
-    repository: "openclaw/openclaw",
-    number: String(issueNumber),
-    fixed_sha: fixedSha,
-    fixed_pr_url: `https://github.com/openclaw/openclaw/pull/${pullNumber}`,
-    fixed_pr_number: String(pullNumber),
-    fixed_pr_title: JSON.stringify(`fix: issue ${issueNumber}`),
-    fixed_pr_merged_at: "2026-08-01T12:00:00Z",
-    fixed_pr_sha: fixedSha,
-    fixed_pr_confidence: "high",
-    fixed_pr_source: JSON.stringify("GitHub commit PR lookup"),
+  return withReviewRecord(
+    reportFrontMatter({
+      repository: "openclaw/openclaw",
+      number: String(issueNumber),
+      fixed_sha: fixedSha,
+      fixed_pr_url: `https://github.com/openclaw/openclaw/pull/${pullNumber}`,
+      fixed_pr_number: String(pullNumber),
+      fixed_pr_title: JSON.stringify(`fix: issue ${issueNumber}`),
+      fixed_pr_merged_at: "2026-08-01T12:00:00Z",
+      fixed_pr_sha: fixedSha,
+      fixed_pr_confidence: "high",
+      fixed_pr_source: JSON.stringify("GitHub commit PR lookup"),
+    }),
+    {
+      fixedSha,
+      fixedPullRequest: {
+        repo: "openclaw/openclaw",
+        number: pullNumber,
+        url: `https://github.com/openclaw/openclaw/pull/${pullNumber}`,
+        title: `fix: issue ${issueNumber}`,
+        mergedAt: "2026-08-01T12:00:00Z",
+        sha: fixedSha,
+        confidence: "high",
+        source: "GitHub commit PR lookup",
+      },
+    },
+  );
+}
+
+function fixingPullRequestReport(): string {
+  return withReviewRecord(reportFrontMatter({ number: 123, type: "pull_request" }), {
+    fixedPullRequest: {
+      repo: "openclaw/openclaw",
+      number: 900,
+      url: "https://github.com/openclaw/openclaw/pull/900",
+      title: "Fix",
+      mergedAt: "2026-08-01T12:00:00Z",
+      sha: null,
+      confidence: "high",
+      source: "GitHub commit PR lookup",
+    },
   });
 }
 
@@ -247,8 +292,8 @@ test("implementation provenance ignores HTML-commented issue references", () => 
   );
 });
 
-test("fixed-SHA issue enrichment reuses repeats and batches cold resolutions", () => {
-  const { calls, context } = statusContextWithCalls();
+test("fixed-SHA issue enrichment reuses repeats and batches cold resolutions", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const repeatFixtures = [
     [91, "repeat-a", 691],
     [92, "repeat-b", 692],
@@ -271,7 +316,7 @@ test("fixed-SHA issue enrichment reuses repeats and batches cold resolutions", (
     assert.equal(resolved.fixedPullRequest?.number, pullNumber);
     assert.equal(resolved.fixedPullRequest?.source, "GitHub commit PR lookup");
   }
-  assert.deepEqual(calls, [], "persisted repeat associations cost zero GitHub calls");
+  assert.deepEqual(calls(), [], "persisted repeat associations cost zero GitHub calls");
 
   for (const [issueNumber, fixedSha, pullNumber] of coldFixtures) {
     const resolved = context.attachFixedPullRequest(
@@ -282,8 +327,8 @@ test("fixed-SHA issue enrichment reuses repeats and batches cold resolutions", (
     assert.equal(resolved.fixedPullRequest?.number, pullNumber);
   }
 
-  const pullLists = calls.filter((path) => path.includes("/pulls?state=all"));
-  const commitPulls = calls.filter((path) => /\/commits\/[^/]+\/pulls$/.test(path));
+  const pullLists = calls().filter((path) => path.includes("/pulls?state=all"));
+  const commitPulls = calls().filter((path) => /\/commits\/[^/]+\/pulls$/.test(path));
   const before = {
     commitPulls: repeatFixtures.length + coldFixtures.length,
     pullLists: 0,
@@ -300,8 +345,8 @@ test("fixed-SHA issue enrichment reuses repeats and batches cold resolutions", (
   );
 });
 
-test("a shared head SHA preserves exact association ordering", () => {
-  const { calls, context } = statusContextWithCalls();
+test("a shared head SHA preserves exact association ordering", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const resolved = context.attachFixedPullRequest(
     closeDecision({ fixedSha: "cold-list-b" }),
     item({ number: 102, kind: "issue" }),
@@ -310,13 +355,13 @@ test("a shared head SHA preserves exact association ordering", () => {
 
   assert.equal(resolved.fixedPullRequest?.number, 704);
   assert.deepEqual(
-    calls.filter((path) => /\/commits\/[^/]+\/pulls$/.test(path)),
+    calls().filter((path) => /\/commits\/[^/]+\/pulls$/.test(path)),
     ["repos/openclaw/openclaw/commits/cold-list-b/pulls"],
   );
 });
 
-test("a merge-commit match is authoritative even when another pull shares its head SHA", () => {
-  const { calls, context } = statusContextWithCalls();
+test("a merge-commit match is authoritative even when another pull shares its head SHA", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const resolved = context.attachFixedPullRequest(
     closeDecision({ fixedSha: "cold-list-a" }),
     item({ number: 101, kind: "issue" }),
@@ -325,14 +370,14 @@ test("a merge-commit match is authoritative even when another pull shares its he
 
   assert.equal(resolved.fixedPullRequest?.number, 701);
   assert.deepEqual(
-    calls.filter((path) => /\/commits\/[^/]+\/pulls$/.test(path)),
+    calls().filter((path) => /\/commits\/[^/]+\/pulls$/.test(path)),
     [],
     "an exact merge-commit match must not use the per-SHA fallback",
   );
 });
 
-test("a changed fixed SHA does not reuse a prior association", () => {
-  const { calls, context } = statusContextWithCalls();
+test("a changed fixed SHA does not reuse a prior association", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const resolved = context.attachFixedPullRequest(
     closeDecision({ fixedSha: "cold-list-a" }),
     item({ number: 101, kind: "issue" }),
@@ -341,11 +386,11 @@ test("a changed fixed SHA does not reuse a prior association", () => {
   );
 
   assert.equal(resolved.fixedPullRequest?.number, 701);
-  assert.equal(calls.filter((path) => path.includes("/pulls?state=all")).length, 1);
+  assert.equal(calls().filter((path) => path.includes("/pulls?state=all")).length, 1);
 });
 
-test("PR implementation closeout revalidates current issue linkage on the repository default branch", () => {
-  const { calls, context } = statusContextWithCalls("master");
+test("PR implementation closeout revalidates current issue linkage on the repository default branch", (t) => {
+  const { calls, context } = statusContextWithCalls(t, "master");
   const resolved = context.attachFixedPullRequest(
     closeDecision({ fixedSha: "same-sha" }),
     item({ number: 123, kind: "pull_request" }),
@@ -355,7 +400,7 @@ test("PR implementation closeout revalidates current issue linkage on the reposi
 
   assert.equal(resolved.fixedPullRequest?.number, 900);
   assert.equal(resolved.fixedPullRequest?.source, "GitHub linked-issue current closing PR");
-  assert.deepEqual(calls, [
+  assert.deepEqual(calls(), [
     "repos/openclaw/openclaw",
     "repos/openclaw/openclaw/pulls?state=all&sort=updated&direction=desc&per_page=100",
     "repos/openclaw/openclaw/commits/same-sha/pulls",
@@ -365,8 +410,8 @@ test("PR implementation closeout revalidates current issue linkage on the reposi
   ]);
 });
 
-test("PR implementation closeout rejects a fixing merge commit no longer on the default branch", () => {
-  const { calls, context } = statusContextWithCalls("main", { mergeCommitReachable: false });
+test("PR implementation closeout rejects a fixing merge commit no longer on the default branch", (t) => {
+  const { calls, context } = statusContextWithCalls(t, "main", { mergeCommitReachable: false });
   const resolved = context.attachFixedPullRequest(
     closeDecision({ fixedSha: "same-sha" }),
     item({ number: 123, kind: "pull_request" }),
@@ -375,7 +420,7 @@ test("PR implementation closeout rejects a fixing merge commit no longer on the 
   );
 
   assert.equal(resolved.fixedPullRequest, null);
-  assert.deepEqual(calls, [
+  assert.deepEqual(calls(), [
     "repos/openclaw/openclaw",
     "repos/openclaw/openclaw/pulls?state=all&sort=updated&direction=desc&per_page=100",
     "repos/openclaw/openclaw/commits/same-sha/pulls",
@@ -385,10 +430,10 @@ test("PR implementation closeout rejects a fixing merge commit no longer on the 
   ]);
 });
 
-test("apply-time PR closeout rejects stale issue linkage", () => {
-  const { calls, context } = statusContextWithCalls();
+test("apply-time PR closeout rejects stale issue linkage", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const block = context.implementedOnMainPullRequestProvenanceApplyBlock(
-    reportFrontMatter({ fixed_pr_number: "900" }),
+    fixingPullRequestReport(),
     item({ number: 123, kind: "pull_request" }),
     "implemented_on_main",
   );
@@ -397,15 +442,15 @@ test("apply-time PR closeout rejects stale issue linkage", () => {
     block,
     "implemented-on-main close no longer has a current explicit same-repository issue link",
   );
-  assert.deepEqual(calls, ["repos/openclaw/openclaw/pulls/123"]);
+  assert.deepEqual(calls(), ["repos/openclaw/openclaw/pulls/123"]);
 });
 
-test("apply-time PR closeout propagates GitHub rate limits", () => {
-  const { context } = statusContextWithCalls("main", { rateLimitOnApplyRead: true });
+test("apply-time PR closeout propagates GitHub rate limits", (t) => {
+  const { context } = statusContextWithCalls(t, "main", { rateLimitOnApplyRead: true });
   assert.throws(
     () =>
       context.implementedOnMainPullRequestProvenanceApplyBlock(
-        reportFrontMatter({ fixed_pr_number: "900" }),
+        fixingPullRequestReport(),
         item({ number: 123, kind: "pull_request" }),
         "implemented_on_main",
       ),
@@ -413,8 +458,8 @@ test("apply-time PR closeout propagates GitHub rate limits", () => {
   );
 });
 
-test("PR implementation closeout accepts a reviewed canonical PR even while the linked issue remains open", () => {
-  const { calls, context } = statusContextWithCalls();
+test("PR implementation closeout accepts a reviewed canonical PR even while the linked issue remains open", (t) => {
+  const { calls, context } = statusContextWithCalls(t);
   const resolved = context.attachFixedPullRequest(
     closeDecision({
       fixedPullRequest: {
@@ -434,47 +479,53 @@ test("PR implementation closeout accepts a reviewed canonical PR even while the 
 
   assert.equal(resolved.fixedPullRequest?.number, 900);
   assert.equal(resolved.fixedPullRequest?.source, "GitHub reviewed implementation landing");
-  assert.deepEqual(calls, [
+  assert.deepEqual(calls(), [
     "repos/openclaw/openclaw",
     "repos/openclaw/openclaw/pulls/900",
     "repos/openclaw/openclaw/compare/current...main",
   ]);
 });
 
-test("apply-time PR closeout propagates GitHub runtime budget exhaustion", () => {
-  const applyRead = statusContextWithCalls("main", { runtimeBudgetOnApplyRead: true });
+test("apply-time PR closeout propagates GitHub runtime budget exhaustion", (t) => {
+  const applyRead = statusContextWithCalls(t, "main", { runtimeBudgetOnApplyRead: true });
   assert.throws(
     () =>
-      applyRead.context.implementedOnMainPullRequestProvenanceApplyBlock(
-        reportFrontMatter({ fixed_pr_number: "900" }),
-        item({ number: 123, kind: "pull_request" }),
-        "implemented_on_main",
+      withGitHubRuntimeBudget({ startedAtMs: Date.now(), maxRuntimeMs: 3000 }, () =>
+        applyRead.context.implementedOnMainPullRequestProvenanceApplyBlock(
+          fixingPullRequestReport(),
+          item({ number: 123, kind: "pull_request" }),
+          "implemented_on_main",
+        ),
       ),
-    TestGitHubRuntimeBudgetError,
+    GitHubRuntimeBudgetError,
   );
+  assert.deepEqual(applyRead.calls(), ["repos/openclaw/openclaw/pulls/123"]);
 
-  const canonicalPull = statusContextWithCalls("main", {
+  const canonicalPull = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     runtimeBudgetOnContainmentRead: true,
   });
   assert.throws(
     () =>
-      canonicalPull.context.implementedOnMainPullRequestProvenanceApplyBlock(
-        reportFrontMatter({ fixed_pr_number: "900" }),
-        item({ number: 123, kind: "pull_request" }),
-        "implemented_on_main",
+      withGitHubRuntimeBudget({ startedAtMs: Date.now(), maxRuntimeMs: 3000 }, () =>
+        canonicalPull.context.implementedOnMainPullRequestProvenanceApplyBlock(
+          fixingPullRequestReport(),
+          item({ number: 123, kind: "pull_request" }),
+          "implemented_on_main",
+        ),
       ),
-    TestGitHubRuntimeBudgetError,
+    GitHubRuntimeBudgetError,
   );
+  assert.equal(canonicalPull.calls().at(-1), "repos/openclaw/openclaw/compare/current...main");
 });
 
-test("apply-time PR closeout accepts the merged canonical PR's formal relationship to a still-open issue", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout accepts the merged canonical PR's formal relationship to a still-open issue", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -482,14 +533,14 @@ test("apply-time PR closeout accepts the merged canonical PR's formal relationsh
   );
 });
 
-test("apply-time PR closeout fails closed when the canonical PR identifies a different closing issue", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout fails closed when the canonical PR identifies a different closing issue", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     canonicalClosingIssueNumber: 457,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -497,14 +548,14 @@ test("apply-time PR closeout fails closed when the canonical PR identifies a dif
   );
 });
 
-test("apply-time PR closeout fails closed when GitHub has no canonical closing reference for the open linked issue", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout fails closed when GitHub has no canonical closing reference for the open linked issue", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     canonicalClosingIssueMissing: true,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -512,14 +563,14 @@ test("apply-time PR closeout fails closed when GitHub has no canonical closing r
   );
 });
 
-test("apply-time PR closeout fails closed when the canonical PR only generically cross-references the open linked issue", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout fails closed when the canonical PR only generically cross-references the open linked issue", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     linkedIssueGenericCrossReferenceOnly: true,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -527,14 +578,14 @@ test("apply-time PR closeout fails closed when the canonical PR only generically
   );
 });
 
-test("apply-time PR closeout fails closed when the formally linked issue is already closed", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout fails closed when the formally linked issue is already closed", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     canonicalClosingIssueOpen: false,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -542,14 +593,14 @@ test("apply-time PR closeout fails closed when the formally linked issue is alre
   );
 });
 
-test("apply-time PR closeout fails closed when the fixing merge commit left the default branch", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout fails closed when the fixing merge commit left the default branch", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     mergeCommitReachable: false,
   });
   assert.equal(
     context.implementedOnMainPullRequestProvenanceApplyBlock(
-      reportFrontMatter({ fixed_pr_number: "900" }),
+      fixingPullRequestReport(),
       item({ number: 123, kind: "pull_request" }),
       "implemented_on_main",
     ),
@@ -557,15 +608,15 @@ test("apply-time PR closeout fails closed when the fixing merge commit left the 
   );
 });
 
-test("apply-time PR closeout propagates fixing-commit containment rate limits", () => {
-  const { context } = statusContextWithCalls("main", {
+test("apply-time PR closeout propagates fixing-commit containment rate limits", (t) => {
+  const { context } = statusContextWithCalls(t, "main", {
     freshApplyBody: true,
     rateLimitOnContainmentRead: true,
   });
   assert.throws(
     () =>
       context.implementedOnMainPullRequestProvenanceApplyBlock(
-        reportFrontMatter({ fixed_pr_number: "900" }),
+        fixingPullRequestReport(),
         item({ number: 123, kind: "pull_request" }),
         "implemented_on_main",
       ),
