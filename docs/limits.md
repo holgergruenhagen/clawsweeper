@@ -39,7 +39,7 @@ The bulk-filer count leaves out issues closed as completed. Every other issue
 in the window counts, including open, rated, not-planned, and duplicate
 issues. Rating labels and priority labels do not change the count: a rating can
 still change between reviews of an unchanged issue, so it is not yet a stable
-signal (#1752).
+signal (https://github.com/openclaw/clawsweeper/issues/1752).
 
 See [`author-pr-budget-close-policy.md`](author-pr-budget-close-policy.md) for
 the rating, proof, inactivity, engagement, and fail-closed gates.

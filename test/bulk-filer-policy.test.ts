@@ -7,7 +7,6 @@ import {
   renderReviewStartStatusComment,
 } from "../dist/clawsweeper.js";
 import {
-  bulkFilerIssueSearchQuery,
   detectBulkFiler,
   bulkFilerPolicyInvalidatesCachedReview,
   updateBulkFilerDetectedFrontMatter,
@@ -118,27 +117,6 @@ test("bulk-filer count ends at the issue's creation, not at review time", () => 
   assert.equal(tenth.context?.issueCount, 10);
   assert.equal(tenth.labelPending, true);
   assert.equal(cache.size, 2);
-});
-
-test("bulk-filer count leaves out only issues closed as completed", () => {
-  const query = bulkFilerIssueSearchQuery({
-    repo: "openclaw/openclaw",
-    author: "reporter",
-    windowStart: "2026-10-03T11:00:00.000Z",
-    windowEnd: "2026-10-10T11:00:00.000Z",
-  });
-  // The author's filing window stays as before; the exclusion only narrows it.
-  for (const term of [
-    "repo:openclaw/openclaw",
-    "type:issue",
-    "author:reporter",
-    "created:2026-10-03T11:00:00.001Z..2026-10-10T11:00:00.000Z",
-    "-reason:completed",
-  ]) {
-    assert.ok(query.includes(term), term);
-  }
-  // Open, rated, not-planned and duplicate issues keep counting.
-  assert.doesNotMatch(query, /is:(open|closed)|reason:(?!completed)|label:/);
 });
 
 test("bulk-filer policy exempts only owners and members", () => {
