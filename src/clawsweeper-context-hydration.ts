@@ -10,7 +10,6 @@ import { validationRecoveryRequired } from "./repair/validation-recovery.js";
 import { BULK_FILED_LABEL } from "./repair/exact-review-guard-labels.js";
 import {
   BULK_FILER_SEARCH_TIMEOUT_MS,
-  BULK_FILER_UNCOUNTED_ISSUE_RATING_LABELS,
   DAY_MS,
   DEFAULT_AUTHOR_PR_BUDGET_MAX_CLOSES_PER_RUN,
   DEFAULT_BULK_FILER_THRESHOLD,
@@ -580,12 +579,9 @@ function bulkFilerIssueSearchQuery(options: {
     "type:issue",
     `author:${quoteGitHubSearchTerm(options.author)}`,
     `created:${rangeStart}..${options.windowEnd}`,
-    // Only issues that have not proven themselves count: closed as completed or
-    // rated with a high-confidence reproduction is left out, everything else stays.
+    // An issue closed as completed was a real report and no longer counts. Model ratings
+    // are left out until they stay stable for unchanged issues (#1752).
     "-reason:completed",
-    ...BULK_FILER_UNCOUNTED_ISSUE_RATING_LABELS.map(
-      (label) => `-label:${quoteGitHubSearchTerm(label)}`,
-    ),
   ].join(" ");
 }
 
