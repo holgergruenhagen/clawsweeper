@@ -39,7 +39,6 @@ test("state hydration retains canonical defaults with an explicit operational-on
     assert.equal(step.with?.["ledger-source"], undefined, site);
     assert.equal(step.with?.["coordinator-enabled"], undefined, site);
   }
-
 });
 
 test("per-target state hydration is slug-scoped while fleet lanes retain discovery", () => {
